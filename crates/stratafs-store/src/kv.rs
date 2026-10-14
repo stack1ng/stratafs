@@ -1,6 +1,7 @@
-use std::ops::Range;
+use std::ops::RangeBounds;
 
 use bytes::Bytes;
+use futures_core::future::BoxFuture;
 
 use crate::error::StoreError;
 
@@ -10,14 +11,16 @@ pub trait KeyValueStore: Send + Sync {
     type ReadTransaction: ReadKeyValueTransaction<Failure = Self::Failure>;
     type Transaction: KeyValueTransaction<Failure = Self::Failure>;
 
-    fn transact<T: Send, Fut: Future<Output = Result<T, Self::Failure>> + Send>(
+    fn transact<T: Send>(
         &self,
-        work: impl FnMut(Self::Transaction) -> Fut + Send,
+        work: impl for<'t> FnMut(&'t Self::Transaction) -> BoxFuture<'t, Result<T, Self::Failure>>
+        + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 
-    fn read_transact<T: Send, Fut: Future<Output = Result<T, Self::Failure>> + Send>(
+    fn read_transact<T: Send>(
         &self,
-        work: impl FnMut(Self::ReadTransaction) -> Fut + Send,
+        work: impl for<'t> FnMut(&'t Self::ReadTransaction) -> BoxFuture<'t, Result<T, Self::Failure>>
+        + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 }
 
@@ -30,11 +33,16 @@ pub trait KeyValueTransaction: ReadKeyValueTransaction {
 pub trait ReadKeyValueTransaction: Send + Sync {
     type Failure: std::error::Error + Send + Sync + 'static;
 
-    fn get(&self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>, Self::Failure>> + Send;
+    fn get(&self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>, Self::Failure>> + Send {
+        async move {
+            let found = self.get_range(&key..=&key, 1).await?;
+            Ok(found.into_iter().next().map(|(_, value)| value))
+        }
+    }
 
     fn get_range(
         &self,
-        range: Range<Bytes>,
+        range: impl RangeBounds<Bytes> + Send,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<(Bytes, Bytes)>, Self::Failure>> + Send;
 
