@@ -1,3 +1,5 @@
+pub mod operations;
+
 use std::fmt;
 
 use bytes::Bytes;
@@ -7,7 +9,7 @@ use vec1::Vec1;
 
 use crate::content::ContentHash;
 use crate::error::StoreError;
-use crate::transaction::{Op, Operations, Outcome};
+use crate::metadata::operations::{Op, Operations, Outcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Seq(pub u64);
@@ -99,20 +101,23 @@ pub enum ForkRejection {
 }
 
 #[derive(Debug, Error)]
-pub enum TransactRejection {
+pub enum TransactRejection<R> {
     #[error(transparent)]
     UnknownVolume(UnknownVolume),
     #[error("assertion at operation {index} failed")]
     AssertionFailed { index: usize },
-    #[error("transaction exceeds the store's limits")]
-    TooLarge,
+    #[error(transparent)]
+    Store(R),
 }
 
+pub type TransactError<R, F> = StoreError<TransactRejection<R>, F>;
+
 pub trait MetadataStore: Send + Sync {
-    type Error: std::error::Error + Send + Sync + 'static;
+    type Rejection: std::error::Error + Send + Sync + 'static;
+    type Failure: std::error::Error + Send + Sync + 'static;
 
     // create a new volume, bound to nothing
-    fn create(&self) -> impl Future<Output = Result<VolumeId, Self::Error>> + Send;
+    fn create(&self) -> impl Future<Output = Result<VolumeId, Self::Failure>> + Send;
 
     // create a new volume that has all entries in the given parent volume,
     // up to and including the given sequence. Then after that point, all entries are exclusive to the new volume.
@@ -120,19 +125,19 @@ pub trait MetadataStore: Send + Sync {
         &self,
         parent_volume: &VolumeId,
         at: Seq,
-    ) -> impl Future<Output = Result<VolumeId, StoreError<ForkRejection, Self::Error>>> + Send;
+    ) -> impl Future<Output = Result<VolumeId, StoreError<ForkRejection, Self::Failure>>> + Send;
 
     fn execute(
         &self,
         volume: &VolumeId,
         operations: Vec1<Op>,
-    ) -> impl Future<Output = Result<Vec1<Outcome>, StoreError<TransactRejection, Self::Error>>> + Send;
+    ) -> impl Future<Output = Result<Vec1<Outcome>, TransactError<Self::Rejection, Self::Failure>>> + Send;
 
     fn transact<T>(
         &self,
         volume: &VolumeId,
         operations: T,
-    ) -> impl Future<Output = Result<T::Output, StoreError<TransactRejection, Self::Error>>> + Send
+    ) -> impl Future<Output = Result<T::Output, TransactError<Self::Rejection, Self::Failure>>> + Send
     where
         T: Operations + Send,
         T::Layout: Send,
@@ -158,7 +163,9 @@ pub trait MetadataStore: Send + Sync {
         &self,
         volume: VolumeId,
         after: Seq,
-    ) -> impl Stream<Item = Result<Stored<Entry>, StoreError<UnknownVolume, Self::Error>>> + Send + 'static;
+    ) -> impl Stream<Item = Result<Stored<Entry>, StoreError<UnknownVolume, Self::Failure>>>
+    + Send
+    + 'static;
 
     // get a stream of the metadata entries whose keys start with the given prefix, in key order.
     // This is not a snapshot: every key that exists the whole time the stream is being read
@@ -167,7 +174,7 @@ pub trait MetadataStore: Send + Sync {
         &self,
         volume: VolumeId,
         prefix: Key,
-    ) -> impl Stream<Item = Result<Stored<KeyValue>, StoreError<UnknownVolume, Self::Error>>>
+    ) -> impl Stream<Item = Result<Stored<KeyValue>, StoreError<UnknownVolume, Self::Failure>>>
     + Send
     + 'static;
 
@@ -176,5 +183,5 @@ pub trait MetadataStore: Send + Sync {
         &self,
         volume: VolumeId,
         after: Seq,
-    ) -> impl Stream<Item = Result<Seq, StoreError<UnknownVolume, Self::Error>>> + Send + 'static;
+    ) -> impl Stream<Item = Result<Seq, StoreError<UnknownVolume, Self::Failure>>> + Send + 'static;
 }

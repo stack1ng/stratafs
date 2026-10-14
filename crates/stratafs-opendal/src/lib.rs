@@ -126,9 +126,9 @@ impl OpendalContentStore {
 }
 
 impl ContentStore for OpendalContentStore {
-    type Error = OpendalError;
+    type Failure = OpendalError;
 
-    fn put(&self, bytes: Bytes) -> impl Future<Output = Result<ContentHash, Self::Error>> + Send {
+    fn put(&self, bytes: Bytes) -> impl Future<Output = Result<ContentHash, Self::Failure>> + Send {
         sendable(self.store(bytes))
     }
 
@@ -137,7 +137,7 @@ impl ContentStore for OpendalContentStore {
         hash: &ContentHash,
         offset: u64,
         size: u64,
-    ) -> impl Future<Output = Result<Bytes, StoreError<GetRejection, Self::Error>>> + Send {
+    ) -> impl Future<Output = Result<Bytes, StoreError<GetRejection, Self::Failure>>> + Send {
         sendable(self.load(*hash, offset, size))
     }
 }

@@ -800,6 +800,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-redb"
+version = "0.1.0"
+
+[[package]]
 name = "stratafs-store"
 version = "0.1.0"
 dependencies = [
@@ -811,6 +815,10 @@ dependencies = [
  "thiserror",
  "vec1",
 ]
+
+[[package]]
+name = "stratafs-tree"
+version = "0.1.0"
 
 [[package]]
 name = "syn"
