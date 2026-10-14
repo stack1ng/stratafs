@@ -50,6 +50,9 @@ pub trait ReadKeyValueTransaction: Send + Sync {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<(Bytes, Bytes)>, Self::Failure>> + Send;
 
+    // watch returns a future that resolves once this key is in a different state
+    // from what this transaction saw, after the transaction finishes.
+    // Fails if the transaction does not finish successfully.
     fn watch(&self, key: Bytes)
     -> impl Future<Output = Result<(), Self::Failure>> + Send + 'static;
 }
