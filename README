@@ -1,0 +1,12 @@
+StrataFS is a forkable, lazy loaded, POSIX compliant file system that can be used on top of any ordered transactional KV store + a blob store.
+
+StrataFS is designed for an agent first world.
+Creating worktrees and even cloning on a fresh instance become O(1).
+This works because content is lazy loaded based on when it is read,
+allowing your codebase to stream in as your agent + its tools read it, without any special configuration.
+
+StrataFS is strongly consistent and durable by default.
+
+StrataFS is completely written in Rust for maximum performance and portability. Strata can be used on Linux, MacOS, and even Webassembly.
+
+This project is currently in active development, and should not be relied on. (yet)
