@@ -1,0 +1,13 @@
+[package]
+name = "stratafs-keyed-notify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+event-listener.workspace = true
+
+[lints]
+workspace = true

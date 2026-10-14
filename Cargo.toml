@@ -10,14 +10,17 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 blake3 = "1.8"
+blocking = "1.7"
 bytes = "1.12"
+cfg_aliases = "0.2"
 derive_more = { version = "2.1", features = ["from", "try_into"] }
+event-listener = "5.4"
 futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 impl-trait-for-tuples = "0.2.3"
 opendal = { version = "0.59.4", default-features = false }
 send_wrapper = { version = "0.6", features = ["futures"] }
-stratafs-opendal = { path = "crates/stratafs-opendal" }
+stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-store = { path = "crates/stratafs-store" }
 thiserror = "2.0"
 vec1 = "1.12"

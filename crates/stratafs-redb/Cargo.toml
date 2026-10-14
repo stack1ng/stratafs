@@ -6,6 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+redb = "4.4.0"
+stratafs-keyed-notify.workspace = true
+stratafs-store.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+blocking.workspace = true
+
+[build-dependencies]
+cfg_aliases.workspace = true
 
 [lints]
 workspace = true
