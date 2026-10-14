@@ -7,6 +7,6 @@ allowing your codebase to stream in as your agent + its tools read it, without a
 
 StrataFS is strongly consistent and durable by default.
 
-StrataFS is completely written in Rust for maximum performance and portability. Strata can be used on Linux, MacOS, and even Webassembly.
+StrataFS is completely written in Rust for maximum performance and portability. Strata can be used on Linux, macOS, and even WebAssembly.
 
-This project is currently in active development, and should not be relied on. (yet)
+This project is currently in active development, and should not be relied on (yet).
