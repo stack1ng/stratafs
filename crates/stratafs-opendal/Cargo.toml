@@ -19,14 +19,5 @@ fs = ["opendal/services-fs"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 send_wrapper.workspace = true
 
-[dev-dependencies]
-opendal = { workspace = true, features = ["services-memory"] }
-stratafs-conformance.workspace = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-stratafs-opendal = { workspace = true, features = ["fs"] }
-tempfile.workspace = true
-tokio = { workspace = true, features = ["rt"] }
-
 [lints]
 workspace = true
