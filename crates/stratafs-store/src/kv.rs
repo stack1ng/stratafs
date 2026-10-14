@@ -8,8 +8,9 @@ use crate::error::StoreError;
 pub trait KeyValueStore: Send + Sync {
     type Rejection: std::error::Error + Send + Sync + 'static;
     type Failure: std::error::Error + Send + Sync + 'static;
-    type ReadTransaction<'txn>: ReadKeyValueTransaction<Failure = Self::Failure>;
-    type Transaction<'txn>: KeyValueTransaction<Failure = Self::Failure>;
+    type Observation: Send + 'static;
+    type ReadTransaction<'txn>: ReadKeyValueTransaction<Failure = Self::Failure, Observation = Self::Observation>;
+    type Transaction<'txn>: KeyValueTransaction<Failure = Self::Failure, Observation = Self::Observation>;
 
     fn transact<T: Send>(
         &self,
@@ -26,6 +27,11 @@ pub trait KeyValueStore: Send + Sync {
         ) -> BoxFuture<'t, Result<T, Self::Failure>>
         + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
+
+    fn changed(
+        &self,
+        observation: Self::Observation,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }
 
 pub trait KeyValueTransaction: ReadKeyValueTransaction {
@@ -36,6 +42,7 @@ pub trait KeyValueTransaction: ReadKeyValueTransaction {
 
 pub trait ReadKeyValueTransaction: Send + Sync {
     type Failure: std::error::Error + Send + Sync + 'static;
+    type Observation: Send + 'static;
 
     fn get(&self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>, Self::Failure>> + Send {
         async move {
@@ -50,9 +57,9 @@ pub trait ReadKeyValueTransaction: Send + Sync {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<(Bytes, Bytes)>, Self::Failure>> + Send;
 
-    // watch returns a future that resolves once this key is in a different state
+    // observe returns an observation, which can be awaited from the store (with changed())
+    // to give a future that resolves once this key is in a different state
     // from what this transaction saw, after the transaction finishes.
     // Fails if the transaction does not finish successfully.
-    fn watch(&self, key: Bytes)
-    -> impl Future<Output = Result<(), Self::Failure>> + Send + 'static;
+    fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure>;
 }
