@@ -8,26 +8,30 @@ use crate::error::StoreError;
 pub trait KeyValueStore: Send + Sync {
     type Rejection: std::error::Error + Send + Sync + 'static;
     type Failure: std::error::Error + Send + Sync + 'static;
-    type ReadTransaction: ReadKeyValueTransaction<Failure = Self::Failure>;
-    type Transaction: KeyValueTransaction<Failure = Self::Failure>;
+    type ReadTransaction<'txn>: ReadKeyValueTransaction<Failure = Self::Failure>;
+    type Transaction<'txn>: KeyValueTransaction<Failure = Self::Failure>;
 
     fn transact<T: Send>(
         &self,
-        work: impl for<'t> FnMut(&'t Self::Transaction) -> BoxFuture<'t, Result<T, Self::Failure>>
+        work: impl for<'t, 'txn> FnMut(
+            &'t mut Self::Transaction<'txn>,
+        ) -> BoxFuture<'t, Result<T, Self::Failure>>
         + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 
     fn read_transact<T: Send>(
         &self,
-        work: impl for<'t> FnMut(&'t Self::ReadTransaction) -> BoxFuture<'t, Result<T, Self::Failure>>
+        work: impl for<'t, 'txn> FnMut(
+            &'t Self::ReadTransaction<'txn>,
+        ) -> BoxFuture<'t, Result<T, Self::Failure>>
         + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 }
 
 pub trait KeyValueTransaction: ReadKeyValueTransaction {
-    fn set(&self, key: Bytes, value: Bytes) -> Result<(), Self::Failure>;
+    fn set(&mut self, key: Bytes, value: Bytes) -> Result<(), Self::Failure>;
 
-    fn clear(&self, key: Bytes) -> Result<(), Self::Failure>;
+    fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure>;
 }
 
 pub trait ReadKeyValueTransaction: Send + Sync {
