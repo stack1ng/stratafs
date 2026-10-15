@@ -1191,6 +1191,7 @@ name = "stratafs-kv-conformance"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
  "proptest",
  "stateright",
  "stratafs-store",
