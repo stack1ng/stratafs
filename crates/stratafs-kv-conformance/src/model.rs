@@ -4,7 +4,7 @@ use std::ops::Bound;
 use bytes::Bytes;
 use stateright::semantics::SequentialSpec;
 
-use crate::history::{SimulatedOperation, SimulatedRead, SimulatedTransaction};
+use crate::activity::{SimulatedOperation, SimulatedRead, SimulatedTransaction};
 
 #[derive(Clone, Debug)]
 pub enum HistoryOperation {
