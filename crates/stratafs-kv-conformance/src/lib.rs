@@ -4,6 +4,7 @@ mod model;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 
+use futures_lite::future::yield_now;
 use futures_util::FutureExt;
 use proptest::prelude::any;
 use proptest::test_runner::TestCaseError;
@@ -130,6 +131,7 @@ async fn execute<S: KeyValueStore>(
                         Box::pin(async move {
                             let mut seen = Vec::new();
                             for read in reads {
+                                yield_now().await;
                                 seen.push(perform_read(transaction, read).await?);
                             }
                             Ok(seen)
@@ -144,6 +146,7 @@ async fn execute<S: KeyValueStore>(
                         Box::pin(async move {
                             let mut seen = Vec::new();
                             for operation in operations {
+                                yield_now().await;
                                 match operation {
                                     SimulatedOperation::Read(read) => {
                                         seen.push(perform_read(transaction, read).await?)
