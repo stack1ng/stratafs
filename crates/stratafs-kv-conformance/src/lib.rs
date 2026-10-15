@@ -1,6 +1,7 @@
 pub mod history;
 mod model;
 
+use std::collections::BTreeSet;
 use std::ops::Bound;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,7 @@ use futures_util::FutureExt;
 use proptest::prelude::any;
 use proptest::test_runner::TestCaseError;
 use proptest::{prop_assert, proptest};
+use shuttle::future::JoinHandle;
 use shuttle::scheduler::RandomScheduler;
 use shuttle::{Config, Runner};
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
@@ -20,7 +22,7 @@ use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransac
 use crate::history::{
     SimulatedOperation, SimulatedRead, SimulatedTransaction, simulated_client_activity,
 };
-use crate::model::{BTreeModel, Outcome, Seen};
+use crate::model::{BTreeModel, HistoryOperation, Outcome, Seen};
 
 // is_strictly_serializable runs fuzzed transactions against the given store from a fuzzed number
 // of concurrent clients, and fails if the resulting history is not strictly serializable,
@@ -74,7 +76,37 @@ pub fn panics_on_invalid_ranges<S: KeyValueStore>(new_store: impl Fn() -> S) {
     }
 }
 
-type Tester = LinearizabilityTester<(usize, usize), BTreeModel>;
+type Tester = LinearizabilityTester<HistoryId, BTreeModel>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum HistoryId {
+    Client {
+        client: usize,
+        generation: usize,
+    },
+    ObservationWaiter {
+        client: usize,
+        transaction: usize,
+        observation: usize,
+    },
+}
+
+enum Event {
+    Invoked(HistoryId, HistoryOperation),
+    Returned(HistoryId, Outcome),
+}
+
+struct Observed<O> {
+    key: Bytes,
+    seen: Option<Bytes>,
+    observation: O,
+}
+
+struct ObservationWaiter {
+    key: Bytes,
+    seen: Option<Bytes>,
+    task: JoinHandle<()>,
+}
 
 fn simulate<S: KeyValueStore + 'static>(
     store: S,
@@ -87,9 +119,7 @@ fn simulate<S: KeyValueStore + 'static>(
     let result = Arc::new(Mutex::new(None));
     let simulation_result = result.clone();
     Runner::new(RandomScheduler::new_from_seed(seed, 1), config).run(move || {
-        let tester = Arc::new(Mutex::new(
-            LinearizabilityTester::new(BTreeModel::default()),
-        ));
+        let history = Arc::new(Mutex::new(Vec::new()));
         let clients: Vec<_> = simulated_client_activity
             .iter()
             .cloned()
@@ -97,57 +127,138 @@ fn simulate<S: KeyValueStore + 'static>(
             .map(|(client, simulated_transactions)| {
                 shuttle::future::spawn(run_client(
                     store.clone(),
-                    tester.clone(),
+                    history.clone(),
                     client,
                     simulated_transactions,
                 ))
             })
             .collect();
         let clients_result = shuttle::future::block_on(async {
-            let mut clients_result = Ok(());
+            let mut observation_waiters = Vec::new();
+            let mut failure = None;
             for client in clients {
-                let client_result = client.await.expect("client tasks are never cancelled");
-                if clients_result.is_ok() {
-                    clients_result = client_result;
+                match client.await.expect("client tasks are never cancelled") {
+                    Ok(client_observation_waiters) => {
+                        observation_waiters.extend(client_observation_waiters)
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
                 }
             }
-            clients_result
+            match failure {
+                Some(failure) => {
+                    for observation_waiter in observation_waiters {
+                        observation_waiter.task.abort();
+                        let _ = observation_waiter.task.await;
+                    }
+                    Err(failure)
+                }
+                None => settle_observation_waiters(&*store, observation_waiters).await,
+            }
         });
-        let tester = Arc::into_inner(tester)
-            .expect("every client task has finished")
+        let history = Arc::into_inner(history)
+            .expect("every task has finished")
             .into_inner()
-            .expect("no client panicked while recording");
-        *simulation_result.lock().unwrap() = Some(clients_result.map(|()| tester));
+            .expect("no task panicked while recording");
+        *simulation_result.lock().unwrap() = Some(clients_result.map(|()| history));
     });
-    Arc::into_inner(result)
+    let history = Arc::into_inner(result)
         .expect("the simulation has finished")
         .into_inner()
         .unwrap()
-        .expect("the simulation ran once")
+        .expect("the simulation ran once")?;
+    tester_from(history)
 }
 
-async fn run_client<S: KeyValueStore>(
-    store: Arc<S>,
-    tester: Arc<Mutex<Tester>>,
-    client: usize,
-    simulated_transactions: Vec<SimulatedTransaction>,
-) -> Result<(), TestCaseError> {
-    let mut id = (client, 0);
-    for simulated_transaction in simulated_transactions {
-        tester
-            .lock()
-            .unwrap()
-            .on_invoke(id, simulated_transaction.clone())
-            .map_err(TestCaseError::fail)?;
-        match execute(&*store, simulated_transaction).await {
-            Ok(outcome) => {
+fn tester_from(history: Vec<Event>) -> Result<Tester, TestCaseError> {
+    let fired: BTreeSet<HistoryId> = history
+        .iter()
+        .filter_map(|event| match event {
+            Event::Returned(id @ HistoryId::ObservationWaiter { .. }, _) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let mut tester = LinearizabilityTester::new(BTreeModel::default());
+    for event in history {
+        match event {
+            Event::Invoked(id @ HistoryId::ObservationWaiter { .. }, _) if !fired.contains(&id) => {
+            }
+            Event::Invoked(id, operation) => {
                 tester
-                    .lock()
-                    .unwrap()
-                    .on_return(id, outcome)
+                    .on_invoke(id, operation)
                     .map_err(TestCaseError::fail)?;
             }
-            Err(StoreError::Failed(_)) => id.1 += 1,
+            Event::Returned(id, outcome) => {
+                tester.on_return(id, outcome).map_err(TestCaseError::fail)?;
+            }
+        }
+    }
+    Ok(tester)
+}
+
+async fn run_client<S: KeyValueStore + 'static>(
+    store: Arc<S>,
+    history: Arc<Mutex<Vec<Event>>>,
+    client: usize,
+    simulated_transactions: Vec<SimulatedTransaction>,
+) -> Result<Vec<ObservationWaiter>, TestCaseError> {
+    let mut generation = 0;
+    let mut observation_waiters = Vec::new();
+    for (transaction, simulated_transaction) in simulated_transactions.into_iter().enumerate() {
+        let id = HistoryId::Client { client, generation };
+        history.lock().unwrap().push(Event::Invoked(
+            id,
+            HistoryOperation::Transaction(simulated_transaction.clone()),
+        ));
+        let (result, observed) = execute(&*store, simulated_transaction).await;
+        match result {
+            Ok(Outcome::Panicked) => {
+                history
+                    .lock()
+                    .unwrap()
+                    .push(Event::Returned(id, Outcome::Panicked));
+                for Observed { observation, .. } in observed {
+                    if store.changed(observation).await.is_ok() {
+                        return Err(TestCaseError::fail(
+                            "changed resolved for an observation whose transaction panicked",
+                        ));
+                    }
+                }
+            }
+            Ok(outcome) => {
+                history.lock().unwrap().push(Event::Returned(id, outcome));
+                for (index, observed) in observed.into_iter().enumerate() {
+                    let observation_waiter_id = HistoryId::ObservationWaiter {
+                        client,
+                        transaction,
+                        observation: index,
+                    };
+                    history.lock().unwrap().push(Event::Invoked(
+                        observation_waiter_id,
+                        HistoryOperation::Changed {
+                            key: observed.key.clone(),
+                            seen: observed.seen.clone(),
+                        },
+                    ));
+                    let store = store.clone();
+                    let history = history.clone();
+                    let task = shuttle::future::spawn(async move {
+                        if store.changed(observed.observation).await.is_ok() {
+                            history.lock().unwrap().push(Event::Returned(
+                                observation_waiter_id,
+                                Outcome::Changed(true),
+                            ));
+                        }
+                    });
+                    observation_waiters.push(ObservationWaiter {
+                        key: observed.key,
+                        seen: observed.seen,
+                        task,
+                    });
+                }
+            }
+            Err(StoreError::Failed(_)) => generation += 1,
             Err(StoreError::Rejected(rejection)) => {
                 return Err(TestCaseError::fail(format!(
                     "a transaction this small was rejected: {rejection}"
@@ -155,24 +266,65 @@ async fn run_client<S: KeyValueStore>(
             }
         }
     }
+    Ok(observation_waiters)
+}
+
+// settle_observation_waiters waits for all observations to either get fulfilled (if the key's value changed from the initial value)
+// or skipped (if the key's value is the same as the initial value, since the watch isn't required to fire now that no more writes can happen).
+async fn settle_observation_waiters<S: KeyValueStore>(
+    store: &S,
+    observation_waiters: Vec<ObservationWaiter>,
+) -> Result<(), TestCaseError> {
+    let keys: Vec<Bytes> = observation_waiters
+        .iter()
+        .map(|observation_waiter| observation_waiter.key.clone())
+        .collect();
+    let final_values = store
+        .read_transact(move |transaction| {
+            let keys = keys.clone();
+            Box::pin(async move {
+                let mut values = Vec::new();
+                for key in keys {
+                    values.push(transaction.get(key).await?);
+                }
+                Ok(values)
+            })
+        })
+        .await
+        .map_err(|error| {
+            TestCaseError::fail(format!("reading the final values failed: {error}"))
+        })?;
+    for (observation_waiter, final_value) in observation_waiters.into_iter().zip(final_values) {
+        if final_value == observation_waiter.seen {
+            observation_waiter.task.abort();
+        }
+        let _ = observation_waiter.task.await;
+    }
     Ok(())
 }
 
 async fn execute<S: KeyValueStore>(
     store: &S,
     simulated_transaction: SimulatedTransaction,
-) -> Result<Outcome, StoreError<S::Rejection, S::Failure>> {
+) -> (
+    Result<Outcome, StoreError<S::Rejection, S::Failure>>,
+    Vec<Observed<S::Observation>>,
+) {
+    let observed = Arc::new(Mutex::new(Vec::new()));
     let run = async {
         match simulated_transaction {
             SimulatedTransaction::Read(reads) => {
+                let observed = observed.clone();
                 store
                     .read_transact(move |transaction| {
                         let reads = reads.clone();
+                        let observed = observed.clone();
                         Box::pin(async move {
+                            observed.lock().unwrap().clear();
                             let mut seen = Vec::new();
                             for read in reads {
                                 yield_now().await;
-                                seen.push(perform_read(transaction, read).await?);
+                                seen.push(perform_read(transaction, read, &observed).await?);
                             }
                             Ok(seen)
                         })
@@ -180,16 +332,19 @@ async fn execute<S: KeyValueStore>(
                     .await
             }
             SimulatedTransaction::Write(operations) => {
+                let observed = observed.clone();
                 store
                     .transact(move |transaction| {
                         let operations = operations.clone();
+                        let observed = observed.clone();
                         Box::pin(async move {
+                            observed.lock().unwrap().clear();
                             let mut seen = Vec::new();
                             for operation in operations {
                                 yield_now().await;
                                 match operation {
                                     SimulatedOperation::Read(read) => {
-                                        seen.push(perform_read(transaction, read).await?)
+                                        seen.push(perform_read(transaction, read, &observed).await?)
                                     }
                                     SimulatedOperation::Set(key, value) => {
                                         transaction.set(key, value)?
@@ -207,20 +362,33 @@ async fn execute<S: KeyValueStore>(
             }
         }
     };
-    match AssertUnwindSafe(run).catch_unwind().await {
+    let result = match AssertUnwindSafe(run).catch_unwind().await {
         Ok(result) => result.map(Outcome::Completed),
         Err(_) => Ok(Outcome::Panicked),
-    }
+    };
+    let observed = std::mem::take(&mut *observed.lock().unwrap());
+    (result, observed)
 }
 
 async fn perform_read<T: ReadKeyValueTransaction>(
     transaction: &T,
     read: SimulatedRead,
+    observed: &Mutex<Vec<Observed<T::Observation>>>,
 ) -> Result<Seen, T::Failure> {
     Ok(match read {
         SimulatedRead::Get(key) => Seen::Get(transaction.get(key).await?),
         SimulatedRead::GetRange(start, end, limit) => {
             Seen::GetRange(transaction.get_range((start, end), limit).await?)
+        }
+        SimulatedRead::Observe(key) => {
+            let seen = transaction.get(key.clone()).await?;
+            let observation = transaction.observe(key.clone())?;
+            observed.lock().unwrap().push(Observed {
+                key,
+                seen: seen.clone(),
+                observation,
+            });
+            Seen::Observe(seen)
         }
     })
 }

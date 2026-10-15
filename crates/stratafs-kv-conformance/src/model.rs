@@ -6,26 +6,45 @@ use stateright::semantics::SequentialSpec;
 
 use crate::history::{SimulatedOperation, SimulatedRead, SimulatedTransaction};
 
+#[derive(Clone, Debug)]
+pub enum HistoryOperation {
+    Transaction(SimulatedTransaction),
+    Changed { key: Bytes, seen: Option<Bytes> },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
     Completed(Vec<Seen>),
     Panicked,
+    Changed(bool),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Seen {
     Get(Option<Bytes>),
     GetRange(Vec<(Bytes, Bytes)>),
+    Observe(Option<Bytes>),
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct BTreeModel(BTreeMap<Bytes, Bytes>);
 
 impl SequentialSpec for BTreeModel {
-    type Op = SimulatedTransaction;
+    type Op = HistoryOperation;
     type Ret = Outcome;
 
-    fn invoke(&mut self, transaction: &SimulatedTransaction) -> Outcome {
+    fn invoke(&mut self, operation: &HistoryOperation) -> Outcome {
+        match operation {
+            HistoryOperation::Transaction(transaction) => self.transact(transaction),
+            HistoryOperation::Changed { key, seen } => {
+                Outcome::Changed(self.0.get(key) != seen.as_ref())
+            }
+        }
+    }
+}
+
+impl BTreeModel {
+    fn transact(&mut self, transaction: &SimulatedTransaction) -> Outcome {
         match transaction {
             SimulatedTransaction::Read(reads) => {
                 Outcome::Completed(reads.iter().map(|read| self.read(read)).collect())
@@ -50,9 +69,7 @@ impl SequentialSpec for BTreeModel {
             }
         }
     }
-}
 
-impl BTreeModel {
     fn read(&self, read: &SimulatedRead) -> Seen {
         match read {
             SimulatedRead::Get(key) => {
@@ -63,6 +80,7 @@ impl BTreeModel {
             SimulatedRead::GetRange(start, end, limit) => {
                 Seen::GetRange(self.range(start, end, *limit))
             }
+            SimulatedRead::Observe(key) => Seen::Observe(self.0.get(key).cloned()),
         }
     }
 

@@ -28,6 +28,7 @@ pub enum SimulatedOperation {
 pub enum SimulatedRead {
     Get(Bytes),
     GetRange(Bound<Bytes>, Bound<Bytes>, usize),
+    Observe(Bytes),
 }
 
 pub fn simulated_client_activity() -> impl Strategy<Value = Vec<Vec<SimulatedTransaction>>> {
@@ -52,12 +53,13 @@ fn operation() -> impl Strategy<Value = SimulatedOperation> {
 
 fn read() -> impl Strategy<Value = SimulatedRead> {
     prop_oneof![
-        key().prop_map(SimulatedRead::Get),
-        (bound(), bound(), limit())
+        4 => key().prop_map(SimulatedRead::Get),
+        4 => (bound(), bound(), limit())
             .prop_filter("valid range", |(start, end, _)| {
                 is_valid_range::<Bytes>(&(start.as_ref(), end.as_ref()))
             })
             .prop_map(|(start, end, limit)| SimulatedRead::GetRange(start, end, limit)),
+        1 => key().prop_map(SimulatedRead::Observe),
     ]
 }
 

@@ -24,7 +24,7 @@ pub trait KeyValueStore: Send + Sync {
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 
     // read_transact runs a read-only transaction, returning the result.
-    // A panic inside work propagates to the caller of transact.
+    // A panic inside work propagates to the caller of read_transact.
     // The transaction is not applied, and the store stays usable.
     fn read_transact<T: Send>(
         &self,

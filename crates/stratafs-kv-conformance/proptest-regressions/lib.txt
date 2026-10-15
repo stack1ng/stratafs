@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1a611ce9804b0083ea7a42f3f291af9dfb525cf6cca2cb8e24e1154480550f79 # shrinks to simulated_client_activity = [[Read([GetRange(Included(b"a\0"), Excluded(b""), 0)])]], seed = 0
+cc e680e6121aab1a382f46cd22cd95a9654a0a8e29b8ce1677c320cdd600875ae6 # shrinks to simulated_client_activity = [[Write([Read(Observe(b"")), Panic])]], seed = 0
