@@ -10,48 +10,48 @@ static VALUES: [&[u8]; 3] = [b"", b"1", b"2"];
 static LIMITS: [usize; 4] = [0, 1, 2, usize::MAX];
 
 #[derive(Clone, Debug)]
-pub enum Transaction {
-    Read(Vec<Read>),
-    Write(Vec<Operation>),
+pub enum SimulatedTransaction {
+    Read(Vec<SimulatedRead>),
+    Write(Vec<SimulatedOperation>),
 }
 
 #[derive(Clone, Debug)]
-pub enum Operation {
-    Read(Read),
+pub enum SimulatedOperation {
+    Read(SimulatedRead),
     Set(Bytes, Bytes),
     Clear(Bytes),
 }
 
 #[derive(Clone, Debug)]
-pub enum Read {
+pub enum SimulatedRead {
     Get(Bytes),
     GetRange(Bound<Bytes>, Bound<Bytes>, usize),
 }
 
-pub fn simulated_client_activity() -> impl Strategy<Value = Vec<Vec<Transaction>>> {
+pub fn simulated_client_activity() -> impl Strategy<Value = Vec<Vec<SimulatedTransaction>>> {
     vec(vec(transaction(), 1..=6), 1..=4)
 }
 
-fn transaction() -> impl Strategy<Value = Transaction> {
+fn transaction() -> impl Strategy<Value = SimulatedTransaction> {
     prop_oneof![
-        vec(read(), 1..=4).prop_map(Transaction::Read),
-        vec(operation(), 1..=4).prop_map(Transaction::Write),
+        vec(read(), 1..=4).prop_map(SimulatedTransaction::Read),
+        vec(operation(), 1..=4).prop_map(SimulatedTransaction::Write),
     ]
 }
 
-fn operation() -> impl Strategy<Value = Operation> {
+fn operation() -> impl Strategy<Value = SimulatedOperation> {
     prop_oneof![
-        read().prop_map(Operation::Read),
-        (key(), value()).prop_map(|(key, value)| Operation::Set(key, value)),
-        key().prop_map(Operation::Clear),
+        read().prop_map(SimulatedOperation::Read),
+        (key(), value()).prop_map(|(key, value)| SimulatedOperation::Set(key, value)),
+        key().prop_map(SimulatedOperation::Clear),
     ]
 }
 
-fn read() -> impl Strategy<Value = Read> {
+fn read() -> impl Strategy<Value = SimulatedRead> {
     prop_oneof![
-        key().prop_map(Read::Get),
+        key().prop_map(SimulatedRead::Get),
         (bound(), bound(), limit())
-            .prop_map(|(start, end, limit)| Read::GetRange(start, end, limit)),
+            .prop_map(|(start, end, limit)| SimulatedRead::GetRange(start, end, limit)),
     ]
 }
 
