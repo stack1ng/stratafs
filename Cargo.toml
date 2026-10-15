@@ -19,8 +19,10 @@ futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 impl-trait-for-tuples = "0.2.3"
 opendal = { version = "0.59.4", default-features = false }
+proptest = { version = "1.5", default-features = false, features = ["std"] }
 send_wrapper = { version = "0.6", features = ["futures"] }
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
+stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
 stratafs-store = { path = "crates/stratafs-store" }
 thiserror = "2.0"
 vec1 = "1.12"

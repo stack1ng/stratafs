@@ -22,3 +22,6 @@ cfg_aliases.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+stratafs-kv-conformance.workspace = true

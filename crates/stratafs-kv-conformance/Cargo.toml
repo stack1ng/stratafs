@@ -1,0 +1,14 @@
+[package]
+name = "stratafs-kv-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+proptest.workspace = true
+stratafs-store.workspace = true
+
+[lints]
+workspace = true
