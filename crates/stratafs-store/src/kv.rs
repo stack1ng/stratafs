@@ -12,6 +12,9 @@ pub trait KeyValueStore: Send + Sync {
     type ReadTransaction<'txn>: ReadKeyValueTransaction<Failure = Self::Failure, Observation = Self::Observation>;
     type Transaction<'txn>: KeyValueTransaction<Failure = Self::Failure, Observation = Self::Observation>;
 
+    // transact runs a transaction, returning the result.
+    // A panic inside work propagates to the caller of transact.
+    // The transaction is not applied, and the store stays usable.
     fn transact<T: Send>(
         &self,
         work: impl for<'t, 'txn> FnMut(
@@ -20,6 +23,9 @@ pub trait KeyValueStore: Send + Sync {
         + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 
+    // read_transact runs a read-only transaction, returning the result.
+    // A panic inside work propagates to the caller of transact.
+    // The transaction is not applied, and the store stays usable.
     fn read_transact<T: Send>(
         &self,
         work: impl for<'t, 'txn> FnMut(
@@ -51,13 +57,15 @@ pub trait ReadKeyValueTransaction: Send + Sync {
         }
     }
 
+    // get_range returns a range of key-value pairs.
+    // If an inverted (end < start) or fully excluded (start == end == Bound::Excluded) range is provided, the call panics.
     fn get_range(
         &self,
         range: impl RangeBounds<Bytes> + Send,
         limit: usize,
     ) -> impl Future<Output = Result<Vec<(Bytes, Bytes)>, Self::Failure>> + Send;
 
-    // observe returns an observation, which can be awaited from the store (with changed())
+    // observe returns an observation, which can be observed from the store (with changed())
     // to give a future that resolves once this key is in a different state
     // from what this transaction saw, after the transaction finishes.
     // Fails if the transaction does not finish successfully.
