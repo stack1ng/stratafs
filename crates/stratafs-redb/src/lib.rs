@@ -2,6 +2,7 @@ use std::ops::RangeBounds;
 
 use bytes::Bytes;
 use futures_core::future::BoxFuture;
+use futures_lite::future::yield_now;
 use futures_util::lock::Mutex;
 use redb::{
     Database, Error, ReadOnlyTable, ReadableDatabase, ReadableTable, Table, TableDefinition,
@@ -13,6 +14,38 @@ use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransac
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
 
+pub trait SpawnBlocking: Send + Sync {
+    fn spawn_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> + Send;
+}
+
+#[cfg(threads)]
+pub struct ThreadPool;
+
+#[cfg(threads)]
+impl SpawnBlocking for ThreadPool {
+    fn spawn_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> + Send {
+        blocking::unblock(work)
+    }
+}
+
+pub struct Inline;
+
+impl SpawnBlocking for Inline {
+    async fn spawn_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        yield_now().await;
+        work()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RedbRejection {
     // this is a 1:1 mapping to the StorageError::ValueTooLarge variant
@@ -20,14 +53,15 @@ pub enum RedbRejection {
     ValueTooLarge(usize),
 }
 
-pub struct RedbStore {
+pub struct RedbStore<S> {
     database: Database,
     writer: Mutex<Vec<Bytes>>,
     notify: KeyedNotify,
+    spawner: S,
 }
 
-impl RedbStore {
-    pub fn new(database: Database) -> Result<Self, Error> {
+impl<S> RedbStore<S> {
+    pub fn new(database: Database, spawner: S) -> Result<Self, Error> {
         let transaction = database.begin_write()?;
         transaction.open_table(TABLE)?;
         transaction.commit()?;
@@ -35,11 +69,12 @@ impl RedbStore {
             database,
             writer: Mutex::new(Vec::new()),
             notify: KeyedNotify::new(),
+            spawner,
         })
     }
 }
 
-impl KeyValueStore for RedbStore {
+impl<S: SpawnBlocking> KeyValueStore for RedbStore<S> {
     type Rejection = RedbRejection;
     // never ValueTooLarge, transact reports that as a rejection
     type Failure = Error;
@@ -67,10 +102,9 @@ impl KeyValueStore for RedbStore {
                 *written = handle.written;
                 output?
             };
-            #[cfg(threads)]
-            blocking::unblock(move || transaction.commit()).await?;
-            #[cfg(not(threads))]
-            transaction.commit()?;
+            self.spawner
+                .spawn_blocking(move || transaction.commit())
+                .await?;
             self.notify.notify_waiters(&written);
             Ok(output)
         }

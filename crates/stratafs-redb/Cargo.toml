@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 bytes.workspace = true
 futures-core.workspace = true
+futures-lite.workspace = true
 futures-util.workspace = true
 redb = "4.4.0"
 stratafs-keyed-notify.workspace = true
