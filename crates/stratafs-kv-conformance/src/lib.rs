@@ -2,10 +2,15 @@ pub mod history;
 mod model;
 
 use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Mutex};
 
 use futures_util::FutureExt;
-use proptest::proptest;
-use stateright::semantics::LinearizabilityTester;
+use proptest::prelude::any;
+use proptest::test_runner::TestCaseError;
+use proptest::{prop_assert, proptest};
+use shuttle::scheduler::RandomScheduler;
+use shuttle::{Config, Runner};
+use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
 
@@ -18,14 +23,100 @@ use crate::model::{BTreeModel, Outcome, Seen};
 // of concurrent clients, and fails if the resulting history is not strictly serializable,
 // using an in memory map as the reference. It can find violations, but cannot prove there are none.
 // https://jepsen.io/consistency/models/strict-serializable
-pub fn is_strictly_serializable<S: KeyValueStore>(new_store: impl Fn() -> S) {
-    proptest!(|(_simulated_client_activity in simulated_client_activity())| {
-        let _store = new_store();
-        let _tester = LinearizabilityTester::<usize, BTreeModel>::new(BTreeModel::default());
+pub fn is_strictly_serializable<S: KeyValueStore + 'static>(new_store: impl Fn() -> S) {
+    proptest!(|(simulated_client_activity in simulated_client_activity(), seed in any::<u64>())| {
+        let tester = simulate(new_store(), simulated_client_activity, seed)?;
+        prop_assert!(
+            tester.is_consistent(),
+            "no serial order explains this history: {tester:?}"
+        );
     });
 }
 
-#[expect(dead_code)]
+type Tester = LinearizabilityTester<(usize, usize), BTreeModel>;
+
+fn simulate<S: KeyValueStore + 'static>(
+    store: S,
+    simulated_client_activity: Vec<Vec<SimulatedTransaction>>,
+    seed: u64,
+) -> Result<Tester, TestCaseError> {
+    let store = Arc::new(store);
+    let mut config = Config::default();
+    config.stack_size = 1 << 20;
+    let result = Arc::new(Mutex::new(None));
+    let simulation_result = result.clone();
+    Runner::new(RandomScheduler::new_from_seed(seed, 1), config).run(move || {
+        let tester = Arc::new(Mutex::new(
+            LinearizabilityTester::new(BTreeModel::default()),
+        ));
+        let clients: Vec<_> = simulated_client_activity
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(client, simulated_transactions)| {
+                shuttle::future::spawn(run_client(
+                    store.clone(),
+                    tester.clone(),
+                    client,
+                    simulated_transactions,
+                ))
+            })
+            .collect();
+        let clients_result = shuttle::future::block_on(async {
+            let mut clients_result = Ok(());
+            for client in clients {
+                let client_result = client.await.expect("client tasks are never cancelled");
+                if clients_result.is_ok() {
+                    clients_result = client_result;
+                }
+            }
+            clients_result
+        });
+        let tester = Arc::into_inner(tester)
+            .expect("every client task has finished")
+            .into_inner()
+            .expect("no client panicked while recording");
+        *simulation_result.lock().unwrap() = Some(clients_result.map(|()| tester));
+    });
+    Arc::into_inner(result)
+        .expect("the simulation has finished")
+        .into_inner()
+        .unwrap()
+        .expect("the simulation ran once")
+}
+
+async fn run_client<S: KeyValueStore>(
+    store: Arc<S>,
+    tester: Arc<Mutex<Tester>>,
+    client: usize,
+    simulated_transactions: Vec<SimulatedTransaction>,
+) -> Result<(), TestCaseError> {
+    let mut id = (client, 0);
+    for simulated_transaction in simulated_transactions {
+        tester
+            .lock()
+            .unwrap()
+            .on_invoke(id, simulated_transaction.clone())
+            .map_err(TestCaseError::fail)?;
+        match execute(&*store, simulated_transaction).await {
+            Ok(outcome) => {
+                tester
+                    .lock()
+                    .unwrap()
+                    .on_return(id, outcome)
+                    .map_err(TestCaseError::fail)?;
+            }
+            Err(StoreError::Failed(_)) => id.1 += 1,
+            Err(StoreError::Rejected(rejection)) => {
+                return Err(TestCaseError::fail(format!(
+                    "a transaction this small was rejected: {rejection}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn execute<S: KeyValueStore>(
     store: &S,
     simulated_transaction: SimulatedTransaction,

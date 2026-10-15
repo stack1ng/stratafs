@@ -1,6 +1,6 @@
 use redb::Database;
 use redb::backends::InMemoryBackend;
-use stratafs_redb::RedbStore;
+use stratafs_redb::{Inline, RedbStore};
 
 #[test]
 fn is_strictly_serializable() {
@@ -9,6 +9,7 @@ fn is_strictly_serializable() {
             Database::builder()
                 .create_with_backend(InMemoryBackend::new())
                 .unwrap(),
+            Inline,
         )
         .unwrap()
     });

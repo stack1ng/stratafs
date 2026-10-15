@@ -9,6 +9,7 @@ license.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 proptest.workspace = true
+shuttle.workspace = true
 stateright.workspace = true
 stratafs-store.workspace = true
 
