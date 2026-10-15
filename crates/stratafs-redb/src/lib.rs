@@ -10,7 +10,9 @@ use redb::{
 
 use stratafs_keyed_notify::KeyedNotify;
 use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
+use stratafs_store::kv::{
+    KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, assert_valid_range,
+};
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
 
@@ -169,6 +171,7 @@ where
         range: impl RangeBounds<Bytes> + Send,
         limit: usize,
     ) -> Result<Vec<(Bytes, Bytes)>, Self::Failure> {
+        assert_valid_range(&range);
         let bounds = (
             range.start_bound().map(|key| &key[..]),
             range.end_bound().map(|key| &key[..]),

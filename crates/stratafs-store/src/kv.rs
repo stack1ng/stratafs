@@ -1,4 +1,4 @@
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 
 use bytes::Bytes;
 use futures_core::future::BoxFuture;
@@ -70,4 +70,18 @@ pub trait ReadKeyValueTransaction: Send + Sync {
     // from what this transaction saw, after the transaction finishes.
     // Fails if the transaction does not finish successfully.
     fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure>;
+}
+
+#[track_caller]
+pub fn assert_valid_range<T: Ord + ?Sized>(range: &impl RangeBounds<T>) {
+    match (range.start_bound(), range.end_bound()) {
+        (
+            Bound::Included(start) | Bound::Excluded(start),
+            Bound::Included(end) | Bound::Excluded(end),
+        ) if start > end => panic!("range start is greater than range end"),
+        (Bound::Excluded(start), Bound::Excluded(end)) if start == end => {
+            panic!("range start and end are equal and excluded")
+        }
+        _ => {}
+    }
 }
