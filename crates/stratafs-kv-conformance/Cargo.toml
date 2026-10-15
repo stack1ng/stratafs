@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 bytes.workspace = true
 proptest.workspace = true
+stateright.workspace = true
 stratafs-store.workspace = true
 
 [lints]
