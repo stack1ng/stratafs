@@ -72,16 +72,26 @@ pub trait ReadKeyValueTransaction: Send + Sync {
     fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure>;
 }
 
+pub fn is_valid_range<T: Ord + ?Sized>(range: &impl RangeBounds<T>) -> bool {
+    invalid_range_reason(range).is_none()
+}
+
 #[track_caller]
 pub fn assert_valid_range<T: Ord + ?Sized>(range: &impl RangeBounds<T>) {
+    if let Some(reason) = invalid_range_reason(range) {
+        panic!("{reason}");
+    }
+}
+
+fn invalid_range_reason<T: Ord + ?Sized>(range: &impl RangeBounds<T>) -> Option<&'static str> {
     match (range.start_bound(), range.end_bound()) {
         (
             Bound::Included(start) | Bound::Excluded(start),
             Bound::Included(end) | Bound::Excluded(end),
-        ) if start > end => panic!("range start is greater than range end"),
+        ) if start > end => Some("range start is greater than range end"),
         (Bound::Excluded(start), Bound::Excluded(end)) if start == end => {
-            panic!("range start and end are equal and excluded")
+            Some("range start and end are equal and excluded")
         }
-        _ => {}
+        _ => None,
     }
 }

@@ -1,10 +1,12 @@
 pub mod history;
 mod model;
 
-use std::panic::AssertUnwindSafe;
+use std::ops::Bound;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::{Arc, Mutex};
 
-use futures_lite::future::yield_now;
+use bytes::Bytes;
+use futures_lite::future::{block_on, yield_now};
 use futures_util::FutureExt;
 use proptest::prelude::any;
 use proptest::test_runner::TestCaseError;
@@ -32,6 +34,44 @@ pub fn is_strictly_serializable<S: KeyValueStore + 'static>(new_store: impl Fn()
             "no serial order explains this history: {tester:?}"
         );
     });
+}
+
+pub fn panics_on_invalid_ranges<S: KeyValueStore>(new_store: impl Fn() -> S) {
+    let store = new_store();
+    let invalid_ranges = [
+        (
+            Bound::Included(Bytes::from_static(b"b")),
+            Bound::Included(Bytes::from_static(b"a")),
+        ),
+        (
+            Bound::Excluded(Bytes::from_static(b"a")),
+            Bound::Excluded(Bytes::from_static(b"a")),
+        ),
+    ];
+    for range in invalid_ranges {
+        let read = block_on(
+            AssertUnwindSafe(store.read_transact(|transaction| {
+                let range = range.clone();
+                Box::pin(async move { transaction.get_range(range, usize::MAX).await })
+            }))
+            .catch_unwind(),
+        );
+        assert!(
+            read.is_err(),
+            "get_range accepted {range:?} in a read transaction"
+        );
+        let write = block_on(
+            AssertUnwindSafe(store.transact(|transaction| {
+                let range = range.clone();
+                Box::pin(async move { transaction.get_range(range, usize::MAX).await })
+            }))
+            .catch_unwind(),
+        );
+        assert!(
+            write.is_err(),
+            "get_range accepted {range:?} in a write transaction"
+        );
+    }
 }
 
 type Tester = LinearizabilityTester<(usize, usize), BTreeModel>;
@@ -155,6 +195,9 @@ async fn execute<S: KeyValueStore>(
                                         transaction.set(key, value)?
                                     }
                                     SimulatedOperation::Clear(key) => transaction.clear(key)?,
+                                    SimulatedOperation::Panic => {
+                                        resume_unwind(Box::new("simulated panic inside work"))
+                                    }
                                 }
                             }
                             Ok(seen)

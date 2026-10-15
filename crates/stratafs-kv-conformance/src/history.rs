@@ -4,6 +4,7 @@ use bytes::Bytes;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::select;
+use stratafs_store::kv::is_valid_range;
 
 static KEYS: [&[u8]; 7] = [b"", b"\0", b"a", b"a\0", b"aa", b"b", b"\xff"];
 static VALUES: [&[u8]; 3] = [b"", b"1", b"2"];
@@ -20,6 +21,7 @@ pub enum SimulatedOperation {
     Read(SimulatedRead),
     Set(Bytes, Bytes),
     Clear(Bytes),
+    Panic,
 }
 
 #[derive(Clone, Debug)]
@@ -41,9 +43,10 @@ fn transaction() -> impl Strategy<Value = SimulatedTransaction> {
 
 fn operation() -> impl Strategy<Value = SimulatedOperation> {
     prop_oneof![
-        read().prop_map(SimulatedOperation::Read),
-        (key(), value()).prop_map(|(key, value)| SimulatedOperation::Set(key, value)),
-        key().prop_map(SimulatedOperation::Clear),
+        6 => read().prop_map(SimulatedOperation::Read),
+        6 => (key(), value()).prop_map(|(key, value)| SimulatedOperation::Set(key, value)),
+        6 => key().prop_map(SimulatedOperation::Clear),
+        1 => Just(SimulatedOperation::Panic),
     ]
 }
 
@@ -51,6 +54,9 @@ fn read() -> impl Strategy<Value = SimulatedRead> {
     prop_oneof![
         key().prop_map(SimulatedRead::Get),
         (bound(), bound(), limit())
+            .prop_filter("valid range", |(start, end, _)| {
+                is_valid_range::<Bytes>(&(start.as_ref(), end.as_ref()))
+            })
             .prop_map(|(start, end, limit)| SimulatedRead::GetRange(start, end, limit)),
     ]
 }

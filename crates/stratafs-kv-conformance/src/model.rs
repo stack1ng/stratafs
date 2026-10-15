@@ -27,28 +27,22 @@ impl SequentialSpec for BTreeModel {
 
     fn invoke(&mut self, transaction: &SimulatedTransaction) -> Outcome {
         match transaction {
-            SimulatedTransaction::Read(reads) => reads
-                .iter()
-                .map(|read| self.read(read))
-                .collect::<Option<_>>()
-                .map_or(Outcome::Panicked, Outcome::Completed),
+            SimulatedTransaction::Read(reads) => {
+                Outcome::Completed(reads.iter().map(|read| self.read(read)).collect())
+            }
             SimulatedTransaction::Write(operations) => {
                 let mut after = self.clone();
                 let mut seen = Vec::new();
                 for operation in operations {
                     match operation {
-                        SimulatedOperation::Read(read) => {
-                            let Some(result) = after.read(read) else {
-                                return Outcome::Panicked;
-                            };
-                            seen.push(result);
-                        }
+                        SimulatedOperation::Read(read) => seen.push(after.read(read)),
                         SimulatedOperation::Set(key, value) => {
                             after.0.insert(key.clone(), value.clone());
                         }
                         SimulatedOperation::Clear(key) => {
                             after.0.remove(key);
                         }
+                        SimulatedOperation::Panic => return Outcome::Panicked,
                     }
                 }
                 *self = after;
@@ -59,18 +53,15 @@ impl SequentialSpec for BTreeModel {
 }
 
 impl BTreeModel {
-    fn read(&self, read: &SimulatedRead) -> Option<Seen> {
+    fn read(&self, read: &SimulatedRead) -> Seen {
         match read {
             SimulatedRead::Get(key) => {
                 let key = Bound::Included(key.clone());
                 let found = self.range(&key, &key, 1);
-                Some(Seen::Get(found.into_iter().next().map(|(_, value)| value)))
+                Seen::Get(found.into_iter().next().map(|(_, value)| value))
             }
             SimulatedRead::GetRange(start, end, limit) => {
-                if invalid_range(start, end) {
-                    return None;
-                }
-                Some(Seen::GetRange(self.range(start, end, *limit)))
+                Seen::GetRange(self.range(start, end, *limit))
             }
         }
     }
@@ -81,16 +72,5 @@ impl BTreeModel {
             .take(limit)
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
-    }
-}
-
-fn invalid_range(start: &Bound<Bytes>, end: &Bound<Bytes>) -> bool {
-    match (start, end) {
-        (Bound::Excluded(start), Bound::Excluded(end)) => start >= end,
-        (
-            Bound::Included(start) | Bound::Excluded(start),
-            Bound::Included(end) | Bound::Excluded(end),
-        ) => start > end,
-        _ => false,
     }
 }
