@@ -2,7 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StoreError<R, E> {
-    // The store refused the operation, and it was not applied
+    // The store refused the operation, and it was not applied.
+    // the exact reasons for this are specific to the store implementation.
     #[error(transparent)]
     Rejected(R),
 
