@@ -240,12 +240,22 @@ pub(crate) async fn run_observation_scenario<P: Replay, S: KeyValueStore + 'stat
             );
         }
         ExpectedObservation::StaysPending => {
-            assert!(
-                !log.lock().unwrap().contains(&ObservationEvent::Resolved {
-                    attempt: last_attempt
-                }),
-                "changed resolved although the key did not change"
-            );
+            let resolved = log.lock().unwrap().contains(&ObservationEvent::Resolved {
+                attempt: last_attempt,
+            });
+            if resolved {
+                let value_after_resolving = store
+                    .read_transact(|transaction| {
+                        let key = key.clone();
+                        Box::pin(async move { transaction.get(key).await })
+                    })
+                    .await
+                    .expect("reading the value after changed resolved failed");
+                assert!(
+                    value_after_resolving != last.seen,
+                    "changed resolved although the key did not change"
+                );
+            }
         }
     }
 }

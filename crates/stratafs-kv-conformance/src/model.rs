@@ -6,10 +6,22 @@ use stateright::semantics::SequentialSpec;
 
 use crate::activity::{SimulatedOperation, SimulatedRead, SimulatedTransaction};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TransactionId {
+    pub client: usize,
+    pub transaction: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ObservationId {
+    pub transaction: TransactionId,
+    pub observation: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum HistoryOperation {
-    Transaction(SimulatedTransaction),
-    ObservationFired { key: Bytes, seen: Option<Bytes> },
+    Transaction(TransactionId, SimulatedTransaction),
+    ObservationFired(ObservationId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,7 +39,17 @@ pub enum Seen {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct BTreeModel(pub(crate) BTreeMap<Bytes, Bytes>);
+pub struct BTreeModel {
+    values: BTreeMap<Bytes, Bytes>,
+    observations: BTreeMap<ObservationId, ObservationMarker>,
+}
+
+#[derive(Clone, Debug)]
+struct ObservationMarker {
+    key: Bytes,
+    seen: Option<Bytes>,
+    differed: bool,
+}
 
 impl SequentialSpec for BTreeModel {
     type Op = HistoryOperation;
@@ -35,33 +57,55 @@ impl SequentialSpec for BTreeModel {
 
     fn invoke(&mut self, operation: &HistoryOperation) -> Outcome {
         match operation {
-            HistoryOperation::Transaction(transaction) => self.transact(transaction),
-            HistoryOperation::ObservationFired { key, seen } => {
-                Outcome::Changed(self.0.get(key) != seen.as_ref())
-            }
+            HistoryOperation::Transaction(id, transaction) => self.transact(*id, transaction),
+            HistoryOperation::ObservationFired(observation) => Outcome::Changed(
+                self.observations
+                    .get(observation)
+                    .is_some_and(|marker| marker.differed),
+            ),
+        }
+    }
+}
+
+impl FromIterator<(Bytes, Bytes)> for BTreeModel {
+    fn from_iter<I: IntoIterator<Item = (Bytes, Bytes)>>(entries: I) -> Self {
+        BTreeModel {
+            values: entries.into_iter().collect(),
+            observations: BTreeMap::new(),
         }
     }
 }
 
 impl BTreeModel {
-    fn transact(&mut self, transaction: &SimulatedTransaction) -> Outcome {
+    fn transact(&mut self, id: TransactionId, transaction: &SimulatedTransaction) -> Outcome {
+        let mut observations = 0;
         match transaction {
-            SimulatedTransaction::Read(reads) => {
-                Outcome::Completed(reads.iter().map(|read| self.read(read)).collect())
-            }
+            SimulatedTransaction::Read(reads) => Outcome::Completed(
+                reads
+                    .iter()
+                    .map(|read| self.read(read, id, &mut observations))
+                    .collect(),
+            ),
             SimulatedTransaction::Write(operations) => {
                 let mut after = self.clone();
                 let mut seen = Vec::new();
                 for operation in operations {
                     match operation {
-                        SimulatedOperation::Read(read) => seen.push(after.read(read)),
+                        SimulatedOperation::Read(read) => {
+                            seen.push(after.read(read, id, &mut observations))
+                        }
                         SimulatedOperation::Set(key, value) => {
-                            after.0.insert(key.clone(), value.clone());
+                            after.values.insert(key.clone(), value.clone());
                         }
                         SimulatedOperation::Clear(key) => {
-                            after.0.remove(key);
+                            after.values.remove(key);
                         }
                         SimulatedOperation::Panic => return Outcome::Panicked,
+                    }
+                }
+                for marker in after.observations.values_mut() {
+                    if after.values.get(&marker.key) != marker.seen.as_ref() {
+                        marker.differed = true;
                     }
                 }
                 *self = after;
@@ -70,7 +114,12 @@ impl BTreeModel {
         }
     }
 
-    fn read(&self, read: &SimulatedRead) -> Seen {
+    fn read(
+        &mut self,
+        read: &SimulatedRead,
+        transaction: TransactionId,
+        observations: &mut usize,
+    ) -> Seen {
         match read {
             SimulatedRead::Get(key) => {
                 let key = Bound::Included(key.clone());
@@ -80,12 +129,27 @@ impl BTreeModel {
             SimulatedRead::GetRange(start, end, limit) => {
                 Seen::GetRange(self.range(start, end, *limit))
             }
-            SimulatedRead::Observe(key) => Seen::Observe(self.0.get(key).cloned()),
+            SimulatedRead::Observe(key) => {
+                let value = self.values.get(key).cloned();
+                self.observations.insert(
+                    ObservationId {
+                        transaction,
+                        observation: *observations,
+                    },
+                    ObservationMarker {
+                        key: key.clone(),
+                        seen: value.clone(),
+                        differed: false,
+                    },
+                );
+                *observations += 1;
+                Seen::Observe(value)
+            }
         }
     }
 
     fn range(&self, start: &Bound<Bytes>, end: &Bound<Bytes>, limit: usize) -> Vec<(Bytes, Bytes)> {
-        self.0
+        self.values
             .range::<Bytes, _>((start.as_ref(), end.as_ref()))
             .take(limit)
             .map(|(key, value)| (key.clone(), value.clone()))

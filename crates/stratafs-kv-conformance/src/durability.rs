@@ -7,7 +7,7 @@ use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
 use crate::activity::{SimulatedCall, SimulatedRead, SimulatedStop, SimulatedTransaction};
 use crate::execute::execute;
-use crate::model::{BTreeModel, HistoryOperation, Outcome, Seen};
+use crate::model::{BTreeModel, HistoryOperation, Outcome, Seen, TransactionId};
 use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
 use crate::simulation::{
     Event, HistoryId, check_strictly_serializable, keep_first_failure,
@@ -219,13 +219,19 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
         client,
         generation: 0,
     };
-    for transaction in simulated_transactions {
+    for (index, transaction) in simulated_transactions.into_iter().enumerate() {
         if crashed() {
             return Ok(());
         }
         history.lock().unwrap().push(Event::Invoked(
             id,
-            HistoryOperation::Transaction(transaction.clone()),
+            HistoryOperation::Transaction(
+                TransactionId {
+                    client,
+                    transaction: index,
+                },
+                transaction.clone(),
+            ),
         ));
         let (result, _) = execute(&*store, transaction).await;
         if crashed() {
@@ -259,11 +265,17 @@ async fn read_reopened_store<S: KeyValueStore>(
     };
     history.lock().unwrap().push(Event::Invoked(
         id,
-        HistoryOperation::Transaction(SimulatedTransaction::Read(vec![SimulatedRead::GetRange(
-            Bound::Unbounded,
-            Bound::Unbounded,
-            usize::MAX,
-        )])),
+        HistoryOperation::Transaction(
+            TransactionId {
+                client: final_client,
+                transaction: 0,
+            },
+            SimulatedTransaction::Read(vec![SimulatedRead::GetRange(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                usize::MAX,
+            )]),
+        ),
     ));
     let entries = store
         .read_transact(|transaction| {
@@ -277,5 +289,5 @@ async fn read_reopened_store<S: KeyValueStore>(
         id,
         Outcome::Completed(vec![Seen::GetRange(entries.clone())]),
     ));
-    Ok(BTreeModel(entries.into_iter().collect()))
+    Ok(entries.into_iter().collect())
 }

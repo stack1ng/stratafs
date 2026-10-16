@@ -6,7 +6,7 @@ use std::task::Poll;
 
 use bytes::Bytes;
 use futures_util::FutureExt;
-use futures_util::future::RemoteHandle;
+use futures_util::future::{Either, RemoteHandle, select};
 use proptest::test_runner::TestCaseError;
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
 use stratafs_store::error::StoreError;
@@ -16,22 +16,15 @@ use stratafs_store::kv::{
 
 use crate::activity::{SimulatedCall, SimulatedTransaction};
 use crate::execute::{Observed, execute};
-use crate::model::{BTreeModel, HistoryOperation, Outcome};
+use crate::model::{BTreeModel, HistoryOperation, ObservationId, Outcome, TransactionId};
 use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
 
 pub(crate) type Tester = LinearizabilityTester<HistoryId, BTreeModel>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum HistoryId {
-    Client {
-        client: usize,
-        generation: usize,
-    },
-    ObservationWaiter {
-        client: usize,
-        transaction: usize,
-        observation: usize,
-    },
+    Client { client: usize, generation: usize },
+    ObservationWaiter(ObservationId),
 }
 
 pub(crate) enum Event {
@@ -118,6 +111,14 @@ where
     N: Fn() -> S + Send + Sync + 'static,
 {
     let history = Arc::new(Mutex::new(Vec::new()));
+    let possible_late_commits = simulated_client_activity
+        .iter()
+        .flatten()
+        .filter(|simulated_call| {
+            simulated_call.cancelled_at_fraction.is_some()
+                && matches!(simulated_call.transaction, SimulatedTransaction::Write(_))
+        })
+        .count();
     let clients: Vec<_> = simulated_client_activity
         .into_iter()
         .enumerate()
@@ -149,7 +150,9 @@ where
     }
     let clients_result = match failure {
         Some(failure) => Err(failure),
-        None => settle_observation_waiters(&*store, observation_waiters).await,
+        None => {
+            settle_observation_waiters(&*store, observation_waiters, possible_late_commits).await
+        }
     };
     let history = std::mem::take(&mut *history.lock().unwrap());
     clients_result.map(|()| history)
@@ -159,15 +162,14 @@ fn tester_from(starting_model: BTreeModel, history: Vec<Event>) -> Result<Tester
     let fired: BTreeSet<HistoryId> = history
         .iter()
         .filter_map(|event| match event {
-            Event::Returned(id @ HistoryId::ObservationWaiter { .. }, _) => Some(*id),
+            Event::Returned(id @ HistoryId::ObservationWaiter(_), _) => Some(*id),
             _ => None,
         })
         .collect();
     let mut tester = LinearizabilityTester::new(starting_model);
     for event in history {
         match event {
-            Event::Invoked(id @ HistoryId::ObservationWaiter { .. }, _) if !fired.contains(&id) => {
-            }
+            Event::Invoked(id @ HistoryId::ObservationWaiter(_), _) if !fired.contains(&id) => {}
             Event::Invoked(id, operation) => {
                 tester
                     .on_invoke(id, operation)
@@ -198,9 +200,13 @@ where
     let mut observation_waiters = Vec::new();
     for (transaction, simulated_call) in simulated_calls.into_iter().enumerate() {
         let id = HistoryId::Client { client, generation };
+        let transaction_id = TransactionId {
+            client,
+            transaction,
+        };
         history.lock().unwrap().push(Event::Invoked(
             id,
-            HistoryOperation::Transaction(simulated_call.transaction.clone()),
+            HistoryOperation::Transaction(transaction_id, simulated_call.transaction.clone()),
         ));
         let execution = execute(&*store, simulated_call.transaction.clone());
         let outcome = match simulated_call.cancelled_at_fraction {
@@ -236,17 +242,14 @@ where
             Ok(outcome) => {
                 history.lock().unwrap().push(Event::Returned(id, outcome));
                 for (index, observed) in observed.into_iter().enumerate() {
-                    let observation_waiter_id = HistoryId::ObservationWaiter {
-                        client,
-                        transaction,
+                    let observation = ObservationId {
+                        transaction: transaction_id,
                         observation: index,
                     };
+                    let observation_waiter_id = HistoryId::ObservationWaiter(observation);
                     history.lock().unwrap().push(Event::Invoked(
                         observation_waiter_id,
-                        HistoryOperation::ObservationFired {
-                            key: observed.key.clone(),
-                            seen: observed.seen.clone(),
-                        },
+                        HistoryOperation::ObservationFired(observation),
                     ));
                     let store = store.clone();
                     let history = history.clone();
@@ -348,31 +351,48 @@ pub(crate) async fn cancel_at_nth_suspension<F: Future>(future: F, n: usize) -> 
 async fn settle_observation_waiters<S: KeyValueStore>(
     store: &S,
     observation_waiters: Vec<ObservationWaiter>,
+    possible_late_commits: usize,
 ) -> Result<(), TestCaseError> {
-    let keys: Vec<Bytes> = observation_waiters
-        .iter()
-        .map(|observation_waiter| observation_waiter.key.clone())
-        .collect();
-    let final_values = store
-        .read_transact(move |transaction| {
-            let keys = keys.clone();
-            Box::pin(async move {
-                let mut values = Vec::new();
-                for key in keys {
-                    values.push(transaction.get(key).await?);
+    for mut observation_waiter in observation_waiters {
+        let mut late_commits_left = possible_late_commits;
+        loop {
+            let key = observation_waiter.key.clone();
+            let (current, observation) = store
+                .read_transact(move |transaction| {
+                    let key = key.clone();
+                    Box::pin(async move {
+                        let current = transaction.get(key.clone()).await?;
+                        Ok((current, transaction.observe(key)?))
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    TestCaseError::fail(format!("reading a watched key failed: {error}"))
+                })?;
+            if current == observation_waiter.seen {
+                observation_waiter.task.now_or_never();
+                break;
+            }
+            let changed_again = pin!(store.changed(observation));
+            match select(&mut observation_waiter.task, changed_again).await {
+                Either::Left(((), _)) => break,
+                Either::Right((Ok(()), _)) => {
+                    if late_commits_left == 0 {
+                        return Err(TestCaseError::fail(
+                            "changed resolved although no transaction could still change the key",
+                        ));
+                    }
+                    late_commits_left -= 1;
                 }
-                Ok(values)
-            })
-        })
-        .await
-        .map_err(|error| {
-            TestCaseError::fail(format!("reading the final values failed: {error}"))
-        })?;
-    for (observation_waiter, final_value) in observation_waiters.into_iter().zip(final_values) {
-        if final_value != observation_waiter.seen {
-            observation_waiter.task.await;
-        } else {
-            observation_waiter.task.now_or_never();
+                Either::Right((Err(StoreError::Rejected(NotCommitted)), _)) => {
+                    return Err(TestCaseError::fail(
+                        "changed reported NotCommitted for an observation from a read transaction that finished",
+                    ));
+                }
+                Either::Right((Err(StoreError::Failed(failure)), _)) => {
+                    return Err(TestCaseError::fail(format!("changed failed: {failure}")));
+                }
+            }
         }
     }
     Ok(())
