@@ -14,8 +14,7 @@ use bytes::Bytes;
 use futures_lite::future::block_on;
 use futures_util::FutureExt;
 use proptest::prelude::any;
-use proptest::{prop_assert, proptest};
-use stateright::semantics::ConsistencyTester;
+use proptest::proptest;
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
 use crate::activity::{simulated_client_activity, simulated_client_transactions, simulated_stop};
@@ -35,11 +34,7 @@ pub fn is_strictly_serializable<R: ReplayingRuntime, S: KeyValueStore + 'static>
 ) {
     let new_store = Arc::new(new_store);
     proptest!(|(simulated_client_activity in simulated_client_activity(), seed in any::<u64>())| {
-        let tester = simulate(&runtime, new_store.clone(), simulated_client_activity, seed)?;
-        prop_assert!(
-            tester.is_consistent(),
-            "no serial order explains this history: {tester:?}"
-        );
+        simulate(&runtime, new_store.clone(), simulated_client_activity, seed)?;
     });
 }
 
@@ -130,7 +125,7 @@ pub fn is_durable<R, S, C>(
         seed in any::<u64>(),
         stop in simulated_stop(),
     )| {
-        let (before_reopen, after_reopen) = simulate_and_reopen(
+        simulate_and_reopen(
             &runtime,
             new_store.clone(),
             reopen.clone(),
@@ -139,13 +134,5 @@ pub fn is_durable<R, S, C>(
             seed,
             stop,
         )?;
-        prop_assert!(
-            before_reopen.is_consistent(),
-            "no serial order explains the history up to reading the reopened store: {before_reopen:?}"
-        );
-        prop_assert!(
-            after_reopen.is_consistent(),
-            "no serial order explains the history after the reopen, starting from what the reopened store held: {after_reopen:?}"
-        );
     });
 }

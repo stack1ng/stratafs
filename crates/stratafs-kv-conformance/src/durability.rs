@@ -9,7 +9,10 @@ use crate::activity::{SimulatedCall, SimulatedRead, SimulatedStop, SimulatedTran
 use crate::execute::execute;
 use crate::model::{BTreeModel, HistoryOperation, Outcome, Seen};
 use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
-use crate::simulation::{Event, HistoryId, Tester, run_simulated_client_activity, tester_from};
+use crate::simulation::{
+    Event, HistoryId, check_strictly_serializable, keep_first_failure,
+    run_simulated_client_activity,
+};
 
 pub trait CrashableStorage: Clone + Send + Sync + 'static {
     fn storage_operations(&self) -> usize;
@@ -25,7 +28,7 @@ pub(crate) fn simulate_and_reopen<R, S, C, N, O>(
     simulated_client_activity_after_reopen: Vec<Vec<SimulatedCall>>,
     seed: u64,
     stop: SimulatedStop,
-) -> Result<(Tester, Tester), TestCaseError>
+) -> Result<(), TestCaseError>
 where
     R: ReplayingRuntime,
     S: KeyValueStore + 'static,
@@ -55,7 +58,7 @@ where
         let simulated_client_activity_after_reopen = simulated_client_activity_after_reopen.clone();
         let simulation_result = simulation_result.clone();
         async move {
-            let histories = stop_and_reopen(
+            let checked = stop_and_reopen(
                 &replay,
                 new_store,
                 &*reopen,
@@ -63,16 +66,23 @@ where
                 simulated_client_transactions_before_stop,
                 simulated_client_activity_after_reopen,
             )
-            .await;
-            *simulation_result.lock().unwrap() = Some(histories);
+            .await
+            .and_then(|(before_reopen, reopened_model, after_reopen)| {
+                check_strictly_serializable(
+                    BTreeModel::default(),
+                    before_reopen,
+                    "no serial order explains the history up to reading the reopened store",
+                )?;
+                check_strictly_serializable(
+                    reopened_model,
+                    after_reopen,
+                    "no serial order explains the history after the reopen, starting from what the reopened store held",
+                )
+            });
+            keep_first_failure(&simulation_result, checked);
         }
     });
-    let (before_reopen, reopened_model, after_reopen) =
-        result.lock().unwrap().take().expect("the simulation ran")?;
-    Ok((
-        tester_from(BTreeModel::default(), before_reopen)?,
-        tester_from(reopened_model, after_reopen)?,
-    ))
+    result.lock().unwrap().take().expect("the simulation ran")
 }
 
 async fn stop_and_reopen<P, S, C, N>(

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use bytes::Bytes;
+use futures_util::FutureExt;
 use futures_util::future::RemoteHandle;
 use proptest::test_runner::TestCaseError;
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
@@ -49,7 +50,7 @@ pub(crate) fn simulate<R, S, N>(
     new_store: Arc<N>,
     simulated_client_activity: Vec<Vec<SimulatedCall>>,
     seed: u64,
-) -> Result<Tester, TestCaseError>
+) -> Result<(), TestCaseError>
 where
     R: ReplayingRuntime,
     S: KeyValueStore + 'static,
@@ -62,18 +63,47 @@ where
         let simulated_client_activity = simulated_client_activity.clone();
         let simulation_result = simulation_result.clone();
         async move {
-            let history = run_simulated_client_activity(
+            let checked = run_simulated_client_activity(
                 &replay,
                 Arc::new(new_store()),
                 new_store,
                 simulated_client_activity,
             )
-            .await;
-            *simulation_result.lock().unwrap() = Some(history);
+            .await
+            .and_then(|history| {
+                check_strictly_serializable(
+                    BTreeModel::default(),
+                    history,
+                    "no serial order explains this history",
+                )
+            });
+            keep_first_failure(&simulation_result, checked);
         }
     });
-    let history = result.lock().unwrap().take().expect("the simulation ran")?;
-    tester_from(BTreeModel::default(), history)
+    result.lock().unwrap().take().expect("the simulation ran")
+}
+
+pub(crate) fn keep_first_failure(
+    slot: &Mutex<Option<Result<(), TestCaseError>>>,
+    result: Result<(), TestCaseError>,
+) {
+    let mut slot = slot.lock().unwrap();
+    if !matches!(*slot, Some(Err(_))) {
+        *slot = Some(result);
+    }
+}
+
+pub(crate) fn check_strictly_serializable(
+    starting_model: BTreeModel,
+    history: Vec<Event>,
+    violation: &str,
+) -> Result<(), TestCaseError> {
+    let tester = tester_from(starting_model, history)?;
+    if tester.is_consistent() {
+        Ok(())
+    } else {
+        Err(TestCaseError::fail(format!("{violation}: {tester:?}")))
+    }
 }
 
 pub(crate) async fn run_simulated_client_activity<P, S, N>(
@@ -125,10 +155,7 @@ where
     clients_result.map(|()| history)
 }
 
-pub(crate) fn tester_from(
-    starting_model: BTreeModel,
-    history: Vec<Event>,
-) -> Result<Tester, TestCaseError> {
+fn tester_from(starting_model: BTreeModel, history: Vec<Event>) -> Result<Tester, TestCaseError> {
     let fired: BTreeSet<HistoryId> = history
         .iter()
         .filter_map(|event| match event {
@@ -344,6 +371,8 @@ async fn settle_observation_waiters<S: KeyValueStore>(
     for (observation_waiter, final_value) in observation_waiters.into_iter().zip(final_values) {
         if final_value != observation_waiter.seen {
             observation_waiter.task.await;
+        } else {
+            observation_waiter.task.now_or_never();
         }
     }
     Ok(())
