@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod durability;
 mod execute;
 mod model;
 mod observation_lifecycle;
@@ -17,7 +18,8 @@ use proptest::{prop_assert, proptest};
 use stateright::semantics::ConsistencyTester;
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
-use crate::activity::simulated_client_activity;
+use crate::activity::{simulated_client_activity, simulated_stop};
+use crate::durability::{CrashableStorage, simulate_and_reopen};
 use crate::observation_lifecycle::{KeyChange, count_change_suspensions, run_observation_scenario};
 use crate::runtime::ReplayingRuntime;
 use crate::simulation::simulate;
@@ -107,4 +109,43 @@ pub fn observation_lifecycle<R: ReplayingRuntime, S: KeyValueStore + 'static>(
             }
         }
     }
+}
+
+// is_durable exercises the durability of the store,
+// by simulating a client activity before and after a stop,
+// which can either be caused by a crash, or a clean exit.
+pub fn is_durable<R, S, C>(
+    runtime: R,
+    new_store: impl Fn() -> (S, C) + Send + Sync + 'static,
+    reopen: impl Fn(C) -> S + Send + Sync + 'static,
+) where
+    R: ReplayingRuntime,
+    S: KeyValueStore + 'static,
+    C: CrashableStorage,
+{
+    let (new_store, reopen) = (Arc::new(new_store), Arc::new(reopen));
+    proptest!(|(
+        simulated_client_activity_before_stop in simulated_client_activity(),
+        simulated_client_activity_after_reopen in simulated_client_activity(),
+        seed in any::<u64>(),
+        stop in simulated_stop(),
+    )| {
+        let (before_reopen, after_reopen) = simulate_and_reopen(
+            &runtime,
+            new_store.clone(),
+            reopen.clone(),
+            simulated_client_activity_before_stop,
+            simulated_client_activity_after_reopen,
+            seed,
+            stop,
+        )?;
+        prop_assert!(
+            before_reopen.is_consistent(),
+            "no serial order explains the history up to reading the reopened store: {before_reopen:?}"
+        );
+        prop_assert!(
+            after_reopen.is_consistent(),
+            "no serial order explains the history after the reopen, starting from what the reopened store held: {after_reopen:?}"
+        );
+    });
 }

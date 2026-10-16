@@ -33,7 +33,7 @@ pub(crate) enum HistoryId {
     },
 }
 
-enum Event {
+pub(crate) enum Event {
     Invoked(HistoryId, HistoryOperation),
     Returned(HistoryId, Outcome),
 }
@@ -64,49 +64,69 @@ where
         let simulated_client_activity = simulated_client_activity.clone();
         let simulation_result = simulation_result.clone();
         async move {
-            let history = Arc::new(Mutex::new(Vec::new()));
-            let clients: Vec<_> = simulated_client_activity
-                .into_iter()
-                .enumerate()
-                .map(|(client, simulated_calls)| {
-                    spawn_with_handle(
-                        &replay,
-                        run_client(
-                            replay.clone(),
-                            store.clone(),
-                            new_store.clone(),
-                            history.clone(),
-                            client,
-                            simulated_calls,
-                        ),
-                    )
-                })
-                .collect();
-            let mut observation_waiters = Vec::new();
-            let mut failure = None;
-            for client in clients {
-                match client.await {
-                    Ok(client_observation_waiters) => {
-                        observation_waiters.extend(client_observation_waiters)
-                    }
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                    }
-                }
-            }
-            let clients_result = match failure {
-                Some(failure) => Err(failure),
-                None => settle_observation_waiters(&*store, observation_waiters).await,
-            };
-            let history = std::mem::take(&mut *history.lock().unwrap());
-            *simulation_result.lock().unwrap() = Some(clients_result.map(|()| history));
+            let history =
+                run_simulated_client_activity(&replay, store, new_store, simulated_client_activity)
+                    .await;
+            *simulation_result.lock().unwrap() = Some(history);
         }
     });
     let history = result.lock().unwrap().take().expect("the simulation ran")?;
-    tester_from(history)
+    tester_from(BTreeModel::default(), history)
 }
 
-fn tester_from(history: Vec<Event>) -> Result<Tester, TestCaseError> {
+pub(crate) async fn run_simulated_client_activity<P, S, N>(
+    replay: &P,
+    store: Arc<S>,
+    new_store: Arc<N>,
+    simulated_client_activity: Vec<Vec<SimulatedCall>>,
+) -> Result<Vec<Event>, TestCaseError>
+where
+    P: Replay,
+    S: KeyValueStore + 'static,
+    N: Fn() -> S + Send + Sync + 'static,
+{
+    let history = Arc::new(Mutex::new(Vec::new()));
+    let clients: Vec<_> = simulated_client_activity
+        .into_iter()
+        .enumerate()
+        .map(|(client, simulated_calls)| {
+            spawn_with_handle(
+                replay,
+                run_client(
+                    replay.clone(),
+                    store.clone(),
+                    new_store.clone(),
+                    history.clone(),
+                    client,
+                    simulated_calls,
+                ),
+            )
+        })
+        .collect();
+    let mut observation_waiters = Vec::new();
+    let mut failure = None;
+    for client in clients {
+        match client.await {
+            Ok(client_observation_waiters) => {
+                observation_waiters.extend(client_observation_waiters)
+            }
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    let clients_result = match failure {
+        Some(failure) => Err(failure),
+        None => settle_observation_waiters(&*store, observation_waiters).await,
+    };
+    let history = std::mem::take(&mut *history.lock().unwrap());
+    clients_result.map(|()| history)
+}
+
+pub(crate) fn tester_from(
+    starting_model: BTreeModel,
+    history: Vec<Event>,
+) -> Result<Tester, TestCaseError> {
     let fired: BTreeSet<HistoryId> = history
         .iter()
         .filter_map(|event| match event {
@@ -114,7 +134,7 @@ fn tester_from(history: Vec<Event>) -> Result<Tester, TestCaseError> {
             _ => None,
         })
         .collect();
-    let mut tester = LinearizabilityTester::new(BTreeModel::default());
+    let mut tester = LinearizabilityTester::new(starting_model);
     for event in history {
         match event {
             Event::Invoked(id @ HistoryId::ObservationWaiter { .. }, _) if !fired.contains(&id) => {

@@ -27,7 +27,7 @@ pub enum Seen {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct BTreeModel(BTreeMap<Bytes, Bytes>);
+pub struct BTreeModel(pub(crate) BTreeMap<Bytes, Bytes>);
 
 impl SequentialSpec for BTreeModel {
     type Op = HistoryOperation;

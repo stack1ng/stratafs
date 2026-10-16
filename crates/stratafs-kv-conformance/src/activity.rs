@@ -37,6 +37,19 @@ pub struct SimulatedCall {
     pub cancelled_at_fraction: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SimulatedStop {
+    Clean,
+    CrashAtFraction(f64),
+}
+
+pub fn simulated_stop() -> impl Strategy<Value = SimulatedStop> {
+    prop_oneof![
+        1 => Just(SimulatedStop::Clean),
+        3 => (0.0..1.0).prop_map(SimulatedStop::CrashAtFraction),
+    ]
+}
+
 pub fn simulated_client_activity() -> impl Strategy<Value = Vec<Vec<SimulatedCall>>> {
     vec(vec(call(), 1..=6), 1..=4)
 }

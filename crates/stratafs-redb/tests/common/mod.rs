@@ -1,6 +1,5 @@
 use futures_lite::future::yield_now;
-use redb::Database;
-use redb::backends::InMemoryBackend;
+use redb::{Database, StorageBackend};
 use stratafs_redb::{RedbStore, SpawnBlocking};
 
 pub struct SimulatedThreadPool;
@@ -19,11 +18,9 @@ impl SpawnBlocking for SimulatedThreadPool {
     }
 }
 
-pub fn new_store() -> RedbStore<SimulatedThreadPool> {
+pub fn open_store(backend: impl StorageBackend) -> RedbStore<SimulatedThreadPool> {
     RedbStore::new(
-        Database::builder()
-            .create_with_backend(InMemoryBackend::new())
-            .unwrap(),
+        Database::builder().create_with_backend(backend).unwrap(),
         SimulatedThreadPool,
     )
     .unwrap()
