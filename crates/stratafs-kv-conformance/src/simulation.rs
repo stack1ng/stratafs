@@ -55,18 +55,20 @@ where
     S: KeyValueStore + 'static,
     N: Fn() -> S + Send + Sync + 'static,
 {
-    let store = Arc::new(new_store());
     let result = Arc::new(Mutex::new(None));
     let simulation_result = result.clone();
     runtime.run(seed, move |replay| {
-        let store = store.clone();
         let new_store = new_store.clone();
         let simulated_client_activity = simulated_client_activity.clone();
         let simulation_result = simulation_result.clone();
         async move {
-            let history =
-                run_simulated_client_activity(&replay, store, new_store, simulated_client_activity)
-                    .await;
+            let history = run_simulated_client_activity(
+                &replay,
+                Arc::new(new_store()),
+                new_store,
+                simulated_client_activity,
+            )
+            .await;
             *simulation_result.lock().unwrap() = Some(history);
         }
     });

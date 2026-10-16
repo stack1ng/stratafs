@@ -21,7 +21,7 @@ pub(crate) fn simulate_and_reopen<R, S, C, N, O>(
     runtime: &R,
     new_store: Arc<N>,
     reopen: Arc<O>,
-    simulated_client_activity_before_stop: Vec<Vec<SimulatedCall>>,
+    simulated_client_transactions_before_stop: Vec<Vec<SimulatedTransaction>>,
     simulated_client_activity_after_reopen: Vec<Vec<SimulatedCall>>,
     seed: u64,
     stop: SimulatedStop,
@@ -39,7 +39,7 @@ where
             let (activity_start, activity_end) = measure_storage_operations(
                 runtime,
                 new_store.clone(),
-                simulated_client_activity_before_stop.clone(),
+                simulated_client_transactions_before_stop.clone(),
                 seed,
             );
             Some(activity_start + (fraction * (activity_end - activity_start + 1) as f64) as usize)
@@ -50,7 +50,8 @@ where
     runtime.run(seed, move |replay| {
         let new_store = new_store.clone();
         let reopen = reopen.clone();
-        let simulated_client_activity_before_stop = simulated_client_activity_before_stop.clone();
+        let simulated_client_transactions_before_stop =
+            simulated_client_transactions_before_stop.clone();
         let simulated_client_activity_after_reopen = simulated_client_activity_after_reopen.clone();
         let simulation_result = simulation_result.clone();
         async move {
@@ -59,7 +60,7 @@ where
                 new_store,
                 &*reopen,
                 crash_point,
-                simulated_client_activity_before_stop,
+                simulated_client_transactions_before_stop,
                 simulated_client_activity_after_reopen,
             )
             .await;
@@ -79,7 +80,7 @@ async fn stop_and_reopen<P, S, C, N>(
     new_store: Arc<N>,
     reopen: &impl Fn(C) -> S,
     crash_point: Option<usize>,
-    simulated_client_activity_before_stop: Vec<Vec<SimulatedCall>>,
+    simulated_client_transactions_before_stop: Vec<Vec<SimulatedTransaction>>,
     simulated_client_activity_after_reopen: Vec<Vec<SimulatedCall>>,
 ) -> Result<(Vec<Event>, BTreeModel, Vec<Event>), TestCaseError>
 where
@@ -94,14 +95,14 @@ where
     }
     let store = Arc::new(store);
     let history = Arc::new(Mutex::new(Vec::new()));
-    let final_client = simulated_client_activity_before_stop.len();
+    let final_client = simulated_client_transactions_before_stop.len();
     run_clients_until_crash(
         replay,
         &store,
         &storage,
         crash_point,
         &history,
-        simulated_client_activity_before_stop,
+        simulated_client_transactions_before_stop,
     )
     .await?;
     drop(store);
@@ -121,7 +122,7 @@ where
 fn measure_storage_operations<R, S, C, N>(
     runtime: &R,
     new_store: Arc<N>,
-    simulated_client_activity: Vec<Vec<SimulatedCall>>,
+    simulated_client_transactions: Vec<Vec<SimulatedTransaction>>,
     seed: u64,
 ) -> (usize, usize)
 where
@@ -134,7 +135,7 @@ where
     let operations = measured.clone();
     runtime.run(seed, move |replay| {
         let new_store = new_store.clone();
-        let simulated_client_activity = simulated_client_activity.clone();
+        let simulated_client_transactions = simulated_client_transactions.clone();
         let operations = operations.clone();
         async move {
             let (store, storage) = new_store();
@@ -146,7 +147,7 @@ where
                 &storage,
                 None,
                 &history,
-                simulated_client_activity,
+                simulated_client_transactions,
             )
             .await;
             *operations.lock().unwrap() = (activity_start, storage.storage_operations());
@@ -161,17 +162,17 @@ async fn run_clients_until_crash<P, S, C>(
     storage: &C,
     crash_point: Option<usize>,
     history: &Arc<Mutex<Vec<Event>>>,
-    simulated_client_activity: Vec<Vec<SimulatedCall>>,
+    simulated_client_transactions: Vec<Vec<SimulatedTransaction>>,
 ) -> Result<(), TestCaseError>
 where
     P: Replay,
     S: KeyValueStore + 'static,
     C: CrashableStorage,
 {
-    let clients: Vec<_> = simulated_client_activity
+    let clients: Vec<_> = simulated_client_transactions
         .into_iter()
         .enumerate()
-        .map(|(client, simulated_calls)| {
+        .map(|(client, simulated_transactions)| {
             spawn_with_handle(
                 replay,
                 run_client_until_crash(
@@ -180,7 +181,7 @@ where
                     crash_point,
                     history.clone(),
                     client,
-                    simulated_calls,
+                    simulated_transactions,
                 ),
             )
         })
@@ -200,7 +201,7 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
     crash_point: Option<usize>,
     history: Arc<Mutex<Vec<Event>>>,
     client: usize,
-    simulated_calls: Vec<SimulatedCall>,
+    simulated_transactions: Vec<SimulatedTransaction>,
 ) -> Result<(), TestCaseError> {
     let crashed =
         || crash_point.is_some_and(|crash_point| storage.storage_operations() > crash_point);
@@ -208,15 +209,15 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
         client,
         generation: 0,
     };
-    for simulated_call in simulated_calls {
+    for transaction in simulated_transactions {
         if crashed() {
             return Ok(());
         }
         history.lock().unwrap().push(Event::Invoked(
             id,
-            HistoryOperation::Transaction(simulated_call.transaction.clone()),
+            HistoryOperation::Transaction(transaction.clone()),
         ));
-        let (result, _) = execute(&*store, simulated_call.transaction).await;
+        let (result, _) = execute(&*store, transaction).await;
         if crashed() {
             return Ok(());
         }

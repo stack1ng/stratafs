@@ -18,7 +18,7 @@ use proptest::{prop_assert, proptest};
 use stateright::semantics::ConsistencyTester;
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
-use crate::activity::{simulated_client_activity, simulated_stop};
+use crate::activity::{simulated_client_activity, simulated_client_transactions, simulated_stop};
 use crate::durability::{CrashableStorage, simulate_and_reopen};
 use crate::observation_lifecycle::{KeyChange, count_change_suspensions, run_observation_scenario};
 use crate::runtime::ReplayingRuntime;
@@ -125,7 +125,7 @@ pub fn is_durable<R, S, C>(
 {
     let (new_store, reopen) = (Arc::new(new_store), Arc::new(reopen));
     proptest!(|(
-        simulated_client_activity_before_stop in simulated_client_activity(),
+        simulated_client_transactions_before_stop in simulated_client_transactions(),
         simulated_client_activity_after_reopen in simulated_client_activity(),
         seed in any::<u64>(),
         stop in simulated_stop(),
@@ -134,7 +134,7 @@ pub fn is_durable<R, S, C>(
             &runtime,
             new_store.clone(),
             reopen.clone(),
-            simulated_client_activity_before_stop,
+            simulated_client_transactions_before_stop,
             simulated_client_activity_after_reopen,
             seed,
             stop,

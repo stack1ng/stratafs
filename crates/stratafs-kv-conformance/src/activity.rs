@@ -51,7 +51,15 @@ pub fn simulated_stop() -> impl Strategy<Value = SimulatedStop> {
 }
 
 pub fn simulated_client_activity() -> impl Strategy<Value = Vec<Vec<SimulatedCall>>> {
-    vec(vec(call(), 1..=6), 1..=4)
+    concurrent_clients(call())
+}
+
+pub fn simulated_client_transactions() -> impl Strategy<Value = Vec<Vec<SimulatedTransaction>>> {
+    concurrent_clients(transaction())
+}
+
+fn concurrent_clients<C: Strategy>(call: C) -> impl Strategy<Value = Vec<Vec<C::Value>>> {
+    vec(vec(call, 1..=6), 1..=4)
 }
 
 fn call() -> impl Strategy<Value = SimulatedCall> {
