@@ -210,7 +210,9 @@ where
                             Err(StoreError::Rejected(NotCommitted)) => panic!(
                                 "changed reported NotCommitted for an observation whose transaction committed"
                             ),
-                            Err(StoreError::Failed(_)) => {}
+                            Err(StoreError::Failed(failure)) => {
+                                panic!("changed failed: {failure}")
+                            }
                         }
                     });
                     observation_waiters.push(ObservationWaiter {
@@ -220,7 +222,11 @@ where
                     });
                 }
             }
-            Err(StoreError::Failed(_)) => generation += 1,
+            Err(StoreError::Failed(failure)) => {
+                return Err(TestCaseError::fail(format!(
+                    "the store failed a transaction: {failure}"
+                )));
+            }
             Err(StoreError::Rejected(rejection)) => {
                 return Err(TestCaseError::fail(format!(
                     "a transaction this small was rejected: {rejection}"
