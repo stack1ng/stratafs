@@ -38,6 +38,8 @@ pub trait KeyValueStore: Send + Sync {
         + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 
+    // changed returns a future that resolves once the observed key differs from what its transaction saw (see observe).
+    // It fails if the transaction that produced the observation did not finish successfully.
     fn changed(
         &self,
         observation: Self::Observation,
@@ -72,7 +74,6 @@ pub trait ReadKeyValueTransaction: Send + Sync {
     // observe returns an observation, which can be observed from the store (with changed())
     // to give a future that resolves once this key is in a different state
     // from what this transaction saw, after the transaction finishes.
-    // Fails if the transaction does not finish successfully.
     fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure>;
 }
 

@@ -4,11 +4,11 @@ use shuttle::scheduler::{DfsScheduler, RandomScheduler, Scheduler};
 use shuttle::{Config, Runner};
 
 // ReplayingRuntime is an async runtime that is expected to replay the run body
-// for the purpose of exercising unique code branches.
+// for the purpose of exercising unique interleavings of tasks.
 pub trait ReplayingRuntime {
     type Replay: Replay;
 
-    // run runs the given body any number of times
+    // run runs the given body one or more times, each time with a unique Replay
     fn run<B, F>(&self, seed: u64, body: B)
     where
         B: Fn(Self::Replay) -> F + Send + Sync + 'static,
