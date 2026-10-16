@@ -2,17 +2,16 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use futures_util::future::RemoteHandle;
 use proptest::test_runner::TestCaseError;
-use shuttle::future::JoinHandle;
-use shuttle::scheduler::RandomScheduler;
-use shuttle::{Config, Runner};
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
 use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
+use stratafs_store::kv::{KeyValueStore, NotCommitted, ReadKeyValueTransaction};
 
 use crate::activity::SimulatedTransaction;
 use crate::execute::{Observed, execute};
 use crate::model::{BTreeModel, HistoryOperation, Outcome};
+use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
 
 pub(crate) type Tester = LinearizabilityTester<HistoryId, BTreeModel>;
 
@@ -37,39 +36,44 @@ enum Event {
 struct ObservationWaiter {
     key: Bytes,
     seen: Option<Bytes>,
-    task: JoinHandle<()>,
+    task: RemoteHandle<()>,
 }
 
-pub(crate) fn simulate<S: KeyValueStore + 'static>(
+pub(crate) fn simulate<R: ReplayingRuntime, S: KeyValueStore + 'static>(
+    runtime: &R,
     store: S,
     simulated_client_activity: Vec<Vec<SimulatedTransaction>>,
     seed: u64,
 ) -> Result<Tester, TestCaseError> {
     let store = Arc::new(store);
-    let mut config = Config::default();
-    config.stack_size = 1 << 20;
     let result = Arc::new(Mutex::new(None));
     let simulation_result = result.clone();
-    Runner::new(RandomScheduler::new_from_seed(seed, 1), config).run(move || {
-        let history = Arc::new(Mutex::new(Vec::new()));
-        let clients: Vec<_> = simulated_client_activity
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(client, simulated_transactions)| {
-                shuttle::future::spawn(run_client(
-                    store.clone(),
-                    history.clone(),
-                    client,
-                    simulated_transactions,
-                ))
-            })
-            .collect();
-        let clients_result = shuttle::future::block_on(async {
+    runtime.run(seed, move |replay| {
+        let store = store.clone();
+        let simulated_client_activity = simulated_client_activity.clone();
+        let simulation_result = simulation_result.clone();
+        async move {
+            let history = Arc::new(Mutex::new(Vec::new()));
+            let clients: Vec<_> = simulated_client_activity
+                .into_iter()
+                .enumerate()
+                .map(|(client, simulated_transactions)| {
+                    spawn_with_handle(
+                        &replay,
+                        run_client(
+                            replay.clone(),
+                            store.clone(),
+                            history.clone(),
+                            client,
+                            simulated_transactions,
+                        ),
+                    )
+                })
+                .collect();
             let mut observation_waiters = Vec::new();
             let mut failure = None;
             for client in clients {
-                match client.await.expect("client tasks are never cancelled") {
+                match client.await {
                     Ok(client_observation_waiters) => {
                         observation_waiters.extend(client_observation_waiters)
                     }
@@ -78,28 +82,15 @@ pub(crate) fn simulate<S: KeyValueStore + 'static>(
                     }
                 }
             }
-            match failure {
-                Some(failure) => {
-                    for observation_waiter in observation_waiters {
-                        observation_waiter.task.abort();
-                        let _ = observation_waiter.task.await;
-                    }
-                    Err(failure)
-                }
+            let clients_result = match failure {
+                Some(failure) => Err(failure),
                 None => settle_observation_waiters(&*store, observation_waiters).await,
-            }
-        });
-        let history = Arc::into_inner(history)
-            .expect("every task has finished")
-            .into_inner()
-            .expect("no task panicked while recording");
-        *simulation_result.lock().unwrap() = Some(clients_result.map(|()| history));
+            };
+            let history = std::mem::take(&mut *history.lock().unwrap());
+            *simulation_result.lock().unwrap() = Some(clients_result.map(|()| history));
+        }
     });
-    let history = Arc::into_inner(result)
-        .expect("the simulation has finished")
-        .into_inner()
-        .unwrap()
-        .expect("the simulation ran once")?;
+    let history = result.lock().unwrap().take().expect("the simulation ran")?;
     tester_from(history)
 }
 
@@ -129,7 +120,8 @@ fn tester_from(history: Vec<Event>) -> Result<Tester, TestCaseError> {
     Ok(tester)
 }
 
-async fn run_client<S: KeyValueStore + 'static>(
+async fn run_client<P: Replay, S: KeyValueStore + 'static>(
+    replay: P,
     store: Arc<S>,
     history: Arc<Mutex<Vec<Event>>>,
     client: usize,
@@ -151,9 +143,12 @@ async fn run_client<S: KeyValueStore + 'static>(
                     .unwrap()
                     .push(Event::Returned(id, Outcome::Panicked));
                 for Observed { observation, .. } in observed {
-                    if store.changed(observation).await.is_ok() {
+                    if !matches!(
+                        store.changed(observation).await,
+                        Err(StoreError::Rejected(NotCommitted))
+                    ) {
                         return Err(TestCaseError::fail(
-                            "changed resolved for an observation whose transaction panicked",
+                            "changed did not report NotCommitted for an observation whose transaction panicked",
                         ));
                     }
                 }
@@ -175,12 +170,16 @@ async fn run_client<S: KeyValueStore + 'static>(
                     ));
                     let store = store.clone();
                     let history = history.clone();
-                    let task = shuttle::future::spawn(async move {
-                        if store.changed(observed.observation).await.is_ok() {
-                            history.lock().unwrap().push(Event::Returned(
+                    let task = spawn_with_handle(&replay, async move {
+                        match store.changed(observed.observation).await {
+                            Ok(()) => history.lock().unwrap().push(Event::Returned(
                                 observation_waiter_id,
                                 Outcome::Changed(true),
-                            ));
+                            )),
+                            Err(StoreError::Rejected(NotCommitted)) => panic!(
+                                "changed reported NotCommitted for an observation whose transaction committed"
+                            ),
+                            Err(StoreError::Failed(_)) => {}
                         }
                     });
                     observation_waiters.push(ObservationWaiter {
@@ -227,10 +226,9 @@ async fn settle_observation_waiters<S: KeyValueStore>(
             TestCaseError::fail(format!("reading the final values failed: {error}"))
         })?;
     for (observation_waiter, final_value) in observation_waiters.into_iter().zip(final_values) {
-        if final_value == observation_waiter.seen {
-            observation_waiter.task.abort();
+        if final_value != observation_waiter.seen {
+            observation_waiter.task.await;
         }
-        let _ = observation_waiter.task.await;
     }
     Ok(())
 }

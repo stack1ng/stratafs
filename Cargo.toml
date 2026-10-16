@@ -15,6 +15,7 @@ bytes = "1.12"
 cfg_aliases = "0.2"
 derive_more = { version = "2.1", features = ["from", "try_into"] }
 event-listener = "5.4"
+futures-channel = "0.3.34"
 futures-core = "0.3.34"
 futures-lite = "2.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }

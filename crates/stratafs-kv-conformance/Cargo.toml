@@ -7,8 +7,9 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+futures-channel.workspace = true
 futures-lite.workspace = true
-futures-util.workspace = true
+futures-util = { workspace = true, features = ["channel"] }
 proptest.workspace = true
 shuttle.workspace = true
 stateright.workspace = true

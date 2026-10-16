@@ -5,6 +5,10 @@ use futures_core::future::BoxFuture;
 
 use crate::error::StoreError;
 
+#[derive(Debug, thiserror::Error)]
+#[error("the transaction that made this observation did not commit")]
+pub struct NotCommitted;
+
 pub trait KeyValueStore: Send + Sync {
     type Rejection: std::error::Error + Send + Sync + 'static;
     type Failure: std::error::Error + Send + Sync + 'static;
@@ -37,7 +41,7 @@ pub trait KeyValueStore: Send + Sync {
     fn changed(
         &self,
         observation: Self::Observation,
-    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
+    ) -> impl Future<Output = Result<(), StoreError<NotCommitted, Self::Failure>>> + Send;
 }
 
 pub trait KeyValueTransaction: ReadKeyValueTransaction {

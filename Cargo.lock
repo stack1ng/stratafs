@@ -1380,6 +1380,7 @@ name = "stratafs-kv-conformance"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-channel",
  "futures-lite",
  "futures-util",
  "proptest",
@@ -1408,6 +1409,7 @@ dependencies = [
  "blocking",
  "bytes",
  "cfg_aliases",
+ "futures-channel",
  "futures-core",
  "futures-lite",
  "futures-util",
