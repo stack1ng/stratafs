@@ -9,7 +9,7 @@ use crate::activity::{SimulatedOperation, SimulatedRead, SimulatedTransaction};
 #[derive(Clone, Debug)]
 pub enum HistoryOperation {
     Transaction(SimulatedTransaction),
-    Changed { key: Bytes, seen: Option<Bytes> },
+    ObservationFired { key: Bytes, seen: Option<Bytes> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,7 +36,7 @@ impl SequentialSpec for BTreeModel {
     fn invoke(&mut self, operation: &HistoryOperation) -> Outcome {
         match operation {
             HistoryOperation::Transaction(transaction) => self.transact(transaction),
-            HistoryOperation::Changed { key, seen } => {
+            HistoryOperation::ObservationFired { key, seen } => {
                 Outcome::Changed(self.0.get(key) != seen.as_ref())
             }
         }

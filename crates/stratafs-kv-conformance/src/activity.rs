@@ -31,8 +31,30 @@ pub enum SimulatedRead {
     Observe(Bytes),
 }
 
-pub fn simulated_client_activity() -> impl Strategy<Value = Vec<Vec<SimulatedTransaction>>> {
-    vec(vec(transaction(), 1..=6), 1..=4)
+#[derive(Clone, Debug)]
+pub struct SimulatedCall {
+    pub transaction: SimulatedTransaction,
+    pub cancelled_at_fraction: Option<f64>,
+}
+
+pub fn simulated_client_activity() -> impl Strategy<Value = Vec<Vec<SimulatedCall>>> {
+    vec(vec(call(), 1..=6), 1..=4)
+}
+
+fn call() -> impl Strategy<Value = SimulatedCall> {
+    (transaction(), cancel_at()).prop_map(|(transaction, cancelled_at_fraction)| SimulatedCall {
+        transaction,
+        cancelled_at_fraction,
+    })
+}
+
+// does_cancel either doesnt cancel, or it says what
+// % of the way through the transaction to cancel at
+fn cancel_at() -> impl Strategy<Value = Option<f64>> {
+    prop_oneof![
+        7 => Just(None),
+        1 => (0.0..1.0).prop_map(Some),
+    ]
 }
 
 fn transaction() -> impl Strategy<Value = SimulatedTransaction> {

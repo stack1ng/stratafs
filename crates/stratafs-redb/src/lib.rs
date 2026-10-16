@@ -1,10 +1,9 @@
 use std::ops::RangeBounds;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use futures_channel::oneshot;
 use futures_core::future::BoxFuture;
-use futures_lite::future::yield_now;
 use futures_util::FutureExt;
 use futures_util::future::Shared;
 use futures_util::lock::Mutex;
@@ -48,7 +47,6 @@ impl SpawnBlocking for Inline {
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> T {
-        yield_now().await;
         work()
     }
 }
@@ -75,7 +73,7 @@ pub enum RedbFailure {
 pub struct RedbStore<S> {
     database: Database,
     writer: Mutex<Vec<Bytes>>,
-    notify: KeyedNotify,
+    notify: Arc<KeyedNotify>,
     spawner: S,
 }
 
@@ -87,7 +85,7 @@ impl<S> RedbStore<S> {
         Ok(Self {
             database,
             writer: Mutex::new(Vec::new()),
-            notify: KeyedNotify::new(),
+            notify: Arc::new(KeyedNotify::new()),
             spawner,
         })
     }
@@ -122,13 +120,23 @@ impl<S: SpawnBlocking> KeyValueStore for RedbStore<S> {
                 *written = handle.written;
                 (output?, handle.committed.into_inner())
             };
-            self.spawner
-                .spawn_blocking(move || transaction.commit())
-                .await?;
-            if let Some((committed, _)) = committed {
-                let _ = committed.send(());
-            }
-            self.notify.notify_waiters(&written);
+            let notify = self.notify.clone();
+            let keys = std::mem::take(&mut *written);
+            let (commit, keys) = self
+                .spawner
+                .spawn_blocking(move || {
+                    let commit = transaction.commit();
+                    if commit.is_ok() {
+                        if let Some((committed, _)) = committed {
+                            let _ = committed.send(());
+                        }
+                        notify.notify_waiters(&keys);
+                    }
+                    (commit, keys)
+                })
+                .await;
+            *written = keys;
+            commit?;
             Ok(output)
         }
         .await;

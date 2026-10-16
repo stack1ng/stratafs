@@ -1,14 +1,19 @@
 use std::collections::BTreeSet;
+use std::future::poll_fn;
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use bytes::Bytes;
 use futures_util::future::RemoteHandle;
 use proptest::test_runner::TestCaseError;
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
 use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, NotCommitted, ReadKeyValueTransaction};
+use stratafs_store::kv::{
+    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction,
+};
 
-use crate::activity::SimulatedTransaction;
+use crate::activity::{SimulatedCall, SimulatedTransaction};
 use crate::execute::{Observed, execute};
 use crate::model::{BTreeModel, HistoryOperation, Outcome};
 use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
@@ -39,17 +44,23 @@ struct ObservationWaiter {
     task: RemoteHandle<()>,
 }
 
-pub(crate) fn simulate<R: ReplayingRuntime, S: KeyValueStore + 'static>(
+pub(crate) fn simulate<R, S, N>(
     runtime: &R,
-    store: S,
-    simulated_client_activity: Vec<Vec<SimulatedTransaction>>,
+    new_store: Arc<N>,
+    simulated_client_activity: Vec<Vec<SimulatedCall>>,
     seed: u64,
-) -> Result<Tester, TestCaseError> {
-    let store = Arc::new(store);
+) -> Result<Tester, TestCaseError>
+where
+    R: ReplayingRuntime,
+    S: KeyValueStore + 'static,
+    N: Fn() -> S + Send + Sync + 'static,
+{
+    let store = Arc::new(new_store());
     let result = Arc::new(Mutex::new(None));
     let simulation_result = result.clone();
     runtime.run(seed, move |replay| {
         let store = store.clone();
+        let new_store = new_store.clone();
         let simulated_client_activity = simulated_client_activity.clone();
         let simulation_result = simulation_result.clone();
         async move {
@@ -57,15 +68,16 @@ pub(crate) fn simulate<R: ReplayingRuntime, S: KeyValueStore + 'static>(
             let clients: Vec<_> = simulated_client_activity
                 .into_iter()
                 .enumerate()
-                .map(|(client, simulated_transactions)| {
+                .map(|(client, simulated_calls)| {
                     spawn_with_handle(
                         &replay,
                         run_client(
                             replay.clone(),
                             store.clone(),
+                            new_store.clone(),
                             history.clone(),
                             client,
-                            simulated_transactions,
+                            simulated_calls,
                         ),
                     )
                 })
@@ -120,22 +132,41 @@ fn tester_from(history: Vec<Event>) -> Result<Tester, TestCaseError> {
     Ok(tester)
 }
 
-async fn run_client<P: Replay, S: KeyValueStore + 'static>(
+async fn run_client<P, S, N>(
     replay: P,
     store: Arc<S>,
+    new_store: Arc<N>,
     history: Arc<Mutex<Vec<Event>>>,
     client: usize,
-    simulated_transactions: Vec<SimulatedTransaction>,
-) -> Result<Vec<ObservationWaiter>, TestCaseError> {
+    simulated_calls: Vec<SimulatedCall>,
+) -> Result<Vec<ObservationWaiter>, TestCaseError>
+where
+    P: Replay,
+    S: KeyValueStore + 'static,
+    N: Fn() -> S,
+{
     let mut generation = 0;
     let mut observation_waiters = Vec::new();
-    for (transaction, simulated_transaction) in simulated_transactions.into_iter().enumerate() {
+    for (transaction, simulated_call) in simulated_calls.into_iter().enumerate() {
         let id = HistoryId::Client { client, generation };
         history.lock().unwrap().push(Event::Invoked(
             id,
-            HistoryOperation::Transaction(simulated_transaction.clone()),
+            HistoryOperation::Transaction(simulated_call.transaction.clone()),
         ));
-        let (result, observed) = execute(&*store, simulated_transaction).await;
+        let execution = execute(&*store, simulated_call.transaction.clone());
+        let outcome = match simulated_call.cancelled_at_fraction {
+            None => Some(execution.await),
+            Some(fraction) => {
+                let suspensions =
+                    measure_suspensions(&*store, &*new_store, simulated_call.transaction).await;
+                let n = (fraction * (suspensions + 1) as f64) as usize;
+                cancel_at_nth_suspension(execution, n).await
+            }
+        };
+        let Some((result, observed)) = outcome else {
+            generation += 1;
+            continue;
+        };
         match result {
             Ok(Outcome::Panicked) => {
                 history
@@ -163,7 +194,7 @@ async fn run_client<P: Replay, S: KeyValueStore + 'static>(
                     };
                     history.lock().unwrap().push(Event::Invoked(
                         observation_waiter_id,
-                        HistoryOperation::Changed {
+                        HistoryOperation::ObservationFired {
                             key: observed.key.clone(),
                             seen: observed.seen.clone(),
                         },
@@ -198,6 +229,63 @@ async fn run_client<P: Replay, S: KeyValueStore + 'static>(
         }
     }
     Ok(observation_waiters)
+}
+
+// measure_suspensions measures the number of suspensions in the given transaction,
+// by executing the transaction and monitoring what it does at runtime.
+// To ensure the borrowed store is not modified, this function makes a complete copy of the store,
+// and executes the transaction on it.
+async fn measure_suspensions<S: KeyValueStore>(
+    store: &S,
+    new_store: &impl Fn() -> S,
+    transaction: SimulatedTransaction,
+) -> usize {
+    let copy = new_store();
+    let entries = store
+        .read_transact(|transaction| {
+            Box::pin(async move { transaction.get_range(.., usize::MAX).await })
+        })
+        .await
+        .expect("reading the store to copy failed");
+    copy.transact(move |transaction| {
+        let entries = entries.clone();
+        Box::pin(async move {
+            for (key, value) in entries {
+                transaction.set(key, value)?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .expect("writing the copy failed");
+    count_suspensions(execute(&copy, transaction)).await
+}
+
+pub(crate) async fn count_suspensions<F: Future>(future: F) -> usize {
+    let mut future = pin!(future);
+    let mut suspensions = 0;
+    poll_fn(|context| match future.as_mut().poll(context) {
+        Poll::Ready(_) => Poll::Ready(suspensions),
+        Poll::Pending => {
+            suspensions += 1;
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+pub(crate) async fn cancel_at_nth_suspension<F: Future>(future: F, n: usize) -> Option<F::Output> {
+    let mut remaining = n;
+    let mut future = pin!(future);
+    poll_fn(|context| match future.as_mut().poll(context) {
+        Poll::Ready(output) => Poll::Ready(Some(output)),
+        Poll::Pending if remaining == 0 => Poll::Ready(None),
+        Poll::Pending => {
+            remaining -= 1;
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 // settle_observation_waiters waits for all observations to either get fulfilled (if the key's value changed from the initial value)

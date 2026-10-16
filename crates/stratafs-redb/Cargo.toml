@@ -9,7 +9,6 @@ license.workspace = true
 bytes.workspace = true
 futures-channel.workspace = true
 futures-core.workspace = true
-futures-lite.workspace = true
 futures-util.workspace = true
 redb = "4.4.0"
 stratafs-keyed-notify.workspace = true
@@ -26,4 +25,5 @@ cfg_aliases.workspace = true
 workspace = true
 
 [dev-dependencies]
+futures-lite.workspace = true
 stratafs-kv-conformance.workspace = true
