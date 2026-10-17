@@ -1,4 +1,5 @@
-use std::ops::{Bound, RangeBounds};
+use std::marker::PhantomData;
+use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 
 use bytes::Bytes;
 use futures_core::future::BoxFuture;
@@ -9,7 +10,7 @@ use crate::error::StoreError;
 #[error("the transaction that made this observation did not commit")]
 pub struct NotCommitted;
 
-pub trait KeyValueStore: Send + Sync {
+pub trait KeyValueStore: Send + Sync + 'static {
     type Rejection: std::error::Error + Send + Sync + 'static;
     type Failure: std::error::Error + Send + Sync + 'static;
     type Observation: Send + 'static;
@@ -21,9 +22,9 @@ pub trait KeyValueStore: Send + Sync {
     // The transaction is not applied, and the store stays usable.
     fn transact<T: Send>(
         &self,
-        work: impl for<'t, 'txn> FnMut(
-            &'t mut Self::Transaction<'txn>,
-        ) -> BoxFuture<'t, Result<T, Self::Failure>>
+        work: impl for<'txn> FnMut(
+            TransactionHandle<'txn, Self::Transaction<'txn>>,
+        ) -> BoxFuture<'txn, Result<T, Self::Failure>>
         + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 
@@ -32,9 +33,9 @@ pub trait KeyValueStore: Send + Sync {
     // The transaction is not applied, and the store stays usable.
     fn read_transact<T: Send>(
         &self,
-        work: impl for<'t, 'txn> FnMut(
-            &'t Self::ReadTransaction<'txn>,
-        ) -> BoxFuture<'t, Result<T, Self::Failure>>
+        work: impl for<'txn> FnMut(
+            TransactionHandle<'txn, Self::ReadTransaction<'txn>>,
+        ) -> BoxFuture<'txn, Result<T, Self::Failure>>
         + Send,
     ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
 
@@ -46,10 +47,44 @@ pub trait KeyValueStore: Send + Sync {
     ) -> impl Future<Output = Result<(), StoreError<NotCommitted, Self::Failure>>> + Send;
 }
 
-pub trait KeyValueTransaction: ReadKeyValueTransaction {
-    fn set(&mut self, key: Bytes, value: Bytes) -> Result<(), Self::Failure>;
+// TransactionHandle gives work its transaction by value, so a store can wrap another store's transaction in its own without allocating.
+// It exists only to carry the transaction's lifetime, which Rust ignores inside Self::Transaction<'txn>.
+pub struct TransactionHandle<'txn, T> {
+    transaction: T,
+    lifetime: PhantomData<&'txn ()>,
+}
 
-    fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure>;
+impl<T> TransactionHandle<'_, T> {
+    pub fn new(transaction: T) -> Self {
+        Self {
+            transaction,
+            lifetime: PhantomData,
+        }
+    }
+}
+
+impl<T> Deref for TransactionHandle<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.transaction
+    }
+}
+
+impl<T> DerefMut for TransactionHandle<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.transaction
+    }
+}
+
+pub trait KeyValueTransaction: ReadKeyValueTransaction {
+    fn set(
+        &mut self,
+        key: Bytes,
+        value: Bytes,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
+
+    fn clear(&mut self, key: Bytes) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }
 
 pub trait ReadKeyValueTransaction: Send + Sync {

@@ -52,7 +52,7 @@ pub(crate) async fn execute<S: KeyValueStore>(
                             for reads in groups {
                                 yield_now().await;
                                 seen.extend(
-                                    perform_reads(transaction, reads, &last_attempt).await?,
+                                    perform_reads(&*transaction, reads, &last_attempt).await?,
                                 );
                             }
                             last_attempt.lock().unwrap().finished = true;
@@ -63,7 +63,7 @@ pub(crate) async fn execute<S: KeyValueStore>(
             }
             SimulatedTransaction::Write(operations) => {
                 store
-                    .transact(move |transaction| {
+                    .transact(move |mut transaction| {
                         let (operations, last_attempt) = (operations.clone(), last_attempt.clone());
                         Box::pin(async move {
                             *last_attempt.lock().unwrap() = WorkAttempt::default();
@@ -72,12 +72,14 @@ pub(crate) async fn execute<S: KeyValueStore>(
                                 yield_now().await;
                                 match operation {
                                     SimulatedOperation::Read(reads) => seen.extend(
-                                        perform_reads(transaction, reads, &last_attempt).await?,
+                                        perform_reads(&*transaction, reads, &last_attempt).await?,
                                     ),
                                     SimulatedOperation::Set(key, value) => {
-                                        transaction.set(key, value)?
+                                        transaction.set(key, value).await?
                                     }
-                                    SimulatedOperation::Clear(key) => transaction.clear(key)?,
+                                    SimulatedOperation::Clear(key) => {
+                                        transaction.clear(key).await?
+                                    }
                                     SimulatedOperation::Panic => {
                                         resume_unwind(Box::new("simulated panic inside work"))
                                     }

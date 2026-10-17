@@ -15,7 +15,8 @@ use redb::{
 use stratafs_keyed_notify::KeyedNotify;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, assert_valid_range,
+    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactionHandle,
+    assert_valid_range,
 };
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
@@ -91,35 +92,33 @@ impl<S> RedbStore<S> {
     }
 }
 
-impl<S: SpawnBlocking> KeyValueStore for RedbStore<S> {
+impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
     type Rejection = RedbRejection;
     // never ValueTooLarge, transact reports that as a rejection
     type Failure = RedbFailure;
     type Observation = RedbObservation;
-    type ReadTransaction<'txn> = RedbTransaction<ReadOnlyTable<&'static [u8], &'static [u8]>>;
-    type Transaction<'txn> = RedbTransaction<Table<'txn, &'static [u8], &'static [u8]>>;
+    type ReadTransaction<'txn> = RedbTransaction<'txn, ReadOnlyTable<&'static [u8], &'static [u8]>>;
+    type Transaction<'txn> = RedbTransaction<'txn, Table<'txn, &'static [u8], &'static [u8]>>;
 
     async fn transact<T: Send>(
         &self,
-        mut work: impl for<'t, 'txn> FnMut(
-            &'t mut Self::Transaction<'txn>,
-        ) -> BoxFuture<'t, Result<T, Self::Failure>>
+        mut work: impl for<'txn> FnMut(
+            TransactionHandle<'txn, Self::Transaction<'txn>>,
+        ) -> BoxFuture<'txn, Result<T, Self::Failure>>
         + Send,
     ) -> Result<T, StoreError<Self::Rejection, Self::Failure>> {
         let mut written = self.writer.lock().await;
         written.clear();
         let result: Result<T, RedbFailure> = async {
             let transaction = self.database.begin_write()?;
-            let (output, committed) = {
-                let mut handle = RedbTransaction {
-                    table: transaction.open_table(TABLE)?,
-                    written: std::mem::take(&mut *written),
-                    committed: OnceLock::new(),
-                };
-                let output = work(&mut handle).await;
-                *written = handle.written;
-                (output?, handle.committed.into_inner())
-            };
+            let committed = OnceLock::new();
+            let output = work(TransactionHandle::new(RedbTransaction {
+                table: transaction.open_table(TABLE)?,
+                written: &mut written,
+                committed: &committed,
+            }))
+            .await?;
+            let committed = committed.into_inner();
             let notify = self.notify.clone();
             let keys = std::mem::take(&mut *written);
             let (commit, keys) = self
@@ -150,20 +149,22 @@ impl<S: SpawnBlocking> KeyValueStore for RedbStore<S> {
 
     async fn read_transact<T: Send>(
         &self,
-        mut work: impl for<'t, 'txn> FnMut(
-            &'t Self::ReadTransaction<'txn>,
-        ) -> BoxFuture<'t, Result<T, Self::Failure>>
+        mut work: impl for<'txn> FnMut(
+            TransactionHandle<'txn, Self::ReadTransaction<'txn>>,
+        ) -> BoxFuture<'txn, Result<T, Self::Failure>>
         + Send,
     ) -> Result<T, StoreError<Self::Rejection, Self::Failure>> {
         let result: Result<T, RedbFailure> = async {
             let transaction = self.database.begin_read()?;
-            let handle = RedbTransaction {
+            let committed = OnceLock::new();
+            let mut written = Vec::new();
+            let output = work(TransactionHandle::new(RedbTransaction {
                 table: transaction.open_table(TABLE)?,
-                written: Vec::new(),
-                committed: OnceLock::new(),
-            };
-            let output = work(&handle).await?;
-            if let Some((committed, _)) = handle.committed.into_inner() {
+                written: &mut written,
+                committed: &committed,
+            }))
+            .await?;
+            if let Some((committed, _)) = committed.into_inner() {
                 let _ = committed.send(());
             }
             Ok(output)
@@ -198,13 +199,13 @@ pub struct RedbObservation {
     committed: Shared<oneshot::Receiver<()>>,
 }
 
-pub struct RedbTransaction<T> {
+pub struct RedbTransaction<'txn, T> {
     table: T,
-    written: Vec<Bytes>,
-    committed: OnceLock<(oneshot::Sender<()>, Shared<oneshot::Receiver<()>>)>,
+    written: &'txn mut Vec<Bytes>,
+    committed: &'txn OnceLock<(oneshot::Sender<()>, Shared<oneshot::Receiver<()>>)>,
 }
 
-impl<T> ReadKeyValueTransaction for RedbTransaction<T>
+impl<T> ReadKeyValueTransaction for RedbTransaction<'_, T>
 where
     T: ReadableTable<&'static [u8], &'static [u8]> + Send + Sync,
 {
@@ -254,8 +255,8 @@ where
     }
 }
 
-impl KeyValueTransaction for RedbTransaction<Table<'_, &'static [u8], &'static [u8]>> {
-    fn set(&mut self, key: Bytes, value: Bytes) -> Result<(), Self::Failure> {
+impl KeyValueTransaction for RedbTransaction<'_, Table<'_, &'static [u8], &'static [u8]>> {
+    async fn set(&mut self, key: Bytes, value: Bytes) -> Result<(), Self::Failure> {
         let previous = self.table.insert(&key[..], &value[..])?;
         if previous.is_none_or(|previous| previous.value() != &value[..]) {
             self.written.push(key);
@@ -263,7 +264,7 @@ impl KeyValueTransaction for RedbTransaction<Table<'_, &'static [u8], &'static [
         Ok(())
     }
 
-    fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {
+    async fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {
         if self.table.remove(&key[..])?.is_some() {
             self.written.push(key);
         }

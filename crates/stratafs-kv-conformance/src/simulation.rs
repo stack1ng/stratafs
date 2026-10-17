@@ -329,11 +329,11 @@ async fn measure_suspensions<S: KeyValueStore>(
         })
         .await
         .expect("reading the store to copy failed");
-    copy.transact(move |transaction| {
+    copy.transact(move |mut transaction| {
         let entries = entries.clone();
         Box::pin(async move {
             for (key, value) in entries {
-                transaction.set(key, value)?;
+                transaction.set(key, value).await?;
             }
             Ok(())
         })

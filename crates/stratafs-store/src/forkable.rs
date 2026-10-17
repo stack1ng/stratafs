@@ -23,6 +23,8 @@ pub trait ForkableKeyValueStore: Send + Sync + 'static {
 }
 
 pub trait ForkingTransaction: KeyValueTransaction {
-    // fork creates a new volume that is a complete copy of the current volume
+    // fork creates a new volume that is a copy of the current volume,
+    // at its current state in the transaction.
+    // The new volume exists once the transaction commits.
     fn fork(&mut self) -> impl Future<Output = Result<VolumeId, Self::Failure>> + Send;
 }
