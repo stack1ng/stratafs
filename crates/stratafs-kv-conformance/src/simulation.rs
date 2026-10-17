@@ -15,7 +15,7 @@ use stratafs_store::kv::{
 };
 
 use crate::activity::{SimulatedCall, SimulatedTransaction};
-use crate::execute::{Observed, WorkAttempt, execute};
+use crate::execute::{Observed, WorkAttempt, WorkFailure, execute};
 use crate::model::{BTreeModel, HistoryOperation, ObservationId, Outcome, TransactionId};
 use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
 
@@ -235,9 +235,7 @@ where
                 )));
             }
             Some(Err(TransactError::Aborted(failure))) => {
-                return Err(TestCaseError::fail(format!(
-                    "the store failed an operation inside a transaction: {failure}"
-                )));
+                return Err(TestCaseError::fail(failure.to_string()));
             }
             Some(Err(TransactError::Rejected(rejection))) => {
                 return Err(TestCaseError::fail(format!(
@@ -334,7 +332,7 @@ async fn measure_suspensions<S: KeyValueStore>(
         })
         .await
         .expect("reading the store to copy failed");
-    copy.transact::<_, S::Failure>(move |mut transaction| {
+    copy.transact::<_, WorkFailure<S::Rejection, S::Failure>>(move |mut transaction| {
         let entries = entries.clone();
         Box::pin(async move {
             for (key, value) in entries {

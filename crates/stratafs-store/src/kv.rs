@@ -31,7 +31,11 @@ pub trait KeyValueStore: Send + Sync + 'static {
     type Failure: std::error::Error + Send + Sync + 'static;
     type Observation: Send + 'static;
     type ReadTransaction<'txn>: ReadKeyValueTransaction<Failure = Self::Failure, Observation = Self::Observation>;
-    type Transaction<'txn>: KeyValueTransaction<Failure = Self::Failure, Observation = Self::Observation>;
+    type Transaction<'txn>: KeyValueTransaction<
+            Rejection = Self::Rejection,
+            Failure = Self::Failure,
+            Observation = Self::Observation,
+        >;
 
     // transact runs a transaction, returning the result.
     // If work returns an error, the transaction is not applied, and transact returns that error as Aborted.
@@ -95,12 +99,23 @@ impl<T> DerefMut for TransactionHandle<'_, T> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SetRejection<R> {
+    #[error("the entry is larger than this store accepts")]
+    TooLarge,
+    #[error(transparent)]
+    Store(R),
+}
+
 pub trait KeyValueTransaction: ReadKeyValueTransaction {
+    type Rejection: std::error::Error + Send + Sync + 'static;
+
     fn set(
         &mut self,
         key: Bytes,
         value: Bytes,
-    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
+    ) -> impl Future<Output = Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>>> + Send;
 
     fn clear(&mut self, key: Bytes) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }

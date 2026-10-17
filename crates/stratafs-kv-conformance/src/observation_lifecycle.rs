@@ -11,6 +11,7 @@ use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactError,
 };
 
+use crate::execute::WorkFailure;
 use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
 use crate::simulation::{cancel_at_nth_suspension, count_suspensions};
 
@@ -85,7 +86,7 @@ pub(crate) async fn change_key<S: KeyValueStore>(
     store: &S,
     log: Arc<Mutex<Vec<ObservationEvent>>>,
     rewrites_same_value: bool,
-) -> Result<(), TransactError<S::Rejection, S::Failure, S::Failure>> {
+) -> Result<(), TransactError<S::Rejection, S::Failure, WorkFailure<S::Rejection, S::Failure>>> {
     store
         .transact(|mut transaction| {
             let log = log.clone();
@@ -111,7 +112,7 @@ pub(crate) async fn observe<S: KeyValueStore>(
     watch: Arc<impl Fn(Observations<S::Observation>) -> usize + Send + Sync + 'static>,
     log: Arc<Mutex<Vec<ObservationEvent>>>,
     panics: bool,
-) -> Result<(), TransactError<S::Rejection, S::Failure, S::Failure>> {
+) -> Result<(), TransactError<S::Rejection, S::Failure, WorkFailure<S::Rejection, S::Failure>>> {
     let key = Bytes::from_static(OBSERVED_KEY);
     match observing_transaction {
         ObservingTransaction::Read => {

@@ -250,9 +250,7 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
                 )));
             }
             Err(TransactError::Aborted(failure)) => {
-                return Err(TestCaseError::fail(format!(
-                    "the store failed an operation inside a transaction: {failure}"
-                )));
+                return Err(TestCaseError::fail(failure.to_string()));
             }
             Err(TransactError::Rejected(rejection)) => {
                 return Err(TestCaseError::fail(format!(

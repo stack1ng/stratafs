@@ -5,8 +5,9 @@ use bytes::Bytes;
 use futures_lite::future::yield_now;
 use futures_util::FutureExt;
 use futures_util::future::try_join_all;
+use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, TransactError,
+    KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
 };
 
 use crate::activity::{SimulatedOperation, SimulatedRead, SimulatedTransaction};
@@ -18,14 +19,28 @@ pub(crate) struct Observed<O> {
     pub(crate) observation: O,
 }
 
-pub(crate) enum WorkFailure<F> {
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorkFailure<R, F> {
+    #[error("the store failed an operation inside a transaction: {0}")]
     Store(F),
+    #[error("a set this small was rejected: {0}")]
+    SetRejected(SetRejection<R>),
+    #[error("work returned the simulated abort")]
     SimulatedAbort,
 }
 
-impl<F> From<F> for WorkFailure<F> {
+impl<R, F> From<F> for WorkFailure<R, F> {
     fn from(failure: F) -> Self {
         WorkFailure::Store(failure)
+    }
+}
+
+impl<R, F> From<StoreError<SetRejection<R>, F>> for WorkFailure<R, F> {
+    fn from(error: StoreError<SetRejection<R>, F>) -> Self {
+        match error {
+            StoreError::Rejected(rejection) => WorkFailure::SetRejected(rejection),
+            StoreError::Failed(failure) => WorkFailure::Store(failure),
+        }
     }
 }
 
@@ -50,13 +65,14 @@ pub(crate) async fn execute<S: KeyValueStore>(
     // this records only the most recent attempt.
     // The caller owns it, so it survives the transaction being cancelled.
     last_attempt: &Arc<Mutex<WorkAttempt<S::Observation>>>,
-) -> Result<Outcome, TransactError<S::Rejection, S::Failure, S::Failure>> {
+) -> Result<Outcome, TransactError<S::Rejection, S::Failure, WorkFailure<S::Rejection, S::Failure>>>
+{
     let last_attempt = last_attempt.clone();
     let run = async {
         match simulated_transaction {
             SimulatedTransaction::Read(groups) => {
                 store
-                    .read_transact::<_, WorkFailure<S::Failure>>(move |transaction| {
+                    .read_transact::<_, WorkFailure<S::Rejection, S::Failure>>(move |transaction| {
                         let (groups, last_attempt) = (groups.clone(), last_attempt.clone());
                         Box::pin(async move {
                             *last_attempt.lock().unwrap() = WorkAttempt::default();
@@ -75,7 +91,7 @@ pub(crate) async fn execute<S: KeyValueStore>(
             }
             SimulatedTransaction::Write(operations) => {
                 store
-                    .transact::<_, WorkFailure<S::Failure>>(move |mut transaction| {
+                    .transact::<_, WorkFailure<S::Rejection, S::Failure>>(move |mut transaction| {
                         let (operations, last_attempt) = (operations.clone(), last_attempt.clone());
                         Box::pin(async move {
                             *last_attempt.lock().unwrap() = WorkAttempt::default();
@@ -111,11 +127,7 @@ pub(crate) async fn execute<S: KeyValueStore>(
     match AssertUnwindSafe(run).catch_unwind().await {
         Ok(Ok(seen)) => Ok(Outcome::Completed(seen)),
         Ok(Err(TransactError::Aborted(WorkFailure::SimulatedAbort))) => Ok(Outcome::Aborted),
-        Ok(Err(TransactError::Aborted(WorkFailure::Store(failure)))) => {
-            Err(TransactError::Aborted(failure))
-        }
-        Ok(Err(TransactError::Failed(failure))) => Err(TransactError::Failed(failure)),
-        Ok(Err(TransactError::Rejected(rejection))) => Err(TransactError::Rejected(rejection)),
+        Ok(Err(error)) => Err(error),
         Err(_) => Ok(Outcome::Panicked),
     }
 }

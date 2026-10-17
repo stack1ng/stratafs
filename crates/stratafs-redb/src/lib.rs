@@ -15,8 +15,8 @@ use redb::{
 use stratafs_keyed_notify::KeyedNotify;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactError,
-    TransactionHandle, assert_valid_range,
+    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, SetRejection,
+    TransactError, TransactionHandle, assert_valid_range,
 };
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
@@ -87,8 +87,7 @@ impl<S> RedbStore<S> {
 
 impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
     type Rejection = std::convert::Infallible;
-    // set returns ValueTooLarge as a failure. If work propagates it, transact reports it as Aborted.
-    // transact's own Failed doesn't have it, since redb only checks value sizes on insert.
+    // set reports values over redb's limit as SetRejection::TooLarge, so Failure excludes ValueTooLarge.
     type Failure = RedbFailure;
     type Observation = RedbObservation;
     type ReadTransaction<'txn> = RedbTransaction<'txn, ReadOnlyTable<&'static [u8], &'static [u8]>>;
@@ -264,8 +263,20 @@ where
 }
 
 impl KeyValueTransaction for RedbTransaction<'_, Table<'_, &'static [u8], &'static [u8]>> {
-    async fn set(&mut self, key: Bytes, value: Bytes) -> Result<(), Self::Failure> {
-        let previous = self.table.insert(&key[..], &value[..])?;
+    type Rejection = std::convert::Infallible;
+
+    async fn set(
+        &mut self,
+        key: Bytes,
+        value: Bytes,
+    ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
+        let previous = match self.table.insert(&key[..], &value[..]) {
+            Ok(previous) => previous,
+            Err(StorageError::ValueTooLarge(_)) => {
+                return Err(StoreError::Rejected(SetRejection::TooLarge));
+            }
+            Err(failure) => return Err(StoreError::Failed(failure.into())),
+        };
         if previous.is_none_or(|previous| previous.value() != &value[..]) {
             self.written.push(key);
         }

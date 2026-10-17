@@ -13,6 +13,7 @@ proptest.workspace = true
 shuttle.workspace = true
 stateright.workspace = true
 stratafs-store.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
