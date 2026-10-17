@@ -33,3 +33,21 @@ vec1 = "1.12"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[profile.dev.package.redb]
+opt-level = 3
+
+[profile.dev.package.shuttle]
+opt-level = 3
+
+[profile.dev.package.shuttle-engine]
+opt-level = 3
+
+[profile.dev.package.shuttle-schedulers]
+opt-level = 3
+
+[profile.dev.package.shuttle-std]
+opt-level = 3
+
+[profile.dev.package.stateright]
+opt-level = 3

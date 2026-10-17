@@ -14,6 +14,7 @@ static LIMITS: [usize; 4] = [0, 1, 2, usize::MAX];
 pub enum SimulatedTransaction {
     // all read transaction operations do not require exclusive access to the transaction,
     // so they can happen concurrently. We make a vec of them to simulate this.
+    // The groups run one after another, so other commits can land between them.
     Read(Vec<Vec<SimulatedRead>>),
     Write(Vec<SimulatedOperation>),
 }
