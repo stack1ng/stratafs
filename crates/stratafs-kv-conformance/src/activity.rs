@@ -12,13 +12,17 @@ static LIMITS: [usize; 4] = [0, 1, 2, usize::MAX];
 
 #[derive(Clone, Debug)]
 pub enum SimulatedTransaction {
-    Read(Vec<SimulatedRead>),
+    // all read transaction operations do not require exclusive access to the transaction,
+    // so they can happen concurrently. We make a vec of them to simulate this.
+    Read(Vec<Vec<SimulatedRead>>),
     Write(Vec<SimulatedOperation>),
 }
 
 #[derive(Clone, Debug)]
 pub enum SimulatedOperation {
-    Read(SimulatedRead),
+    // read operations in a write tx ALSO do not require exclusive access to the transaction,
+    // so we make a vec of concurrent read operations to simulate this.
+    Read(Vec<SimulatedRead>),
     Set(Bytes, Bytes),
     Clear(Bytes),
     Panic,
@@ -80,14 +84,14 @@ fn cancel_at() -> impl Strategy<Value = Option<f64>> {
 
 fn transaction() -> impl Strategy<Value = SimulatedTransaction> {
     prop_oneof![
-        vec(read(), 1..=4).prop_map(SimulatedTransaction::Read),
+        vec(vec(read(), 1..=3), 1..=3).prop_map(SimulatedTransaction::Read),
         vec(operation(), 1..=4).prop_map(SimulatedTransaction::Write),
     ]
 }
 
 fn operation() -> impl Strategy<Value = SimulatedOperation> {
     prop_oneof![
-        6 => read().prop_map(SimulatedOperation::Read),
+        6 => vec(read(), 1..=3).prop_map(SimulatedOperation::Read),
         6 => (key(), value()).prop_map(|(key, value)| SimulatedOperation::Set(key, value)),
         6 => key().prop_map(SimulatedOperation::Clear),
         1 => Just(SimulatedOperation::Panic),

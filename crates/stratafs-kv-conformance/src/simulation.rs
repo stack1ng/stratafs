@@ -15,7 +15,7 @@ use stratafs_store::kv::{
 };
 
 use crate::activity::{SimulatedCall, SimulatedTransaction};
-use crate::execute::{Observed, execute};
+use crate::execute::{Observed, WorkAttempt, execute};
 use crate::model::{BTreeModel, HistoryOperation, ObservationId, Outcome, TransactionId};
 use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
 
@@ -208,8 +208,9 @@ where
             id,
             HistoryOperation::Transaction(transaction_id, simulated_call.transaction.clone()),
         ));
-        let execution = execute(&*store, simulated_call.transaction.clone());
-        let outcome = match simulated_call.cancelled_at_fraction {
+        let last_attempt = Arc::new(Mutex::new(WorkAttempt::default()));
+        let execution = execute(&*store, simulated_call.transaction.clone(), &last_attempt);
+        let result = match simulated_call.cancelled_at_fraction {
             None => Some(execution.await),
             Some(fraction) => {
                 let suspensions =
@@ -218,75 +219,98 @@ where
                 cancel_at_nth_suspension(execution, n).await
             }
         };
-        let Some((result, observed)) = outcome else {
-            generation += 1;
-            continue;
-        };
-        match result {
-            Ok(Outcome::Panicked) => {
-                history
-                    .lock()
-                    .unwrap()
-                    .push(Event::Returned(id, Outcome::Panicked));
-                for Observed { observation, .. } in observed {
-                    if !matches!(
-                        store.changed(observation).await,
-                        Err(StoreError::Rejected(NotCommitted))
-                    ) {
-                        return Err(TestCaseError::fail(
-                            "changed did not report NotCommitted for an observation whose transaction panicked",
-                        ));
-                    }
-                }
+        let WorkAttempt { observed, finished } = std::mem::take(&mut *last_attempt.lock().unwrap());
+        let known_to_commit = match result {
+            None => {
+                generation += 1;
+                false
             }
-            Ok(outcome) => {
+            Some(Ok(outcome)) => {
                 history.lock().unwrap().push(Event::Returned(id, outcome));
-                for (index, observed) in observed.into_iter().enumerate() {
-                    let observation = ObservationId {
-                        transaction: transaction_id,
-                        observation: index,
-                    };
-                    let observation_waiter_id = HistoryId::ObservationWaiter(observation);
-                    history.lock().unwrap().push(Event::Invoked(
-                        observation_waiter_id,
-                        HistoryOperation::ObservationFired(observation),
-                    ));
-                    let store = store.clone();
-                    let history = history.clone();
-                    let task = spawn_with_handle(&replay, async move {
-                        match store.changed(observed.observation).await {
-                            Ok(()) => history.lock().unwrap().push(Event::Returned(
-                                observation_waiter_id,
-                                Outcome::Changed(true),
-                            )),
-                            Err(StoreError::Rejected(NotCommitted)) => panic!(
-                                "changed reported NotCommitted for an observation whose transaction committed"
-                            ),
-                            Err(StoreError::Failed(failure)) => {
-                                panic!("changed failed: {failure}")
-                            }
-                        }
-                    });
-                    observation_waiters.push(ObservationWaiter {
-                        key: observed.key,
-                        seen: observed.seen,
-                        task,
-                    });
-                }
+                true
             }
-            Err(StoreError::Failed(failure)) => {
+            Some(Err(StoreError::Failed(failure))) => {
                 return Err(TestCaseError::fail(format!(
                     "the store failed a transaction: {failure}"
                 )));
             }
-            Err(StoreError::Rejected(rejection)) => {
+            Some(Err(StoreError::Rejected(rejection))) => {
                 return Err(TestCaseError::fail(format!(
                     "a transaction this small was rejected: {rejection}"
                 )));
             }
+        };
+        if !finished {
+            require_not_committed(&*store, observed).await?;
+            continue;
+        }
+        for (index, observed) in observed.into_iter().enumerate() {
+            let observation = ObservationId {
+                transaction: transaction_id,
+                observation: index,
+            };
+            observation_waiters.push(spawn_observation_waiter(
+                &replay,
+                &store,
+                &history,
+                observation,
+                observed,
+                known_to_commit,
+            ));
         }
     }
     Ok(observation_waiters)
+}
+
+async fn require_not_committed<S: KeyValueStore>(
+    store: &S,
+    observed: Vec<Observed<S::Observation>>,
+) -> Result<(), TestCaseError> {
+    for Observed { observation, .. } in observed {
+        if !matches!(
+            store.changed(observation).await,
+            Err(StoreError::Rejected(NotCommitted))
+        ) {
+            return Err(TestCaseError::fail(
+                "changed did not report NotCommitted for an observation whose transaction did not finish its work",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn spawn_observation_waiter<P: Replay, S: KeyValueStore + 'static>(
+    replay: &P,
+    store: &Arc<S>,
+    history: &Arc<Mutex<Vec<Event>>>,
+    observation: ObservationId,
+    observed: Observed<S::Observation>,
+    known_to_commit: bool,
+) -> ObservationWaiter {
+    let observation_waiter_id = HistoryId::ObservationWaiter(observation);
+    history.lock().unwrap().push(Event::Invoked(
+        observation_waiter_id,
+        HistoryOperation::ObservationFired(observation),
+    ));
+    let (store, history) = (store.clone(), history.clone());
+    let task = spawn_with_handle(replay, async move {
+        match store.changed(observed.observation).await {
+            Ok(()) => history.lock().unwrap().push(Event::Returned(
+                observation_waiter_id,
+                Outcome::Changed(true),
+            )),
+            Err(StoreError::Rejected(NotCommitted)) if !known_to_commit => {}
+            Err(StoreError::Rejected(NotCommitted)) => panic!(
+                "changed reported NotCommitted for an observation whose transaction committed"
+            ),
+            Err(StoreError::Failed(failure)) => panic!("changed failed: {failure}"),
+        }
+    });
+    ObservationWaiter {
+        key: observed.key,
+        seen: observed.seen,
+        task,
+    }
 }
 
 // measure_suspensions measures the number of suspensions in the given transaction,
@@ -316,7 +340,7 @@ async fn measure_suspensions<S: KeyValueStore>(
     })
     .await
     .expect("writing the copy failed");
-    count_suspensions(execute(&copy, transaction)).await
+    count_suspensions(execute(&copy, transaction, &Arc::default())).await
 }
 
 pub(crate) async fn count_suspensions<F: Future>(future: F) -> usize {
@@ -334,13 +358,22 @@ pub(crate) async fn count_suspensions<F: Future>(future: F) -> usize {
 
 pub(crate) async fn cancel_at_nth_suspension<F: Future>(future: F, n: usize) -> Option<F::Output> {
     let mut remaining = n;
+    let mut parked_at_nth = false;
     let mut future = pin!(future);
-    poll_fn(|context| match future.as_mut().poll(context) {
-        Poll::Ready(output) => Poll::Ready(Some(output)),
-        Poll::Pending if remaining == 0 => Poll::Ready(None),
-        Poll::Pending => {
-            remaining -= 1;
-            Poll::Pending
+    poll_fn(|context| {
+        if parked_at_nth {
+            return Poll::Ready(None);
+        }
+        match future.as_mut().poll(context) {
+            Poll::Ready(output) => Poll::Ready(Some(output)),
+            Poll::Pending if remaining == 0 => {
+                parked_at_nth = true;
+                Poll::Pending
+            }
+            Poll::Pending => {
+                remaining -= 1;
+                Poll::Pending
+            }
         }
     })
     .await

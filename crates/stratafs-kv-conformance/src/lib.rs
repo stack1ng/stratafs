@@ -19,7 +19,10 @@ use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
 use crate::activity::{simulated_client_activity, simulated_client_transactions, simulated_stop};
 use crate::durability::{CrashableStorage, simulate_and_reopen};
-use crate::observation_lifecycle::{KeyChange, count_change_suspensions, run_observation_scenario};
+use crate::observation_lifecycle::{
+    KeyChange, Observations, ObserverOutcome, ObservingTransaction, change_key,
+    count_suspensions_on_a_fresh_store, observe, run_observation_scenario,
+};
 use crate::runtime::ReplayingRuntime;
 use crate::simulation::simulate;
 
@@ -83,21 +86,51 @@ pub fn observation_lifecycle<R: ReplayingRuntime, S: KeyValueStore + 'static>(
     new_store: impl Fn() -> S + Send + Sync + 'static,
 ) {
     let new_store = Arc::new(new_store);
-    let change_suspensions = count_change_suspensions(&runtime, &new_store);
-    let key_changes: Vec<KeyChange> = [KeyChange::Unchanged, KeyChange::Committed]
-        .into_iter()
-        .chain((0..change_suspensions).map(KeyChange::CancelledAtSuspension))
-        .collect();
-    for in_read_transaction in [false, true] {
-        for observer_commits in [false, true] {
+    let change_suspensions =
+        count_suspensions_on_a_fresh_store(&runtime, &new_store, |store| async move {
+            let _ = change_key(&*store, Arc::default(), false).await;
+        });
+    let key_changes: Vec<KeyChange> = [
+        KeyChange::Unchanged,
+        KeyChange::Committed,
+        KeyChange::RewritesSameValue,
+    ]
+    .into_iter()
+    .chain((0..change_suspensions).map(KeyChange::CancelledAtSuspension))
+    .collect();
+    for observing_transaction in [
+        ObservingTransaction::Read,
+        ObservingTransaction::Write,
+        ObservingTransaction::WritesObservedKey,
+    ] {
+        let observer_suspensions =
+            count_suspensions_on_a_fresh_store(&runtime, &new_store, move |store| async move {
+                let ignore = Arc::new(|_: Observations<S::Observation>| 0);
+                let _ = observe(
+                    &*store,
+                    observing_transaction,
+                    ignore,
+                    Arc::default(),
+                    false,
+                )
+                .await;
+            });
+        let observer_outcomes: Vec<ObserverOutcome> =
+            [ObserverOutcome::Commits, ObserverOutcome::Panics]
+                .into_iter()
+                .chain((0..observer_suspensions).map(ObserverOutcome::CancelledAtSuspension))
+                .collect();
+
+        // exhaustively test all possible observer lifecycle scenarios
+        for &observer_outcome in &observer_outcomes {
             for &key_change in &key_changes {
                 let new_store = new_store.clone();
                 runtime.run(0, move |replay| {
                     run_observation_scenario(
                         replay,
                         Arc::new(new_store()),
-                        in_read_transaction,
-                        observer_commits,
+                        observing_transaction,
+                        observer_outcome,
                         key_change,
                     )
                 });

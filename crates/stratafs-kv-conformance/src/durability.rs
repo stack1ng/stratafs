@@ -233,7 +233,13 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
                 transaction.clone(),
             ),
         ));
-        let (result, _) = execute(&*store, transaction).await;
+        let result = execute(
+            &*store,
+            transaction,
+            // we arent checking the work that was performed here, so just make a throwaway value
+            &Arc::default(),
+        )
+        .await;
         if crashed() {
             return Ok(());
         }
@@ -270,11 +276,11 @@ async fn read_reopened_store<S: KeyValueStore>(
                 client: final_client,
                 transaction: 0,
             },
-            SimulatedTransaction::Read(vec![SimulatedRead::GetRange(
+            SimulatedTransaction::Read(vec![vec![SimulatedRead::GetRange(
                 Bound::Unbounded,
                 Bound::Unbounded,
                 usize::MAX,
-            )]),
+            )]]),
         ),
     ));
     let entries = store

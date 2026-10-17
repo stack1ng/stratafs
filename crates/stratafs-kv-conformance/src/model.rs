@@ -80,9 +80,10 @@ impl BTreeModel {
     fn transact(&mut self, id: TransactionId, transaction: &SimulatedTransaction) -> Outcome {
         let mut observations = 0;
         match transaction {
-            SimulatedTransaction::Read(reads) => Outcome::Completed(
-                reads
+            SimulatedTransaction::Read(groups) => Outcome::Completed(
+                groups
                     .iter()
+                    .flatten()
                     .map(|read| self.read(read, id, &mut observations))
                     .collect(),
             ),
@@ -91,8 +92,10 @@ impl BTreeModel {
                 let mut seen = Vec::new();
                 for operation in operations {
                     match operation {
-                        SimulatedOperation::Read(read) => {
-                            seen.push(after.read(read, id, &mut observations))
+                        SimulatedOperation::Read(reads) => {
+                            for read in reads {
+                                seen.push(after.read(read, id, &mut observations));
+                            }
                         }
                         SimulatedOperation::Set(key, value) => {
                             after.values.insert(key.clone(), value.clone());

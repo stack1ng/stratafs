@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures_lite::future::yield_now;
 use futures_util::FutureExt;
-use futures_util::future::RemoteHandle;
+use futures_util::future::{RemoteHandle, join};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction,
@@ -17,60 +17,87 @@ use crate::simulation::{cancel_at_nth_suspension, count_suspensions};
 const OBSERVED_KEY: &[u8] = b"observed";
 
 #[derive(Clone, Copy)]
+pub(crate) enum ObservingTransaction {
+    Read,
+    Write,
+    WritesObservedKey,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ObserverOutcome {
+    Commits,
+    Panics,
+    CancelledAtSuspension(usize),
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum KeyChange {
     Unchanged,
     Committed,
     CancelledAtSuspension(usize),
+    RewritesSameValue,
 }
 
-enum ExpectedObservation {
+enum ObserverCommit {
+    Committed,
     NotCommitted,
-    Fires,
-    StaysPending,
+    Unknown,
 }
 
 #[derive(Debug, PartialEq)]
-enum ObservationEvent {
+pub(crate) enum ObservationEvent {
     ObserverWorkEnded { attempt: usize },
     ChangerWorkEnded,
-    Resolved { attempt: usize },
+    Resolved { attempt: usize, observation: usize },
 }
+
+pub(crate) type Observations<O> = [(Option<Bytes>, O); 2];
 
 struct ObservationAttempt<F> {
-    seen: Option<Bytes>,
-    waiter: RemoteHandle<Result<(), StoreError<NotCommitted, F>>>,
+    seen: [Option<Bytes>; 2],
+    waiters: [RemoteHandle<Result<(), StoreError<NotCommitted, F>>>; 2],
 }
 
-pub(crate) fn count_change_suspensions<R, S, N>(runtime: &R, new_store: &Arc<N>) -> usize
+pub(crate) fn count_suspensions_on_a_fresh_store<R, S, N, W, F>(
+    runtime: &R,
+    new_store: &Arc<N>,
+    work: W,
+) -> usize
 where
     R: ReplayingRuntime,
     S: KeyValueStore + 'static,
     N: Fn() -> S + Send + Sync + 'static,
+    W: Fn(Arc<S>) -> F + Send + Sync + 'static,
+    F: Future<Output = ()>,
 {
     let suspensions = Arc::new(AtomicUsize::new(0));
-    let (new_store, counted) = (new_store.clone(), suspensions.clone());
+    let (new_store, counted, work) = (new_store.clone(), suspensions.clone(), Arc::new(work));
     runtime.run(0, move |_| {
-        let (store, counted) = (new_store(), counted.clone());
+        let (store, counted, work) = (Arc::new(new_store()), counted.clone(), work.clone());
         async move {
-            let change = change_key(&store, Arc::new(Mutex::new(Vec::new())));
-            counted.store(count_suspensions(change).await, Ordering::SeqCst);
+            counted.store(count_suspensions(work(store)).await, Ordering::SeqCst);
         }
     });
     suspensions.load(Ordering::SeqCst)
 }
 
-async fn change_key<S: KeyValueStore>(
+pub(crate) async fn change_key<S: KeyValueStore>(
     store: &S,
     log: Arc<Mutex<Vec<ObservationEvent>>>,
+    rewrites_same_value: bool,
 ) -> Result<(), StoreError<S::Rejection, S::Failure>> {
     store
         .transact(|transaction| {
             let log = log.clone();
             Box::pin(async move {
-                transaction.set(
-                    Bytes::from_static(OBSERVED_KEY),
-                    Bytes::from_static(b"changed"),
-                )?;
+                let key = Bytes::from_static(OBSERVED_KEY);
+                if !rewrites_same_value {
+                    transaction.set(key, Bytes::from_static(b"changed"))?;
+                } else if let Some(value) = transaction.get(key.clone()).await? {
+                    transaction.set(key, value)?;
+                } else {
+                    transaction.clear(key)?;
+                }
                 log.lock().unwrap().push(ObservationEvent::ChangerWorkEnded);
                 Ok(())
             })
@@ -78,11 +105,74 @@ async fn change_key<S: KeyValueStore>(
         .await
 }
 
+pub(crate) async fn observe<S: KeyValueStore>(
+    store: &S,
+    observing_transaction: ObservingTransaction,
+    watch: Arc<impl Fn(Observations<S::Observation>) -> usize + Send + Sync + 'static>,
+    log: Arc<Mutex<Vec<ObservationEvent>>>,
+    panics: bool,
+) -> Result<(), StoreError<S::Rejection, S::Failure>> {
+    let key = Bytes::from_static(OBSERVED_KEY);
+    match observing_transaction {
+        ObservingTransaction::Read => {
+            store
+                .read_transact(|transaction| {
+                    let (key, watch, log) = (key.clone(), watch.clone(), log.clone());
+                    Box::pin(async move {
+                        let first = observe_key(transaction, &key).await?;
+                        let second = observe_key(transaction, &key).await?;
+                        finish_observer_work(watch([first, second]), &log, panics).await;
+                        Ok(())
+                    })
+                })
+                .await
+        }
+        ObservingTransaction::Write | ObservingTransaction::WritesObservedKey => {
+            store
+                .transact(|transaction| {
+                    let (key, watch, log) = (key.clone(), watch.clone(), log.clone());
+                    Box::pin(async move {
+                        let first = observe_key(&*transaction, &key).await?;
+                        if matches!(
+                            observing_transaction,
+                            ObservingTransaction::WritesObservedKey
+                        ) {
+                            transaction
+                                .set(key.clone(), Bytes::from_static(b"written by the observer"))?;
+                        }
+                        let second = observe_key(&*transaction, &key).await?;
+                        finish_observer_work(watch([first, second]), &log, panics).await;
+                        Ok(())
+                    })
+                })
+                .await
+        }
+    }
+}
+
+async fn observe_key<T: ReadKeyValueTransaction>(
+    transaction: &T,
+    key: &Bytes,
+) -> Result<(Option<Bytes>, T::Observation), T::Failure> {
+    let seen = transaction.get(key.clone()).await?;
+    Ok((seen, transaction.observe(key.clone())?))
+}
+
+async fn finish_observer_work(attempt: usize, log: &Mutex<Vec<ObservationEvent>>, panics: bool) {
+    yield_now().await;
+    log.lock()
+        .unwrap()
+        .push(ObservationEvent::ObserverWorkEnded { attempt });
+    if panics {
+        resume_unwind(Box::new("simulated panic inside work"));
+    }
+}
+
 pub(crate) async fn run_observation_scenario<P: Replay, S: KeyValueStore + 'static>(
     replay: P,
     store: Arc<S>,
-    in_read_transaction: bool,
-    observer_commits: bool,
+    observing_transaction: ObservingTransaction,
+    observer_outcome: ObserverOutcome,
     key_change: KeyChange,
 ) {
     let key = Bytes::from_static(OBSERVED_KEY);
@@ -91,190 +181,209 @@ pub(crate) async fn run_observation_scenario<P: Replay, S: KeyValueStore + 'stat
     let watch = Arc::new({
         let (replay, store, log, attempts) =
             (replay.clone(), store.clone(), log.clone(), attempts.clone());
-        move |seen: Option<Bytes>, observation: S::Observation| {
+        move |[(first_seen, first), (second_seen, second)]: Observations<S::Observation>| {
             let attempt = attempts.lock().unwrap().len();
-            let (store, log) = (store.clone(), log.clone());
-            let waiter = spawn_with_handle(&replay, async move {
-                let result = store.changed(observation).await;
-                log.lock()
-                    .unwrap()
-                    .push(ObservationEvent::Resolved { attempt });
-                result
+            let resolve = |observation: usize, observed: S::Observation| {
+                let (store, log) = (store.clone(), log.clone());
+                async move {
+                    let result = store.changed(observed).await;
+                    log.lock().unwrap().push(ObservationEvent::Resolved {
+                        attempt,
+                        observation,
+                    });
+                    result
+                }
+                .remote_handle()
+            };
+            let (first_resolving, first_waiter) = resolve(0, first);
+            let (second_resolving, second_waiter) = resolve(1, second);
+            replay.spawn(async move {
+                join(first_resolving, second_resolving).await;
             });
-            attempts
-                .lock()
-                .unwrap()
-                .push(ObservationAttempt { seen, waiter });
+            attempts.lock().unwrap().push(ObservationAttempt {
+                seen: [first_seen, second_seen],
+                waiters: [first_waiter, second_waiter],
+            });
             attempt
         }
     });
     let changing = match key_change {
         KeyChange::Unchanged => None,
-        KeyChange::Committed | KeyChange::CancelledAtSuspension(_) => {
-            Some(spawn_with_handle(&replay, {
-                let (store, log) = (store.clone(), log.clone());
-                async move {
-                    let change = change_key(&*store, log);
-                    match key_change {
-                        KeyChange::CancelledAtSuspension(n) => {
-                            if let Some(result) = cancel_at_nth_suspension(change, n).await {
-                                result.expect("the changing transaction failed");
-                            }
-                        }
-                        KeyChange::Unchanged | KeyChange::Committed => {
-                            change.await.expect("the changing transaction failed")
-                        }
+        KeyChange::Committed
+        | KeyChange::RewritesSameValue
+        | KeyChange::CancelledAtSuspension(_) => Some(spawn_with_handle(&replay, {
+            let (store, log) = (store.clone(), log.clone());
+            async move {
+                let rewrites_same_value = matches!(key_change, KeyChange::RewritesSameValue);
+                let change = change_key(&*store, log, rewrites_same_value);
+                let result = match key_change {
+                    KeyChange::CancelledAtSuspension(n) => {
+                        cancel_at_nth_suspension(change, n).await
                     }
+                    KeyChange::Unchanged | KeyChange::Committed | KeyChange::RewritesSameValue => {
+                        Some(change.await)
+                    }
+                };
+                if let Some(result) = result {
+                    result.expect("the changing transaction failed");
                 }
-            }))
-        }
+            }
+        })),
     };
-    let observing = async {
-        if in_read_transaction {
-            store
-                .read_transact(|transaction| {
-                    let (key, watch, log) = (key.clone(), watch.clone(), log.clone());
-                    Box::pin(async move {
-                        observe_and_watch(transaction, key, &*watch, &log, observer_commits).await
-                    })
-                })
-                .await
-        } else {
-            store
-                .transact(|transaction| {
-                    let (key, watch, log) = (key.clone(), watch.clone(), log.clone());
-                    Box::pin(async move {
-                        observe_and_watch(transaction, key, &*watch, &log, observer_commits).await
-                    })
-                })
-                .await
-        }
+    let panics = matches!(observer_outcome, ObserverOutcome::Panics);
+    let observing = AssertUnwindSafe(observe(
+        &*store,
+        observing_transaction,
+        watch,
+        log.clone(),
+        panics,
+    ))
+    .catch_unwind();
+    let observed = match observer_outcome {
+        ObserverOutcome::CancelledAtSuspension(n) => cancel_at_nth_suspension(observing, n).await,
+        ObserverOutcome::Commits | ObserverOutcome::Panics => Some(observing.await),
     };
-    let outcome = AssertUnwindSafe(observing).catch_unwind().await;
-    if observer_commits {
-        assert!(
-            matches!(outcome, Ok(Ok(()))),
-            "the observing transaction did not commit"
-        );
-    } else {
-        assert!(outcome.is_err(), "the observing transaction did not panic");
-    }
+    let (_, dropped) = store
+        .read_transact(|transaction| {
+            let key = key.clone();
+            Box::pin(async move { observe_key(transaction, &key).await })
+        })
+        .await
+        .expect("observing the key again failed");
+    assert!(
+        store.changed(dropped).now_or_never().is_none(),
+        "changed resolved although the key did not change"
+    );
     if let Some(changing) = changing {
         changing.await;
     }
     yield_now().await;
-    let final_value = store
-        .read_transact(|transaction| {
+    let read_key = || {
+        store.read_transact(|transaction| {
             let key = key.clone();
             Box::pin(async move { transaction.get(key).await })
         })
-        .await
-        .expect("reading the final value failed");
+    };
+    let final_value = read_key().await.expect("reading the final value failed");
     let mut attempts = std::mem::take(&mut *attempts.lock().unwrap());
-    let last = attempts.pop().expect("work observed the key");
+    let Some(last) = attempts.pop() else {
+        return;
+    };
     let last_attempt = attempts.len();
-    let resolved_before = |attempt, event| {
+    let logged = |event| log.lock().unwrap().contains(&event);
+    let resolved_before = |attempt, observation, event| {
         let log = log.lock().unwrap();
-        let resolved = log
-            .iter()
-            .position(|logged| *logged == ObservationEvent::Resolved { attempt });
+        let resolved = log.iter().position(|logged| {
+            *logged
+                == ObservationEvent::Resolved {
+                    attempt,
+                    observation,
+                }
+        });
         let event = log.iter().rposition(|logged| *logged == event);
         matches!((resolved, event), (Some(resolved), Some(event)) if resolved < event)
             || (resolved.is_some() && event.is_none())
     };
     for (attempt, retried) in attempts.into_iter().enumerate() {
-        assert!(
-            matches!(
-                retried.waiter.await,
-                Err(StoreError::Rejected(NotCommitted))
-            ),
-            "changed did not report NotCommitted for an attempt of the observing transaction that the store retried"
-        );
-        assert!(
-            !resolved_before(attempt, ObservationEvent::ObserverWorkEnded { attempt }),
-            "changed resolved before a retried attempt of the observing transaction finished"
-        );
+        for (observation, waiter) in retried.waiters.into_iter().enumerate() {
+            assert!(
+                matches!(waiter.await, Err(StoreError::Rejected(NotCommitted))),
+                "changed did not report NotCommitted for an attempt of the observing transaction that the store retried"
+            );
+            assert!(
+                !resolved_before(
+                    attempt,
+                    observation,
+                    ObservationEvent::ObserverWorkEnded { attempt }
+                ),
+                "changed resolved before a retried attempt of the observing transaction finished"
+            );
+        }
     }
-    let expected = if !observer_commits {
-        ExpectedObservation::NotCommitted
-    } else if final_value != last.seen {
-        ExpectedObservation::Fires
-    } else {
-        ExpectedObservation::StaysPending
+    let work_ended = logged(ObservationEvent::ObserverWorkEnded {
+        attempt: last_attempt,
+    });
+    let commit = match (observer_outcome, observed) {
+        (ObserverOutcome::Panics, Some(Err(_))) => ObserverCommit::NotCommitted,
+        (ObserverOutcome::Panics, _) => panic!("the observing transaction did not panic"),
+        (_, Some(Ok(Ok(())))) => ObserverCommit::Committed,
+        (ObserverOutcome::Commits, _) => panic!("the observing transaction did not commit"),
+        (ObserverOutcome::CancelledAtSuspension(_), _) if !work_ended => {
+            ObserverCommit::NotCommitted
+        }
+        (ObserverOutcome::CancelledAtSuspension(_), _) => ObserverCommit::Unknown,
     };
-    match expected {
-        ExpectedObservation::NotCommitted => {
-            let result = last.waiter.await;
-            assert!(
-                matches!(result, Err(StoreError::Rejected(NotCommitted))),
-                "changed did not report NotCommitted although the observing transaction did not commit"
-            );
-            assert!(
-                !resolved_before(
-                    last_attempt,
-                    ObservationEvent::ObserverWorkEnded {
-                        attempt: last_attempt
-                    }
-                ),
-                "changed resolved before the observing transaction finished"
-            );
-        }
-        ExpectedObservation::Fires => {
-            let result = last.waiter.await;
-            assert!(
-                result.is_ok(),
-                "changed did not resolve although the key changed"
-            );
-            assert!(
-                !resolved_before(
-                    last_attempt,
-                    ObservationEvent::ObserverWorkEnded {
-                        attempt: last_attempt
-                    }
-                ),
-                "changed resolved before the observing transaction finished"
-            );
-            assert!(
-                !resolved_before(last_attempt, ObservationEvent::ChangerWorkEnded),
-                "changed resolved before the key changed"
-            );
-        }
-        ExpectedObservation::StaysPending => {
-            let resolved = log.lock().unwrap().contains(&ObservationEvent::Resolved {
+    let writes_observed_key = matches!(
+        observing_transaction,
+        ObservingTransaction::WritesObservedKey
+    );
+    for (observation, (seen, waiter)) in last.seen.into_iter().zip(last.waiters).enumerate() {
+        let resolved_before_work_ended = resolved_before(
+            last_attempt,
+            observation,
+            ObservationEvent::ObserverWorkEnded {
                 attempt: last_attempt,
-            });
-            if resolved {
-                let value_after_resolving = store
-                    .read_transact(|transaction| {
-                        let key = key.clone();
-                        Box::pin(async move { transaction.get(key).await })
-                    })
-                    .await
-                    .expect("reading the value after changed resolved failed");
+            },
+        );
+        let resolved = logged(ObservationEvent::Resolved {
+            attempt: last_attempt,
+            observation,
+        });
+        match commit {
+            ObserverCommit::NotCommitted => {
                 assert!(
-                    value_after_resolving != last.seen,
-                    "changed resolved although the key did not change"
+                    matches!(waiter.await, Err(StoreError::Rejected(NotCommitted))),
+                    "changed did not report NotCommitted although the observing transaction did not commit"
                 );
+                assert!(
+                    !work_ended || !resolved_before_work_ended,
+                    "changed resolved before the observing transaction finished"
+                );
+            }
+            ObserverCommit::Committed if final_value != seen => {
+                assert!(
+                    waiter.await.is_ok(),
+                    "changed did not resolve although the key changed"
+                );
+                assert!(
+                    !resolved_before_work_ended,
+                    "changed resolved before the observing transaction finished"
+                );
+                let changed_by_the_observer = writes_observed_key && observation == 0;
+                assert!(
+                    changed_by_the_observer
+                        || !resolved_before(
+                            last_attempt,
+                            observation,
+                            ObservationEvent::ChangerWorkEnded
+                        ),
+                    "changed resolved before the key changed"
+                );
+            }
+            ObserverCommit::Unknown if final_value != seen => {
+                assert!(
+                    !matches!(waiter.await, Err(StoreError::Failed(_))),
+                    "changed failed for an observation whose transaction was cancelled"
+                );
+            }
+            ObserverCommit::Committed | ObserverCommit::Unknown => {
+                if resolved {
+                    let result = waiter.await;
+                    assert!(
+                        matches!(commit, ObserverCommit::Unknown) || result.is_ok(),
+                        "changed reported NotCommitted although the observing transaction committed"
+                    );
+                    if result.is_ok() {
+                        let value_after_resolving = read_key()
+                            .await
+                            .expect("reading the value after changed resolved failed");
+                        assert!(
+                            value_after_resolving != seen,
+                            "changed resolved although the key did not change"
+                        );
+                    }
+                }
             }
         }
     }
-}
-
-async fn observe_and_watch<T: ReadKeyValueTransaction>(
-    transaction: &T,
-    key: Bytes,
-    watch: &(impl Fn(Option<Bytes>, T::Observation) -> usize + Sync),
-    log: &Mutex<Vec<ObservationEvent>>,
-    observer_commits: bool,
-) -> Result<(), T::Failure> {
-    let value = transaction.get(key.clone()).await?;
-    let attempt = watch(value, transaction.observe(key)?);
-    yield_now().await;
-    log.lock()
-        .unwrap()
-        .push(ObservationEvent::ObserverWorkEnded { attempt });
-    if !observer_commits {
-        resume_unwind(Box::new("simulated panic inside work"));
-    }
-    Ok(())
 }
