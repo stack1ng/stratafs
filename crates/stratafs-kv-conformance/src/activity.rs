@@ -8,7 +8,8 @@ use stratafs_store::kv::is_valid_range;
 
 static KEYS: [&[u8]; 7] = [b"", b"\0", b"a", b"a\0", b"aa", b"b", b"\xff"];
 static VALUES: [&[u8]; 3] = [b"", b"1", b"2"];
-static LIMITS: [usize; 4] = [0, 1, 2, usize::MAX];
+static LIMITS: [usize; 5] = [0, 1, 2, 10, usize::MAX];
+const NUMBERED_KEYS: usize = 48;
 
 #[derive(Clone, Debug)]
 pub enum SimulatedTransaction {
@@ -86,8 +87,33 @@ fn cancel_at() -> impl Strategy<Value = Option<f64>> {
 fn transaction() -> impl Strategy<Value = SimulatedTransaction> {
     prop_oneof![
         vec(vec(read(), 1..=3), 1..=3).prop_map(SimulatedTransaction::Read),
-        vec(operation(), 1..=4).prop_map(SimulatedTransaction::Write),
+        vec(
+            prop_oneof![
+                3 => operation().prop_map(|operation| vec![operation]),
+                1 => numbered_key_run(),
+            ],
+            1..=4,
+        )
+        .prop_map(|steps| SimulatedTransaction::Write(steps.into_iter().flatten().collect())),
     ]
+}
+
+// numbered_key_run generates a sequence of operations that set (or clear) a bunch of keys along a range,
+// where they sit directly next to each other in the key space.
+fn numbered_key_run() -> impl Strategy<Value = Vec<SimulatedOperation>> {
+    (
+        0..NUMBERED_KEYS,
+        0..NUMBERED_KEYS,
+        proptest::option::of(value()),
+    )
+        .prop_map(|(one_end, other_end, value)| {
+            (one_end.min(other_end)..=one_end.max(other_end))
+                .map(|index| match &value {
+                    Some(value) => SimulatedOperation::Set(numbered_key(index), value.clone()),
+                    None => SimulatedOperation::Clear(numbered_key(index)),
+                })
+                .collect()
+        })
 }
 
 fn operation() -> impl Strategy<Value = SimulatedOperation> {
@@ -120,7 +146,14 @@ fn bound() -> impl Strategy<Value = Bound<Bytes>> {
 }
 
 fn key() -> impl Strategy<Value = Bytes> {
-    select(KEYS.as_slice()).prop_map(Bytes::from_static)
+    prop_oneof![
+        select(KEYS.as_slice()).prop_map(Bytes::from_static),
+        (0..NUMBERED_KEYS).prop_map(numbered_key),
+    ]
+}
+
+fn numbered_key(index: usize) -> Bytes {
+    Bytes::from(format!("n/{index:02}"))
 }
 
 fn value() -> impl Strategy<Value = Bytes> {
