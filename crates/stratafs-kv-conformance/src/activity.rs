@@ -28,6 +28,7 @@ pub enum SimulatedOperation {
     Set(Bytes, Bytes),
     Clear(Bytes),
     Panic,
+    Abort,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +123,7 @@ fn operation() -> impl Strategy<Value = SimulatedOperation> {
         6 => (key(), value()).prop_map(|(key, value)| SimulatedOperation::Set(key, value)),
         6 => key().prop_map(SimulatedOperation::Clear),
         1 => Just(SimulatedOperation::Panic),
+        1 => Just(SimulatedOperation::Abort),
     ]
 }
 

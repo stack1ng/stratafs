@@ -28,6 +28,7 @@ pub enum HistoryOperation {
 pub enum Outcome {
     Completed(Vec<Seen>),
     Panicked,
+    Aborted,
     Changed(bool),
 }
 
@@ -104,6 +105,7 @@ impl BTreeModel {
                             after.values.remove(key);
                         }
                         SimulatedOperation::Panic => return Outcome::Panicked,
+                        SimulatedOperation::Abort => return Outcome::Aborted,
                     }
                 }
                 for marker in after.observations.values_mut() {

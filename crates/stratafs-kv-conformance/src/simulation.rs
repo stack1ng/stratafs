@@ -11,7 +11,7 @@ use proptest::test_runner::TestCaseError;
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction,
+    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactError,
 };
 
 use crate::activity::{SimulatedCall, SimulatedTransaction};
@@ -229,12 +229,17 @@ where
                 history.lock().unwrap().push(Event::Returned(id, outcome));
                 true
             }
-            Some(Err(StoreError::Failed(failure))) => {
+            Some(Err(TransactError::Failed(failure))) => {
                 return Err(TestCaseError::fail(format!(
                     "the store failed a transaction: {failure}"
                 )));
             }
-            Some(Err(StoreError::Rejected(rejection))) => {
+            Some(Err(TransactError::Aborted(failure))) => {
+                return Err(TestCaseError::fail(format!(
+                    "the store failed an operation inside a transaction: {failure}"
+                )));
+            }
+            Some(Err(TransactError::Rejected(rejection))) => {
                 return Err(TestCaseError::fail(format!(
                     "a transaction this small was rejected: {rejection}"
                 )));
@@ -329,7 +334,7 @@ async fn measure_suspensions<S: KeyValueStore>(
         })
         .await
         .expect("reading the store to copy failed");
-    copy.transact(move |mut transaction| {
+    copy.transact::<_, S::Failure>(move |mut transaction| {
         let entries = entries.clone();
         Box::pin(async move {
             for (key, value) in entries {
@@ -391,7 +396,7 @@ async fn settle_observation_waiters<S: KeyValueStore>(
         loop {
             let key = observation_waiter.key.clone();
             let (current, observation) = store
-                .read_transact(move |transaction| {
+                .read_transact::<_, S::Failure>(move |transaction| {
                     let key = key.clone();
                     Box::pin(async move {
                         let current = transaction.get(key.clone()).await?;

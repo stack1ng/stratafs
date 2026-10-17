@@ -5,8 +5,9 @@ use bytes::Bytes;
 use futures_lite::future::yield_now;
 use futures_util::FutureExt;
 use futures_util::future::try_join_all;
-use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
+use stratafs_store::kv::{
+    KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, TransactError,
+};
 
 use crate::activity::{SimulatedOperation, SimulatedRead, SimulatedTransaction};
 use crate::model::{Outcome, Seen};
@@ -15,6 +16,17 @@ pub(crate) struct Observed<O> {
     pub(crate) key: Bytes,
     pub(crate) seen: Option<Bytes>,
     pub(crate) observation: O,
+}
+
+pub(crate) enum WorkFailure<F> {
+    Store(F),
+    SimulatedAbort,
+}
+
+impl<F> From<F> for WorkFailure<F> {
+    fn from(failure: F) -> Self {
+        WorkFailure::Store(failure)
+    }
 }
 
 pub(crate) struct WorkAttempt<O> {
@@ -38,13 +50,13 @@ pub(crate) async fn execute<S: KeyValueStore>(
     // this records only the most recent attempt.
     // The caller owns it, so it survives the transaction being cancelled.
     last_attempt: &Arc<Mutex<WorkAttempt<S::Observation>>>,
-) -> Result<Outcome, StoreError<S::Rejection, S::Failure>> {
+) -> Result<Outcome, TransactError<S::Rejection, S::Failure, S::Failure>> {
     let last_attempt = last_attempt.clone();
     let run = async {
         match simulated_transaction {
             SimulatedTransaction::Read(groups) => {
                 store
-                    .read_transact(move |transaction| {
+                    .read_transact::<_, WorkFailure<S::Failure>>(move |transaction| {
                         let (groups, last_attempt) = (groups.clone(), last_attempt.clone());
                         Box::pin(async move {
                             *last_attempt.lock().unwrap() = WorkAttempt::default();
@@ -63,7 +75,7 @@ pub(crate) async fn execute<S: KeyValueStore>(
             }
             SimulatedTransaction::Write(operations) => {
                 store
-                    .transact(move |mut transaction| {
+                    .transact::<_, WorkFailure<S::Failure>>(move |mut transaction| {
                         let (operations, last_attempt) = (operations.clone(), last_attempt.clone());
                         Box::pin(async move {
                             *last_attempt.lock().unwrap() = WorkAttempt::default();
@@ -83,6 +95,9 @@ pub(crate) async fn execute<S: KeyValueStore>(
                                     SimulatedOperation::Panic => {
                                         resume_unwind(Box::new("simulated panic inside work"))
                                     }
+                                    SimulatedOperation::Abort => {
+                                        return Err(WorkFailure::SimulatedAbort);
+                                    }
                                 }
                             }
                             last_attempt.lock().unwrap().finished = true;
@@ -94,7 +109,13 @@ pub(crate) async fn execute<S: KeyValueStore>(
         }
     };
     match AssertUnwindSafe(run).catch_unwind().await {
-        Ok(result) => result.map(Outcome::Completed),
+        Ok(Ok(seen)) => Ok(Outcome::Completed(seen)),
+        Ok(Err(TransactError::Aborted(WorkFailure::SimulatedAbort))) => Ok(Outcome::Aborted),
+        Ok(Err(TransactError::Aborted(WorkFailure::Store(failure)))) => {
+            Err(TransactError::Aborted(failure))
+        }
+        Ok(Err(TransactError::Failed(failure))) => Err(TransactError::Failed(failure)),
+        Ok(Err(TransactError::Rejected(rejection))) => Err(TransactError::Rejected(rejection)),
         Err(_) => Ok(Outcome::Panicked),
     }
 }

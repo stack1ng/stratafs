@@ -8,7 +8,7 @@ use futures_util::FutureExt;
 use futures_util::future::{RemoteHandle, join};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction,
+    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactError,
 };
 
 use crate::runtime::{Replay, ReplayingRuntime, spawn_with_handle};
@@ -85,7 +85,7 @@ pub(crate) async fn change_key<S: KeyValueStore>(
     store: &S,
     log: Arc<Mutex<Vec<ObservationEvent>>>,
     rewrites_same_value: bool,
-) -> Result<(), StoreError<S::Rejection, S::Failure>> {
+) -> Result<(), TransactError<S::Rejection, S::Failure, S::Failure>> {
     store
         .transact(|mut transaction| {
             let log = log.clone();
@@ -111,7 +111,7 @@ pub(crate) async fn observe<S: KeyValueStore>(
     watch: Arc<impl Fn(Observations<S::Observation>) -> usize + Send + Sync + 'static>,
     log: Arc<Mutex<Vec<ObservationEvent>>>,
     panics: bool,
-) -> Result<(), StoreError<S::Rejection, S::Failure>> {
+) -> Result<(), TransactError<S::Rejection, S::Failure, S::Failure>> {
     let key = Bytes::from_static(OBSERVED_KEY);
     match observing_transaction {
         ObservingTransaction::Read => {

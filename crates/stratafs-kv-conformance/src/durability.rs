@@ -2,8 +2,7 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use proptest::test_runner::TestCaseError;
-use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
+use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction, TransactError};
 
 use crate::activity::{SimulatedCall, SimulatedRead, SimulatedStop, SimulatedTransaction};
 use crate::execute::execute;
@@ -245,12 +244,17 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
         }
         match result {
             Ok(outcome) => history.lock().unwrap().push(Event::Returned(id, outcome)),
-            Err(StoreError::Failed(failure)) => {
+            Err(TransactError::Failed(failure)) => {
                 return Err(TestCaseError::fail(format!(
                     "the store failed a transaction: {failure}"
                 )));
             }
-            Err(StoreError::Rejected(rejection)) => {
+            Err(TransactError::Aborted(failure)) => {
+                return Err(TestCaseError::fail(format!(
+                    "the store failed an operation inside a transaction: {failure}"
+                )));
+            }
+            Err(TransactError::Rejected(rejection)) => {
                 return Err(TestCaseError::fail(format!(
                     "a transaction this small was rejected: {rejection}"
                 )));

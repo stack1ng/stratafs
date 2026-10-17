@@ -10,6 +10,22 @@ use crate::error::StoreError;
 #[error("the transaction that made this observation did not commit")]
 pub struct NotCommitted;
 
+#[derive(Debug, thiserror::Error)]
+pub enum TransactError<R, F, E> {
+    // The store refused the transaction, and it was not applied.
+    // the exact reasons for this are specific to the store implementation.
+    #[error(transparent)]
+    Rejected(R),
+
+    // The transaction failed due to some backend failure, it may or may not have been applied.
+    #[error(transparent)]
+    Failed(F),
+
+    // work returned an error, so the transaction was not applied.
+    #[error(transparent)]
+    Aborted(E),
+}
+
 pub trait KeyValueStore: Send + Sync + 'static {
     type Rejection: std::error::Error + Send + Sync + 'static;
     type Failure: std::error::Error + Send + Sync + 'static;
@@ -18,26 +34,28 @@ pub trait KeyValueStore: Send + Sync + 'static {
     type Transaction<'txn>: KeyValueTransaction<Failure = Self::Failure, Observation = Self::Observation>;
 
     // transact runs a transaction, returning the result.
+    // If work returns an error, the transaction is not applied, and transact returns that error as Aborted.
     // A panic inside work propagates to the caller of transact.
     // The transaction is not applied, and the store stays usable.
-    fn transact<T: Send>(
+    fn transact<T: Send, E: Send>(
         &self,
         work: impl for<'txn> FnMut(
             TransactionHandle<'txn, Self::Transaction<'txn>>,
-        ) -> BoxFuture<'txn, Result<T, Self::Failure>>
+        ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
-    ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
+    ) -> impl Future<Output = Result<T, TransactError<Self::Rejection, Self::Failure, E>>> + Send;
 
     // read_transact runs a read-only transaction, returning the result.
+    // If work returns an error, read_transact returns that error as Aborted.
     // A panic inside work propagates to the caller of read_transact.
     // The transaction is not applied, and the store stays usable.
-    fn read_transact<T: Send>(
+    fn read_transact<T: Send, E: Send>(
         &self,
         work: impl for<'txn> FnMut(
             TransactionHandle<'txn, Self::ReadTransaction<'txn>>,
-        ) -> BoxFuture<'txn, Result<T, Self::Failure>>
+        ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
-    ) -> impl Future<Output = Result<T, StoreError<Self::Rejection, Self::Failure>>> + Send;
+    ) -> impl Future<Output = Result<T, TransactError<Self::Rejection, Self::Failure, E>>> + Send;
 
     // changed returns a future that resolves once the observed key differs from what its transaction saw (see observe).
     // It fails if the transaction that produced the observation did not finish successfully.

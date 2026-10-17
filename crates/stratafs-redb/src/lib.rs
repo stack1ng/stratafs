@@ -15,8 +15,8 @@ use redb::{
 use stratafs_keyed_notify::KeyedNotify;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactionHandle,
-    assert_valid_range,
+    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactError,
+    TransactionHandle, assert_valid_range,
 };
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
@@ -53,13 +53,6 @@ impl SpawnBlocking for Inline {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum RedbRejection {
-    // this is a 1:1 mapping to the StorageError::ValueTooLarge variant
-    #[error("The value being inserted exceeds the maximum of 3GiB: {0} bytes")]
-    ValueTooLarge(usize),
-}
-
-#[derive(Debug, thiserror::Error)]
 pub enum RedbFailure {
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -93,23 +86,24 @@ impl<S> RedbStore<S> {
 }
 
 impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
-    type Rejection = RedbRejection;
-    // never ValueTooLarge, transact reports that as a rejection
+    type Rejection = std::convert::Infallible;
+    // set returns ValueTooLarge as a failure. If work propagates it, transact reports it as Aborted.
+    // transact's own Failed doesn't have it, since redb only checks value sizes on insert.
     type Failure = RedbFailure;
     type Observation = RedbObservation;
     type ReadTransaction<'txn> = RedbTransaction<'txn, ReadOnlyTable<&'static [u8], &'static [u8]>>;
     type Transaction<'txn> = RedbTransaction<'txn, Table<'txn, &'static [u8], &'static [u8]>>;
 
-    async fn transact<T: Send>(
+    async fn transact<T: Send, E: Send>(
         &self,
         mut work: impl for<'txn> FnMut(
             TransactionHandle<'txn, Self::Transaction<'txn>>,
-        ) -> BoxFuture<'txn, Result<T, Self::Failure>>
+        ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
-    ) -> Result<T, StoreError<Self::Rejection, Self::Failure>> {
+    ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
         let mut written = self.writer.lock().await;
         written.clear();
-        let result: Result<T, RedbFailure> = async {
+        let result: Result<Result<T, E>, RedbFailure> = async {
             let transaction = self.database.begin_write()?;
             let committed = OnceLock::new();
             let output = work(TransactionHandle::new(RedbTransaction {
@@ -117,7 +111,14 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                 written: &mut written,
                 committed: &committed,
             }))
-            .await?;
+            .await;
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    transaction.abort()?;
+                    return Ok(Err(error));
+                }
+            };
             let committed = committed.into_inner();
             let notify = self.notify.clone();
             let keys = std::mem::take(&mut *written);
@@ -136,25 +137,24 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                 .await;
             *written = keys;
             commit?;
-            Ok(output)
+            Ok(Ok(output))
         }
         .await;
-        result.map_err(|failure| match failure {
-            RedbFailure::Storage(StorageError::ValueTooLarge(size)) => {
-                StoreError::Rejected(RedbRejection::ValueTooLarge(size))
-            }
-            failure => StoreError::Failed(failure),
-        })
+        match result {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(TransactError::Aborted(error)),
+            Err(failure) => Err(TransactError::Failed(failure)),
+        }
     }
 
-    async fn read_transact<T: Send>(
+    async fn read_transact<T: Send, E: Send>(
         &self,
         mut work: impl for<'txn> FnMut(
             TransactionHandle<'txn, Self::ReadTransaction<'txn>>,
-        ) -> BoxFuture<'txn, Result<T, Self::Failure>>
+        ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
-    ) -> Result<T, StoreError<Self::Rejection, Self::Failure>> {
-        let result: Result<T, RedbFailure> = async {
+    ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
+        let result: Result<Result<T, E>, RedbFailure> = async {
             let transaction = self.database.begin_read()?;
             let committed = OnceLock::new();
             let mut written = Vec::new();
@@ -163,14 +163,22 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                 written: &mut written,
                 committed: &committed,
             }))
-            .await?;
+            .await;
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => return Ok(Err(error)),
+            };
             if let Some((committed, _)) = committed.into_inner() {
                 let _ = committed.send(());
             }
-            Ok(output)
+            Ok(Ok(output))
         }
         .await;
-        result.map_err(StoreError::Failed)
+        match result {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(TransactError::Aborted(error)),
+            Err(failure) => Err(TransactError::Failed(failure)),
+        }
     }
 
     async fn changed(
