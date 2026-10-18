@@ -8,11 +8,13 @@ use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume, VolumeId};
 use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
 };
+use zerocopy::IntoBytes;
 use zerocopy::little_endian::{U64, U128};
 
 use crate::error::TreeFailure;
 use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
 use crate::key::TreeKey;
+use crate::node::{NodeHeader, NodeKind};
 use crate::serialized::{CorruptValue, serialized_value};
 use crate::slotted::{AddressableRange, SlottedList};
 use crate::volume::TreeVolume;
@@ -142,7 +144,7 @@ where
     // create creates a new volume with no contents.
     async fn create(&self) -> Result<VolumeId, Self::CreateError> {
         let id = TreeVolumeId((self.0.id_allocator)());
-        let root = NodeId((self.0.id_allocator)());
+        let root = NodeId(U128::new((self.0.id_allocator)()));
         self.0
             .store
             .transact(move |mut transaction| {
@@ -151,7 +153,7 @@ where
                         .set(
                             TreeKey::VolumeHeader(id).into(),
                             Bytes::from(&VolumeHeader {
-                                root: U128::new(root.0),
+                                root,
                                 epoch: U64::new(0),
                             }),
                         )
@@ -159,14 +161,22 @@ where
                     transaction
                         .set(
                             TreeKey::Node(root).into(),
-                            SlottedList::<
-                                BytesMut,
-                                // we aren't storing any values yet, so we intentionally make it so we cant store any with the infallible type.
-                                Infallible,
-                                R,
-                            >::empty()
-                            .into_inner()
-                            .freeze(),
+                            [
+                                NodeHeader {
+                                    kind: NodeKind::Leaf,
+                                    epoch: U64::new(0),
+                                }
+                                .as_bytes(),
+                                &SlottedList::<
+                                    BytesMut,
+                                    // we aren't storing any values yet, so we intentionally make it so we cant store any with the infallible type.
+                                    Infallible,
+                                    R,
+                                >::empty()
+                                .into_inner(),
+                            ]
+                            .concat()
+                            .into(),
                         )
                         .await
                 })
