@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+equivalent.workspace = true
 futures-core.workspace = true
 storekey.workspace = true
 stratafs-store.workspace = true

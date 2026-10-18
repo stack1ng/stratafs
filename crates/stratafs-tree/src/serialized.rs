@@ -15,6 +15,8 @@ pub enum CorruptValue {
     KeyLongerThanEntry,
     #[error("a node refers to a child node that is not in the store")]
     MissingNode,
+    #[error("the volume's header is not in the store")]
+    MissingVolumeHeader,
     #[error(
         "the key sorts before the internal node's first separator, which must be the empty key"
     )]

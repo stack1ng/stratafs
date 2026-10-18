@@ -14,6 +14,7 @@ blocking = "1.7"
 bytes = "1.12"
 cfg_aliases = "0.2"
 derive_more = { version = "2.1", features = ["from", "try_into"] }
+equivalent = "1.0"
 event-listener = "5.4"
 futures-channel = "0.3.34"
 futures-core = "0.3.34"

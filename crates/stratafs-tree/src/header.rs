@@ -43,7 +43,7 @@ impl SerializedShape for VolumeEpoch {
 }
 
 serialized_value! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     pub(crate) struct VolumeHeader {
         pub(crate) root: NodeId,
         pub(crate) epoch: VolumeEpoch,

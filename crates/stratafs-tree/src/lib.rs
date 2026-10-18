@@ -1,3 +1,5 @@
+mod concatenated_bytes;
+mod descent;
 pub mod error;
 mod header;
 mod key;
