@@ -131,6 +131,7 @@ fn stored_bytes_are_read_in_place() {
     let list = SlottedList::<Bytes, [u8], u16>::new(bytes.clone()).unwrap();
     assert_eq!(entries(&list), [&b"ab"[..], b"cde"]);
     assert_eq!(list.get(0).unwrap().unwrap().as_ptr(), bytes.as_ptr());
+    assert_eq!(list.get_ref().as_ptr(), bytes.as_ptr());
 }
 
 #[test]

@@ -12,15 +12,15 @@ use crate::volume::TreeTransaction;
 
 const MAX_DEPTH: usize = 64;
 
-struct DescentStep<R, T: ?Sized, P> {
-    entries: SlottedList<Bytes, T, R>,
+pub(crate) struct DescentStep<R, T: ?Sized, P> {
+    pub(crate) entries: SlottedList<Bytes, T, R>,
     epoch: VolumeEpoch,
     position: P,
 }
 
 pub(crate) struct DescentPath<R> {
     steps: Vec<DescentStep<R, InternalEntry, usize>>,
-    destination: DescentStep<
+    pub(crate) destination: DescentStep<
         R,
         LeafEntry,
         // leaf entries might not have a match, so this expects the binary search result
@@ -33,7 +33,7 @@ where
     T: ReadKeyValueTransaction,
     R: AddressableRange,
 {
-    // TODO: these methods assume KV operations are effeciently cached by the underlying kv store,
+    // TODO: these methods assume KV operations are efficiently cached by the underlying kv store,
     // we need to make a wrapper for any generic kv store that does this.
     pub(crate) async fn get_volume_header(&self) -> Result<VolumeHeader, TreeFailure<T::Failure>> {
         let stored = self
@@ -124,17 +124,18 @@ where
     }
 
     // next_entry provides a way to iterate from a DescentPath.
-    // If it errors, the cursor should be treated as invalid.
+    // If it errors or is cancelled, the cursor should be treated as invalid.
+    // It returns the next leaf entry and its backing buffer.
     pub(crate) async fn next_entry<'cursor>(
         &self,
         cursor: &'cursor mut DescentPath<R>,
-    ) -> Result<Option<&'cursor LeafEntry>, TreeFailure<T::Failure>> {
+    ) -> Result<Option<(&'cursor LeafEntry, &'cursor Bytes)>, TreeFailure<T::Failure>> {
         let next_held_leaf_index = match cursor.destination.position {
             Ok(index) => index,
             Err(next_closest_index) => next_closest_index,
         };
         if next_held_leaf_index >= cursor.destination.entries.len() {
-            // we have reached the end of the cursor's held leaf node, so we must find the next
+            // we have reached the end of the cursor's held leaf node, so we must find the next leaf node
             let mut current_possible_ancestors = &cursor.steps[..];
             loop {
                 let Some((ancestor, above)) = current_possible_ancestors.split_last() else {
@@ -144,7 +145,7 @@ where
                 };
                 if let Some(next) = ancestor.entries.get(ancestor.position + 1) {
                     // we have found a common ancestor between the old position and the next.
-                    // now we simply descend from it to its first leaf
+                    // now we simply descend from the common ancestor's next child to that subtree's first leaf
                     let next_subtree_root = next.map_err(TreeFailure::Corrupt)?.child;
                     cursor.steps.truncate(current_possible_ancestors.len());
 
@@ -168,12 +169,12 @@ where
                     // ensure that we are pointing directly after the first entry
                     cursor.destination.position = Ok(1);
 
-                    return cursor
-                        .destination
-                        .entries
+                    let entries = &cursor.destination.entries;
+                    return Ok(entries
                         .get(0)
                         .transpose()
-                        .map_err(TreeFailure::Corrupt);
+                        .map_err(TreeFailure::Corrupt)?
+                        .map(|entry| (entry, entries.get_ref())));
                 }
 
                 // this ancestor has no child to the right, so we must check its parent
@@ -184,7 +185,7 @@ where
             Some(Ok(entry)) => {
                 // we still are iterating on the same held leaf, simply advance the cursor position and return what we got
                 cursor.destination.position = Ok(next_held_leaf_index + 1);
-                Ok(Some(entry))
+                Ok(Some((entry, cursor.destination.entries.get_ref())))
             }
             Some(Err(corrupt)) => Err(TreeFailure::Corrupt(corrupt)),
             None => {

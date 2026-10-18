@@ -1,3 +1,4 @@
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
@@ -9,25 +10,22 @@ use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, SetRejection,
     TransactError, TransactionHandle,
 };
-use zerocopy::IntoBytes;
 
+use crate::concatenated_bytes::ConcatenatedBytes;
 use crate::error::TreeFailure;
-use crate::header::{NodeId, VolumeEpoch};
-use crate::key::TreeKey;
-use crate::node::{InternalEntry, LeafEntry, Node, NodeKind};
-use crate::serialized::CorruptValue;
-use crate::slotted::{AddressableRange, SlottedList};
+use crate::header::TreeVolumeId;
+use crate::slotted::AddressableRange;
 use crate::tree::TreeShared;
 
 pub struct TreeVolume<S, A, R, const NODE_CAPACITY: usize> {
     shared: Arc<TreeShared<S, A, R, NODE_CAPACITY>>,
-    id: VolumeId,
+    id: TreeVolumeId,
 }
 
 pub struct TreeTransaction<'txn, T, S, A, R, const NODE_CAPACITY: usize> {
-    inner: TransactionHandle<'txn, T>,
-    shared: Arc<TreeShared<S, A, R, NODE_CAPACITY>>,
-    volume: VolumeId,
+    pub(crate) inner: TransactionHandle<'txn, T>,
+    pub(crate) shared: Arc<TreeShared<S, A, R, NODE_CAPACITY>>,
+    pub(crate) volume: TreeVolumeId,
 }
 
 pub struct TreeObservation;
@@ -40,7 +38,7 @@ impl<S, A, R, const NODE_CAPACITY: usize> TreeVolume<S, A, R, NODE_CAPACITY> {
         TreeTransaction {
             inner,
             shared: Arc::clone(&self.shared),
-            volume: self.id.clone(),
+            volume: self.id,
         }
     }
 }
@@ -104,103 +102,6 @@ where
     }
 }
 
-const MAX_DEPTH: usize = 64;
-
-struct DescentStep<R, T: ?Sized, P> {
-    entries: SlottedList<Bytes, T, R>,
-    epoch: VolumeEpoch,
-    position: P,
-}
-
-struct DescentPath<R> {
-    steps: Vec<DescentStep<R, InternalEntry, usize>>,
-    destination: DescentStep<
-        R,
-        LeafEntry,
-        // leaf entries might not have a match, so this expects the binary search result
-        Result<usize, usize>,
-    >,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum DescentError<F> {
-    #[error(transparent)]
-    Get(#[from] F),
-    #[error(transparent)]
-    Corrupt(CorruptValue),
-}
-
-impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
-where
-    T: ReadKeyValueTransaction,
-    R: AddressableRange,
-{
-    async fn descend(
-        &self,
-        root: NodeId,
-        key: &[u8],
-    ) -> Result<DescentPath<R>, DescentError<T::Failure>> {
-        let mut steps: Vec<DescentStep<R, InternalEntry, usize>> = Vec::new();
-        let mut current = root;
-        for _ in 0..MAX_DEPTH {
-            let node_bytes = self
-                .inner
-                .get(TreeKey::Node(current).into())
-                .await?
-                .ok_or(DescentError::Corrupt(CorruptValue::MissingNode))?;
-            let (epoch, node) =
-                Node::<Bytes, R>::read(node_bytes).map_err(DescentError::Corrupt)?;
-
-            match node {
-                Node::Leaf(entries) => {
-                    let position = entries
-                        .binary_search_by(|leaf| {
-                            let (leaf_key, _) = leaf.key_and_value()?;
-                            Ok(leaf_key.cmp(key))
-                        })
-                        .map_err(DescentError::Corrupt)?;
-                    return Ok(DescentPath {
-                        steps,
-                        destination: DescentStep {
-                            entries,
-                            epoch,
-                            position,
-                        },
-                    });
-                }
-                Node::Internal(entries) => {
-                    let applicable_separator_index = match entries
-                        .binary_search_by(|separator| Ok(separator.key.cmp(key)))
-                        .map_err(DescentError::Corrupt)?
-                    {
-                        Ok(index) => index,
-                        Err(0) => {
-                            return Err(DescentError::Corrupt(
-                                CorruptValue::KeyBeforeFirstSeparator,
-                            ));
-                        }
-                        // if there is not an exact match, we are in the applicable range of the separator that is to the left of this index.
-                        Err(index) => index - 1,
-                    };
-
-                    current = entries
-                        .get(applicable_separator_index)
-                        .expect("the index is in the range")
-                        .map_err(DescentError::Corrupt)?
-                        .child;
-
-                    steps.push(DescentStep {
-                        entries,
-                        epoch,
-                        position: applicable_separator_index,
-                    });
-                }
-            }
-        }
-        Err(DescentError::Corrupt(CorruptValue::TreeTooDeep))
-    }
-}
-
 impl<T, S, A, R, const NODE_CAPACITY: usize> ReadKeyValueTransaction
     for TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
 where
@@ -212,12 +113,43 @@ where
     type Failure = TreeFailure<T::Failure>;
     type Observation = TreeObservation;
 
+    // get_range is implemented by walking the tree. The returned Bytes
+    // are all pinned to their containing leaf node's buffer, so for any long lived usage, they should be copied.
     async fn get_range(
         &self,
         range: impl RangeBounds<Bytes> + Send,
         limit: usize,
     ) -> Result<Vec<(Bytes, Bytes)>, Self::Failure> {
-        todo!()
+        let start_target = match range.start_bound() {
+            Included(key) => ConcatenatedBytes::from(&key[..]),
+            Excluded(key) => ConcatenatedBytes::new(key, &[0]),
+            Unbounded => ConcatenatedBytes::default(),
+        };
+
+        let end = range.end_bound();
+        let reached_end = |key: &[u8]| match end {
+            Included(end) => key > &end[..],
+            Excluded(end) => key >= &end[..],
+            Unbounded => false,
+        };
+
+        let mut cursor = self.descend(&start_target).await?;
+        let mut entries: Vec<(Bytes, Bytes)> =
+            Vec::with_capacity(limit.min(cursor.destination.entries.len()));
+        while entries.len() < limit {
+            match self.next_entry(&mut cursor).await? {
+                None => break,
+                Some((entry, leaf_bytes)) => {
+                    let (key, value) = entry.key_and_value().map_err(TreeFailure::Corrupt)?;
+                    if reached_end(key) {
+                        break;
+                    }
+                    entries.push((leaf_bytes.slice_ref(key), leaf_bytes.slice_ref(value)));
+                }
+            }
+        }
+
+        Ok(entries)
     }
 
     fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure> {

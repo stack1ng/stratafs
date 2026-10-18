@@ -134,6 +134,10 @@ where
 }
 
 impl<B, T: ?Sized, R> SlottedList<B, T, R> {
+    pub(crate) fn get_ref(&self) -> &B {
+        &self.bytes
+    }
+
     pub(crate) fn into_inner(self) -> B {
         self.bytes
     }
