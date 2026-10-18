@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::Range;
 
@@ -100,6 +101,23 @@ where
     pub(crate) fn get(&self, index: usize) -> Option<Result<&T, CorruptValue>> {
         let entry = self.entry_range(index)?;
         Some(T::ref_from_bytes(&self.bytes.as_ref()[entry]).map_err(|_| CorruptValue::WrongLength))
+    }
+
+    pub(crate) fn binary_search_by(
+        &self,
+        mut compare: impl FnMut(&T) -> Result<Ordering, CorruptValue>,
+    ) -> Result<Result<usize, usize>, CorruptValue> {
+        let (mut low, mut high) = (0, self.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let entry = self.get(middle).expect("middle is below the length")?;
+            match compare(entry)? {
+                Ordering::Less => low = middle + 1,
+                Ordering::Greater => high = middle,
+                Ordering::Equal => return Ok(Ok(middle)),
+            }
+        }
+        Ok(Err(low))
     }
 
     fn parts(&self) -> (&[u8], &[R::Stored]) {

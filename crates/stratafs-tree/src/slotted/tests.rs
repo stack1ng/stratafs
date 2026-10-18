@@ -239,6 +239,46 @@ fn each_width_is_optimal_just_past_the_narrower_max() {
     );
 }
 
+fn search(list: &SlottedList<BytesMut, [u8], u16>, key: &[u8]) -> Result<usize, usize> {
+    list.binary_search_by(|entry| Ok(entry.cmp(key))).unwrap()
+}
+
+#[test]
+fn binary_search_finds_entries_and_their_insertion_points() {
+    let list = list_of::<u16>(&[b"b", b"d", b"f"]);
+    assert_eq!(search(&list, b"a"), Err(0));
+    assert_eq!(search(&list, b"b"), Ok(0));
+    assert_eq!(search(&list, b"c"), Err(1));
+    assert_eq!(search(&list, b"d"), Ok(1));
+    assert_eq!(search(&list, b"e"), Err(2));
+    assert_eq!(search(&list, b"f"), Ok(2));
+    assert_eq!(search(&list, b"g"), Err(3));
+}
+
+#[test]
+fn binary_search_on_an_empty_list_inserts_at_the_start() {
+    assert_eq!(search(&list_of::<u16>(&[]), b"a"), Err(0));
+}
+
+#[test]
+fn binary_search_reports_corrupt_entries() {
+    let bytes = stored::<u16>(b"abc", &[0]);
+    let list = SlottedList::<&[u8], ChildEntry, u16>::new(&bytes[..]).unwrap();
+    assert!(matches!(
+        list.binary_search_by(|_| Ok(Ordering::Equal)),
+        Err(CorruptValue::WrongLength)
+    ));
+}
+
+#[test]
+fn binary_search_reports_errors_from_its_comparison() {
+    let list = list_of::<u16>(&[b"a"]);
+    assert!(matches!(
+        list.binary_search_by(|_| Err(CorruptValue::KeyLongerThanEntry)),
+        Err(CorruptValue::KeyLongerThanEntry)
+    ));
+}
+
 fn lists_at_the_limits_are_accepted<R: AddressableRange>() {
     for bytes in [
         stored::<R>(&vec![0; R::MAX], &[0, R::MAX]),
