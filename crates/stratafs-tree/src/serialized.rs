@@ -13,6 +13,14 @@ pub enum CorruptValue {
     UnknownNodeKind,
     #[error("the stored key length is longer than its entry")]
     KeyLongerThanEntry,
+    #[error("a node refers to a child node that is not in the store")]
+    MissingNode,
+    #[error(
+        "the key sorts before the internal node's first separator, which must be the empty key"
+    )]
+    KeyBeforeFirstSeparator,
+    #[error("the path from the root is deeper than any valid tree")]
+    TreeTooDeep,
 }
 
 pub(crate) const FINGERPRINT_LENGTH: usize = 4;

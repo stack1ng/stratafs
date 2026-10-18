@@ -104,6 +104,8 @@ where
     }
 }
 
+const MAX_DEPTH: usize = 64;
+
 struct DescentStep<R, T: ?Sized, P> {
     entries: SlottedList<Bytes, T, R>,
     epoch: VolumeEpoch,
@@ -140,12 +142,12 @@ where
     ) -> Result<DescentPath<R>, DescentError<T::Failure>> {
         let mut steps: Vec<DescentStep<R, InternalEntry, usize>> = Vec::new();
         let mut current = root;
-        loop {
+        for _ in 0..MAX_DEPTH {
             let node_bytes = self
                 .inner
                 .get(TreeKey::Node(current).into())
                 .await?
-                .expect("expected a node to be present");
+                .ok_or(DescentError::Corrupt(CorruptValue::MissingNode))?;
             let (epoch, node) =
                 Node::<Bytes, R>::read(node_bytes).map_err(DescentError::Corrupt)?;
 
@@ -172,6 +174,11 @@ where
                         .map_err(DescentError::Corrupt)?
                     {
                         Ok(index) => index,
+                        Err(0) => {
+                            return Err(DescentError::Corrupt(
+                                CorruptValue::KeyBeforeFirstSeparator,
+                            ));
+                        }
                         // if there is not an exact match, we are in the applicable range of the separator that is to the left of this index.
                         Err(index) => index - 1,
                     };
@@ -190,6 +197,7 @@ where
                 }
             }
         }
+        Err(DescentError::Corrupt(CorruptValue::TreeTooDeep))
     }
 }
 
