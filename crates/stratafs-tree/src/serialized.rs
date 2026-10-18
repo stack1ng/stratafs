@@ -9,6 +9,10 @@ pub enum CorruptValue {
     WrongLength,
     #[error("the stored entry positions do not describe the entry data")]
     InvalidEntryPositions,
+    #[error("the stored node kind is not a known kind")]
+    UnknownNodeKind,
+    #[error("the stored key length is longer than its entry")]
+    KeyLongerThanEntry,
 }
 
 pub(crate) const FINGERPRINT_LENGTH: usize = 4;

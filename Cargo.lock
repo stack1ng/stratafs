@@ -1368,6 +1368,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "storekey"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd9a94571bde7369ecaac47cec2e6844642d99166bd452fbd8def74b5b917b2f"
+dependencies = [
+ "storekey-derive",
+]
+
+[[package]]
+name = "storekey-derive"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6079d53242246522ec982de613c5c952cc7b1380ef2f8622fcdab9bfe73c0098"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "stratafs-keyed-notify"
 version = "0.1.0"
 dependencies = [
@@ -1386,6 +1406,7 @@ dependencies = [
  "shuttle",
  "stateright",
  "stratafs-store",
+ "thiserror",
 ]
 
 [[package]]
@@ -1435,6 +1456,19 @@ dependencies = [
 [[package]]
 name = "stratafs-tree"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-lite",
+ "proptest",
+ "redb",
+ "storekey",
+ "stratafs-redb",
+ "stratafs-store",
+ "thiserror",
+ "xxhash-rust",
+ "zerocopy",
+]
 
 [[package]]
 name = "syn"
@@ -1806,6 +1840,12 @@ dependencies = [
  "libc",
  "rustix",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yoke"

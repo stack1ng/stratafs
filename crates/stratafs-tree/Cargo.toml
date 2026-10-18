@@ -6,6 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes.workspace = true
+futures-core.workspace = true
+storekey.workspace = true
+stratafs-store.workspace = true
+thiserror.workspace = true
+xxhash-rust.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+proptest.workspace = true
+redb = "4.4.0"
+stratafs-redb.workspace = true
 
 [lints]
 workspace = true
