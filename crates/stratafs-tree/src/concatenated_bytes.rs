@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use equivalent::{Comparable, Equivalent};
+
 // ConcatenatedBytes provides a zero copy view of 2 buffers
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ConcatenatedBytes<'a> {
@@ -64,6 +66,18 @@ impl PartialEq for ConcatenatedBytes<'_> {
 }
 
 impl Eq for ConcatenatedBytes<'_> {}
+
+impl Equivalent<[u8]> for ConcatenatedBytes<'_> {
+    fn equivalent(&self, bytes: &[u8]) -> bool {
+        *self == ConcatenatedBytes::from(bytes)
+    }
+}
+
+impl Comparable<[u8]> for ConcatenatedBytes<'_> {
+    fn compare(&self, bytes: &[u8]) -> Ordering {
+        self.cmp(&ConcatenatedBytes::from(bytes))
+    }
+}
 
 #[cfg(test)]
 mod tests;

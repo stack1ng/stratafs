@@ -1,3 +1,4 @@
+use equivalent::{Comparable, Equivalent};
 use proptest::collection::vec;
 use proptest::prelude::*;
 
@@ -37,6 +38,20 @@ fn a_split_point_does_not_change_the_order() {
     );
 }
 
+#[test]
+fn compares_with_plain_bytes() {
+    let concatenated = ConcatenatedBytes::new(b"m", b"\0");
+    for (bytes, ordering) in [
+        (&b"m"[..], Ordering::Greater),
+        (b"m\0", Ordering::Equal),
+        (b"m\0a", Ordering::Less),
+        (b"ma", Ordering::Less),
+    ] {
+        assert_eq!(concatenated.compare(bytes), ordering);
+        assert_eq!(concatenated.equivalent(bytes), ordering == Ordering::Equal);
+    }
+}
+
 proptest! {
     #[test]
     fn concatenations_order_like_their_joined_bytes(
@@ -49,5 +64,16 @@ proptest! {
         let right = ConcatenatedBytes::new(&right.0, &right.1);
         prop_assert_eq!(left.cmp(&right), left_joined.cmp(&right_joined));
         prop_assert_eq!(left == right, left_joined == right_joined);
+    }
+
+    #[test]
+    fn comparisons_with_plain_bytes_match_the_joined_bytes(
+        concatenated in (vec(0u8..3, 0..4), vec(0u8..3, 0..4)),
+        bytes in vec(0u8..3, 0..8),
+    ) {
+        let joined = [concatenated.0.as_slice(), concatenated.1.as_slice()].concat();
+        let concatenated = ConcatenatedBytes::new(&concatenated.0, &concatenated.1);
+        prop_assert_eq!(concatenated.compare(bytes.as_slice()), joined.as_slice().cmp(bytes.as_slice()));
+        prop_assert_eq!(concatenated.equivalent(bytes.as_slice()), joined == bytes);
     }
 }
