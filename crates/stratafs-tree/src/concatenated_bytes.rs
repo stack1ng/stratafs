@@ -67,15 +67,15 @@ impl PartialEq for ConcatenatedBytes<'_> {
 
 impl Eq for ConcatenatedBytes<'_> {}
 
-impl Equivalent<[u8]> for ConcatenatedBytes<'_> {
-    fn equivalent(&self, bytes: &[u8]) -> bool {
-        *self == ConcatenatedBytes::from(bytes)
+impl Equivalent<ConcatenatedBytes<'_>> for [u8] {
+    fn equivalent(&self, concatenated: &ConcatenatedBytes<'_>) -> bool {
+        ConcatenatedBytes::from(self) == *concatenated
     }
 }
 
-impl Comparable<[u8]> for ConcatenatedBytes<'_> {
-    fn compare(&self, bytes: &[u8]) -> Ordering {
-        self.cmp(&ConcatenatedBytes::from(bytes))
+impl Comparable<ConcatenatedBytes<'_>> for [u8] {
+    fn compare(&self, concatenated: &ConcatenatedBytes<'_>) -> Ordering {
+        ConcatenatedBytes::from(self).cmp(concatenated)
     }
 }
 
