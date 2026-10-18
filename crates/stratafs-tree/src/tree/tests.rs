@@ -3,6 +3,7 @@ use redb::backends::InMemoryBackend;
 use stratafs_redb::{Inline, RedbStore};
 
 use super::*;
+use crate::node::Node;
 
 type Optimal<R, const NODE_CAPACITY: usize> = fn(u8) -> TreeConfig<R, NODE_CAPACITY>;
 
@@ -143,7 +144,7 @@ fn create_writes_a_header_and_an_empty_root() {
                 .await?
                 .unwrap();
             let root = transaction
-                .get(TreeKey::Node(NodeId(7)).into())
+                .get(TreeKey::Node(NodeId(U128::new(7))).into())
                 .await?
                 .unwrap();
             Ok::<_, stratafs_redb::RedbFailure>((header, root))
@@ -151,6 +152,11 @@ fn create_writes_a_header_and_an_empty_root() {
     }))
     .unwrap();
     let header = VolumeHeader::view(&header).unwrap();
-    assert_eq!((header.root.get(), header.epoch.get()), (7, 0));
-    assert_eq!(&root[..], [0, 0]);
+    assert_eq!((header.root, header.epoch.get()), (NodeId(U128::new(7)), 0));
+    let (root_header, root) = Node::<Bytes, u16>::read(root).unwrap();
+    assert_eq!(
+        (root_header.kind, root_header.epoch.get()),
+        (NodeKind::Leaf, 0)
+    );
+    assert!(matches!(root, Node::Leaf(list) if list.len() == 0));
 }
