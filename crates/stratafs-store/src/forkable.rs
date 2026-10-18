@@ -12,9 +12,10 @@ pub struct UnknownVolume;
 
 pub trait ForkableKeyValueStore: Send + Sync + 'static {
     type Failure: std::error::Error + Send + Sync + 'static;
+    type CreateError: std::error::Error + Send + Sync + 'static;
     type Volume: for<'txn> KeyValueStore<Failure = Self::Failure, Transaction<'txn>: ForkingTransaction>;
 
-    fn create(&self) -> impl Future<Output = Result<VolumeId, Self::Failure>> + Send;
+    fn create(&self) -> impl Future<Output = Result<VolumeId, Self::CreateError>> + Send;
 
     fn open(
         &self,
