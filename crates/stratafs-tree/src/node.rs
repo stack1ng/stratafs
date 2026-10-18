@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use zerocopy::little_endian::{U16, U64};
 use zerocopy::{
     FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, TryFromBytes, TryReadError, Unaligned,
@@ -65,17 +65,28 @@ pub(crate) enum Node<B, R> {
 
 impl<R: AddressableRange> Node<Bytes, R> {
     pub(crate) fn read(stored: Bytes) -> Result<(NodeHeader, Self), CorruptValue> {
-        let (header, _) =
+        let (header, rest) =
             NodeHeader::try_read_from_prefix(&stored).map_err(|error| match error {
                 TryReadError::Size(_) => CorruptValue::WrongLength,
                 TryReadError::Validity(_) => CorruptValue::UnknownNodeKind,
             })?;
-        let entries = stored.slice(size_of::<NodeHeader>()..);
+        let entries = stored.slice_ref(rest);
         let node = match header.kind {
             NodeKind::Leaf => Self::Leaf(SlottedList::new(entries)?),
             NodeKind::Internal => Self::Internal(SlottedList::new(entries)?),
         };
         Ok((header, node))
+    }
+
+    pub(crate) fn write<T: ?Sized>(
+        header: NodeHeader,
+        entries: SlottedList<BytesMut, T, R>,
+    ) -> Bytes {
+        let entries = entries.into_inner();
+        let mut stored = BytesMut::with_capacity(size_of::<NodeHeader>() + entries.len());
+        stored.extend_from_slice(header.as_bytes());
+        stored.extend_from_slice(&entries);
+        stored.freeze()
     }
 }
 

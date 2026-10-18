@@ -8,13 +8,12 @@ use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume, VolumeId};
 use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
 };
-use zerocopy::IntoBytes;
 use zerocopy::little_endian::{U64, U128};
 
 use crate::error::TreeFailure;
 use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
 use crate::key::TreeKey;
-use crate::node::{NodeHeader, NodeKind};
+use crate::node::{Node, NodeHeader, NodeKind};
 use crate::serialized::{CorruptValue, serialized_value};
 use crate::slotted::{AddressableRange, SlottedList};
 use crate::volume::TreeVolume;
@@ -161,22 +160,18 @@ where
                     transaction
                         .set(
                             TreeKey::Node(root).into(),
-                            [
+                            Node::write(
                                 NodeHeader {
                                     kind: NodeKind::Leaf,
                                     epoch: U64::new(0),
-                                }
-                                .as_bytes(),
-                                &SlottedList::<
+                                },
+                                SlottedList::<
                                     BytesMut,
                                     // we aren't storing any values yet, so we intentionally make it so we cant store any with the infallible type.
                                     Infallible,
                                     R,
-                                >::empty()
-                                .into_inner(),
-                            ]
-                            .concat()
-                            .into(),
+                                >::empty(),
+                            ),
                         )
                         .await
                 })

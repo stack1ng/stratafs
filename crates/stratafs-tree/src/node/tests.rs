@@ -95,6 +95,28 @@ fn a_key_longer_than_its_entry_is_reported() {
 }
 
 #[test]
+fn a_written_node_reads_back() {
+    let mut list = SlottedList::<BytesMut, LeafEntry, u16>::empty();
+    list.insert(0, &LeafEntry::new(b"key", b"value"));
+    let stored = Node::<Bytes, u16>::write(
+        NodeHeader {
+            kind: NodeKind::Leaf,
+            epoch: U64::new(5),
+        },
+        list,
+    );
+    let (header, node) = Node::<Bytes, u16>::read(stored).unwrap();
+    assert_eq!((header.kind, header.epoch.get()), (NodeKind::Leaf, 5));
+    let Node::Leaf(list) = node else {
+        panic!("expected a leaf");
+    };
+    assert_eq!(
+        list.get(0).unwrap().unwrap().key_and_value().unwrap(),
+        (&b"key"[..], &b"value"[..])
+    );
+}
+
+#[test]
 fn an_unknown_kind_is_reported() {
     let entries = SlottedList::<BytesMut, LeafEntry, u16>::empty().into_inner();
     let mut stored = stored_node(NodeKind::Leaf, 0, &entries).to_vec();
