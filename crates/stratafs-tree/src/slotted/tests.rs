@@ -1,3 +1,5 @@
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
 use bytes::Bytes;
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -44,12 +46,22 @@ fn editable<R: AddressableRange>(bytes: &[u8]) -> SlottedList<BytesMut, [u8], R>
     SlottedList::new(BytesMut::from(bytes)).unwrap()
 }
 
+fn edit_panics_without_changing<R: AddressableRange>(
+    bytes: &[u8],
+    edit: impl FnOnce(&mut SlottedList<BytesMut, [u8], R>),
+) {
+    let mut list = editable::<R>(bytes);
+    let panic = catch_unwind(AssertUnwindSafe(|| edit(&mut list))).unwrap_err();
+    assert_eq!(&list.into_inner()[..], bytes);
+    resume_unwind(panic);
+}
+
 #[test]
 fn an_empty_list_is_only_its_count() {
     let list = SlottedList::<BytesMut, [u8], u16>::empty();
     assert_eq!(list.len(), 0);
     assert!(list.get(0).is_none());
-    assert_eq!(&list.into_bytes()[..], [0, 0]);
+    assert_eq!(&list.into_inner()[..], [0, 0]);
 }
 
 #[test]
@@ -57,17 +69,21 @@ fn entries_are_stored_before_their_starts_and_count() {
     let mut list = list_of::<u16>(&[b"ab", b"cde"]);
     list.insert(1, b"x");
     assert_eq!(entries(&list), [&b"ab"[..], b"x", b"cde"]);
-    assert_eq!(&list.into_bytes()[..], stored::<u16>(b"abxcde", &[0, 2, 3]));
+    assert_eq!(&list.into_inner()[..], stored::<u16>(b"abxcde", &[0, 2, 3]));
 }
 
 #[test]
 fn addresses_take_the_width_of_their_range() {
     assert_eq!(
-        &list_of::<u8>(&[b"ab", b"c"]).into_bytes()[..],
+        &list_of::<u8>(&[b"ab", b"c"]).into_inner()[..],
         b"abc\x00\x02\x02"
     );
     assert_eq!(
-        &list_of::<u32>(&[b"ab", b"c"]).into_bytes()[..],
+        &list_of::<u16>(&[b"ab", b"c"]).into_inner()[..],
+        b"abc\x00\x00\x02\x00\x02\x00"
+    );
+    assert_eq!(
+        &list_of::<u32>(&[b"ab", b"c"]).into_inner()[..],
         b"abc\x00\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00"
     );
 }
@@ -92,7 +108,7 @@ fn removes_close_the_gap() {
     list.remove(0);
     assert_eq!(entries(&list), [&b"f"[..]]);
     list.remove(0);
-    assert_eq!(&list.into_bytes()[..], [0, 0]);
+    assert_eq!(&list.into_inner()[..], [0, 0]);
 }
 
 #[test]
@@ -106,12 +122,12 @@ fn replaces_resize_only_their_entry() {
     assert_eq!(entries(&list), [&b"ab"[..], b"", b"f"]);
     list.replace(2, b"end");
     assert_eq!(entries(&list), [&b"ab"[..], b"", b"end"]);
-    assert_eq!(&list.into_bytes()[..], stored::<u16>(b"abend", &[0, 2, 2]));
+    assert_eq!(&list.into_inner()[..], stored::<u16>(b"abend", &[0, 2, 2]));
 }
 
 #[test]
 fn stored_bytes_are_read_in_place() {
-    let bytes = list_of::<u16>(&[b"ab", b"cde"]).into_bytes().freeze();
+    let bytes = list_of::<u16>(&[b"ab", b"cde"]).into_inner().freeze();
     let list = SlottedList::<Bytes, [u8], u16>::new(bytes.clone()).unwrap();
     assert_eq!(entries(&list), [&b"ab"[..], b"cde"]);
     assert_eq!(list.get(0).unwrap().unwrap().as_ptr(), bytes.as_ptr());
@@ -178,19 +194,49 @@ fn starts_that_do_not_describe_the_data_are_rejected() {
 #[test]
 #[should_panic(expected = "insert index 2 is past the end of a list of 1")]
 fn inserting_past_the_end_panics() {
-    list_of::<u16>(&[b"a"]).insert(2, b"b");
+    edit_panics_without_changing::<u16>(&stored::<u16>(b"a", &[0]), |list| list.insert(2, b"b"));
 }
 
 #[test]
 #[should_panic(expected = "remove index 1 is past the end of a list of 1")]
 fn removing_past_the_end_panics() {
-    list_of::<u16>(&[b"a"]).remove(1);
+    edit_panics_without_changing::<u16>(&stored::<u16>(b"a", &[0]), |list| list.remove(1));
 }
 
 #[test]
 #[should_panic(expected = "replace index 1 is past the end of a list of 1")]
 fn replacing_past_the_end_panics() {
-    list_of::<u16>(&[b"a"]).replace(1, b"b");
+    edit_panics_without_changing::<u16>(&stored::<u16>(b"a", &[0]), |list| list.replace(1, b"b"));
+}
+
+fn the_largest_stored_address_is_the_max<R: AddressableRange>() {
+    let largest = R::Stored::read_from_bytes(&[u8::MAX; 4][..size_of::<R::Stored>()]).unwrap();
+    assert_eq!(R::decode(&largest), R::MAX);
+    assert_eq!(
+        R::encode(R::MAX).map(|stored| R::decode(&stored)),
+        Some(R::MAX)
+    );
+    assert!(R::MAX.checked_add(1).and_then(R::encode).is_none());
+}
+
+#[test]
+fn addresses_span_exactly_their_stored_width() {
+    the_largest_stored_address_is_the_max::<u8>();
+    the_largest_stored_address_is_the_max::<u16>();
+    the_largest_stored_address_is_the_max::<u32>();
+}
+
+#[test]
+fn each_width_is_optimal_just_past_the_narrower_max() {
+    assert_eq!(<u8 as AddressableRange>::SMALLEST_OPTIMAL_CAPACITY, 0);
+    assert_eq!(
+        <u16 as AddressableRange>::SMALLEST_OPTIMAL_CAPACITY,
+        <u8 as AddressableRange>::MAX + 1
+    );
+    assert_eq!(
+        <u32 as AddressableRange>::SMALLEST_OPTIMAL_CAPACITY,
+        <u16 as AddressableRange>::MAX + 1
+    );
 }
 
 fn lists_at_the_limits_are_accepted<R: AddressableRange>() {
@@ -213,15 +259,19 @@ fn entry_data_beyond_the_range_is_rejected<R: AddressableRange>() {
 fn entry_data_can_fill_the_range<R: AddressableRange>() {
     let mut list = list_of::<R>(&[&vec![0; R::MAX][..]]);
     list.replace(0, &vec![1; R::MAX]);
-    assert!(corruption::<R>(&list.into_bytes()).is_none());
+    assert!(corruption::<R>(&list.into_inner()).is_none());
 }
 
 fn inserted_entry_data_cannot_outgrow_the_range<R: AddressableRange>() {
-    editable::<R>(&stored::<R>(&vec![0; R::MAX], &[0])).insert(1, b"x");
+    edit_panics_without_changing::<R>(&stored::<R>(&vec![0; R::MAX], &[0]), |list| {
+        list.insert(1, b"x")
+    });
 }
 
 fn replaced_entry_data_cannot_outgrow_the_range<R: AddressableRange>() {
-    editable::<R>(&stored::<R>(&vec![0; R::MAX], &[0])).replace(0, &vec![0; R::MAX + 1]);
+    edit_panics_without_changing::<R>(&stored::<R>(&vec![0; R::MAX], &[0]), |list| {
+        list.replace(0, &vec![0; R::MAX + 1])
+    });
 }
 
 fn entry_count_can_fill_the_range<R: AddressableRange>() {
@@ -231,7 +281,9 @@ fn entry_count_can_fill_the_range<R: AddressableRange>() {
 }
 
 fn entry_count_cannot_outgrow_the_range<R: AddressableRange>() {
-    editable::<R>(&stored::<R>(b"", &vec![0; R::MAX])).insert(0, b"");
+    edit_panics_without_changing::<R>(&stored::<R>(b"", &vec![0; R::MAX]), |list| {
+        list.insert(0, b"")
+    });
 }
 
 macro_rules! limit_tests {
@@ -326,7 +378,7 @@ fn edits_match_a_vector_of_entries<R: AddressableRange>(
             }
             Edit::Insert(..) | Edit::Remove(_) | Edit::Replace(..) => {}
         }
-        list = SlottedList::new(list.into_bytes()).unwrap();
+        list = SlottedList::new(list.into_inner()).unwrap();
         prop_assert_eq!(&entries(&list), &model);
         let data_length = model.iter().map(Vec::len).sum::<usize>();
         let expected_length = data_length + (model.len() + 1) * size_of::<R::Stored>();

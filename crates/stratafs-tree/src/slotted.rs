@@ -102,10 +102,6 @@ where
         Some(T::ref_from_bytes(&self.bytes.as_ref()[entry]).map_err(|_| CorruptValue::WrongLength))
     }
 
-    pub(crate) fn into_bytes(self) -> B {
-        self.bytes
-    }
-
     fn parts(&self) -> (&[u8], &[R::Stored]) {
         split::<R>(self.bytes.as_ref())
             .expect("new checked the list's lengths, and edits keep them consistent")
@@ -119,11 +115,13 @@ where
     }
 }
 
-impl<T, R> SlottedList<BytesMut, T, R>
-where
-    T: ?Sized + FromBytes + IntoBytes + KnownLayout + Immutable + Unaligned,
-    R: AddressableRange,
-{
+impl<B, T: ?Sized, R> SlottedList<B, T, R> {
+    pub(crate) fn into_inner(self) -> B {
+        self.bytes
+    }
+}
+
+impl<T: ?Sized, R: AddressableRange> SlottedList<BytesMut, T, R> {
     pub(crate) fn empty() -> Self {
         Self {
             bytes: BytesMut::from(address::<R>(0).as_bytes()),
@@ -131,7 +129,13 @@ where
             address: PhantomData,
         }
     }
+}
 
+impl<T, R> SlottedList<BytesMut, T, R>
+where
+    T: ?Sized + FromBytes + IntoBytes + KnownLayout + Immutable + Unaligned,
+    R: AddressableRange,
+{
     pub(crate) fn insert(&mut self, index: usize, entry: &T) {
         let entry = entry.as_bytes();
         let (data_length, count) = self.lengths();
