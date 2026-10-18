@@ -9,9 +9,14 @@ use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, SetRejection,
     TransactError, TransactionHandle,
 };
+use zerocopy::IntoBytes;
 
 use crate::error::TreeFailure;
-use crate::slotted::AddressableRange;
+use crate::header::{NodeId, VolumeEpoch};
+use crate::key::TreeKey;
+use crate::node::{InternalEntry, LeafEntry, Node, NodeKind};
+use crate::serialized::CorruptValue;
+use crate::slotted::{AddressableRange, SlottedList};
 use crate::tree::TreeShared;
 
 pub struct TreeVolume<S, A, R, const NODE_CAPACITY: usize> {
@@ -96,6 +101,95 @@ where
         observation: Self::Observation,
     ) -> Result<(), StoreError<NotCommitted, Self::Failure>> {
         todo!()
+    }
+}
+
+struct DescentStep<R, T: ?Sized, P> {
+    entries: SlottedList<Bytes, T, R>,
+    epoch: VolumeEpoch,
+    position: P,
+}
+
+struct DescentPath<R> {
+    steps: Vec<DescentStep<R, InternalEntry, usize>>,
+    destination: DescentStep<
+        R,
+        LeafEntry,
+        // leaf entries might not have a match, so this expects the binary search result
+        Result<usize, usize>,
+    >,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DescentError<F> {
+    #[error(transparent)]
+    Get(#[from] F),
+    #[error(transparent)]
+    Corrupt(CorruptValue),
+}
+
+impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+where
+    T: ReadKeyValueTransaction,
+    R: AddressableRange,
+{
+    async fn descend(
+        &self,
+        root: NodeId,
+        key: &[u8],
+    ) -> Result<DescentPath<R>, DescentError<T::Failure>> {
+        let mut steps: Vec<DescentStep<R, InternalEntry, usize>> = Vec::new();
+        let mut current = root;
+        loop {
+            let node_bytes = self
+                .inner
+                .get(TreeKey::Node(current).into())
+                .await?
+                .expect("expected a node to be present");
+            let (epoch, node) =
+                Node::<Bytes, R>::read(node_bytes).map_err(DescentError::Corrupt)?;
+
+            match node {
+                Node::Leaf(entries) => {
+                    let position = entries
+                        .binary_search_by(|leaf| {
+                            let (leaf_key, _) = leaf.key_and_value()?;
+                            Ok(leaf_key.cmp(key))
+                        })
+                        .map_err(DescentError::Corrupt)?;
+                    return Ok(DescentPath {
+                        steps,
+                        destination: DescentStep {
+                            entries,
+                            epoch,
+                            position,
+                        },
+                    });
+                }
+                Node::Internal(entries) => {
+                    let applicable_separator_index = match entries
+                        .binary_search_by(|separator| Ok(separator.key.cmp(key)))
+                        .map_err(DescentError::Corrupt)?
+                    {
+                        Ok(index) => index,
+                        // if there is not an exact match, we are in the applicable range of the separator that is to the left of this index.
+                        Err(index) => index - 1,
+                    };
+
+                    current = entries
+                        .get(applicable_separator_index)
+                        .expect("the index is in the range")
+                        .map_err(DescentError::Corrupt)?
+                        .child;
+
+                    steps.push(DescentStep {
+                        entries,
+                        epoch,
+                        position: applicable_separator_index,
+                    });
+                }
+            }
+        }
     }
 }
 
