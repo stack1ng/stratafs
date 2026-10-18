@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use zerocopy::little_endian::U128;
+use zerocopy::little_endian::{U64, U128};
 
 use super::*;
 
@@ -7,7 +7,7 @@ fn stored_node(kind: NodeKind, epoch: u64, entries: &[u8]) -> Bytes {
     [
         NodeHeader {
             kind,
-            epoch: U64::new(epoch),
+            epoch: VolumeEpoch(U64::new(epoch)),
         }
         .as_bytes(),
         entries,
@@ -23,9 +23,8 @@ fn internal_entry(child: u128, key: &[u8]) -> Vec<u8> {
 #[test]
 fn an_empty_leaf_reads_back() {
     let entries = SlottedList::<BytesMut, LeafEntry, u16>::empty().into_inner();
-    let (header, node) =
-        Node::<Bytes, u16>::read(stored_node(NodeKind::Leaf, 3, &entries)).unwrap();
-    assert_eq!((header.kind, header.epoch.get()), (NodeKind::Leaf, 3));
+    let (epoch, node) = Node::<Bytes, u16>::read(stored_node(NodeKind::Leaf, 3, &entries)).unwrap();
+    assert_eq!(epoch, VolumeEpoch(U64::new(3)));
     assert!(matches!(node, Node::Leaf(list) if list.len() == 0));
 }
 
@@ -38,9 +37,8 @@ fn internal_entries_read_back_with_their_children() {
     {
         list.insert(index, InternalEntry::ref_from_bytes(entry).unwrap());
     }
-    let (header, node) =
+    let (_, node) =
         Node::<Bytes, u16>::read(stored_node(NodeKind::Internal, 0, &list.into_inner())).unwrap();
-    assert_eq!(header.kind, NodeKind::Internal);
     let Node::Internal(list) = node else {
         panic!("expected an internal node");
     };
@@ -101,12 +99,12 @@ fn a_written_node_reads_back() {
     let stored = Node::<Bytes, u16>::write(
         NodeHeader {
             kind: NodeKind::Leaf,
-            epoch: U64::new(5),
+            epoch: VolumeEpoch(U64::new(5)),
         },
         list,
     );
-    let (header, node) = Node::<Bytes, u16>::read(stored).unwrap();
-    assert_eq!((header.kind, header.epoch.get()), (NodeKind::Leaf, 5));
+    let (epoch, node) = Node::<Bytes, u16>::read(stored).unwrap();
+    assert_eq!(epoch, VolumeEpoch(U64::new(5)));
     let Node::Leaf(list) = node else {
         panic!("expected a leaf");
     };

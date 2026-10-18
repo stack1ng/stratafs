@@ -29,10 +29,23 @@ impl SerializedShape for NodeId {
     );
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(transparent)]
+pub(crate) struct VolumeEpoch(pub(crate) U64);
+
+impl SerializedShape for VolumeEpoch {
+    const FINGERPRINT: u32 = xxh32(
+        &<U64 as SerializedShape>::FINGERPRINT.to_le_bytes(),
+        xxh32(b"VolumeEpoch", 0),
+    );
+}
+
 serialized_value! {
     #[derive(Debug)]
     pub(crate) struct VolumeHeader {
         pub(crate) root: NodeId,
-        pub(crate) epoch: U64,
+        pub(crate) epoch: VolumeEpoch,
     }
 }

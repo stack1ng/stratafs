@@ -1,10 +1,10 @@
 use bytes::{Bytes, BytesMut};
-use zerocopy::little_endian::{U16, U64};
+use zerocopy::little_endian::U16;
 use zerocopy::{
     FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, TryFromBytes, TryReadError, Unaligned,
 };
 
-use crate::header::NodeId;
+use crate::header::{NodeId, VolumeEpoch};
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
 
@@ -21,7 +21,7 @@ pub(crate) enum NodeKind {
 #[repr(C)]
 pub(crate) struct NodeHeader {
     pub(crate) kind: NodeKind,
-    pub(crate) epoch: U64,
+    pub(crate) epoch: VolumeEpoch,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -64,7 +64,7 @@ pub(crate) enum Node<B, R> {
 }
 
 impl<R: AddressableRange> Node<Bytes, R> {
-    pub(crate) fn read(stored: Bytes) -> Result<(NodeHeader, Self), CorruptValue> {
+    pub(crate) fn read(stored: Bytes) -> Result<(VolumeEpoch, Self), CorruptValue> {
         let (header, rest) =
             NodeHeader::try_read_from_prefix(&stored).map_err(|error| match error {
                 TryReadError::Size(_) => CorruptValue::WrongLength,
@@ -75,7 +75,7 @@ impl<R: AddressableRange> Node<Bytes, R> {
             NodeKind::Leaf => Self::Leaf(SlottedList::new(entries)?),
             NodeKind::Internal => Self::Internal(SlottedList::new(entries)?),
         };
-        Ok((header, node))
+        Ok((header.epoch, node))
     }
 
     pub(crate) fn write<T: ?Sized>(

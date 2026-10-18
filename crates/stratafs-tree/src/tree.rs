@@ -11,7 +11,7 @@ use stratafs_store::kv::{
 use zerocopy::little_endian::{U64, U128};
 
 use crate::error::TreeFailure;
-use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
+use crate::header::{NodeId, TreeVolumeId, VolumeEpoch, VolumeHeader};
 use crate::key::TreeKey;
 use crate::node::{Node, NodeHeader, NodeKind};
 use crate::serialized::{CorruptValue, serialized_value};
@@ -153,7 +153,7 @@ where
                             TreeKey::VolumeHeader(id).into(),
                             Bytes::from(&VolumeHeader {
                                 root,
-                                epoch: U64::new(0),
+                                epoch: VolumeEpoch(U64::new(0)),
                             }),
                         )
                         .await?;
@@ -163,7 +163,7 @@ where
                             Node::write(
                                 NodeHeader {
                                     kind: NodeKind::Leaf,
-                                    epoch: U64::new(0),
+                                    epoch: VolumeEpoch(U64::new(0)),
                                 },
                                 SlottedList::<
                                     BytesMut,
