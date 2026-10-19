@@ -1,5 +1,4 @@
 use bytes::{Bytes, BytesMut};
-use zerocopy::little_endian::U16;
 use zerocopy::{
     FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, TryFromBytes, TryReadError, Unaligned,
 };
@@ -26,27 +25,26 @@ pub(crate) struct NodeHeader {
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
-pub(crate) struct LeafEntry {
-    key_length: U16,
+pub(crate) struct LeafEntry<R: AddressableRange> {
+    key_length: R::Stored,
     key_then_value: [u8],
 }
 
-impl LeafEntry {
-    pub(crate) fn new(key: &[u8], value: &[u8]) -> Box<Self> {
-        let key_length =
-            u16::try_from(key.len()).expect("a leaf entry's key is at most 65535 bytes");
+impl<R: AddressableRange> LeafEntry<R> {
+    pub(crate) fn new(key: &[u8], value: &[u8]) -> Option<Box<Self>> {
+        let key_length = R::encode(key.len())?;
         let mut entry = Self::new_box_zeroed_with_elems(key.len() + value.len())
             .expect("a leaf entry fits in memory");
-        entry.key_length = U16::new(key_length);
+        entry.key_length = key_length;
         let (stored_key, stored_value) = entry.key_then_value.split_at_mut(key.len());
         stored_key.copy_from_slice(key);
         stored_value.copy_from_slice(value);
-        entry
+        Some(entry)
     }
 
     pub(crate) fn key_and_value(&self) -> Result<(&[u8], &[u8]), CorruptValue> {
         self.key_then_value
-            .split_at_checked(usize::from(self.key_length.get()))
+            .split_at_checked(R::decode(&self.key_length))
             .ok_or(CorruptValue::KeyLongerThanEntry)
     }
 }
@@ -58,8 +56,8 @@ pub(crate) struct InternalEntry {
     pub(crate) key: [u8],
 }
 
-pub(crate) enum Node<B, R> {
-    Leaf(SlottedList<B, LeafEntry, R>),
+pub(crate) enum Node<B, R: AddressableRange> {
+    Leaf(SlottedList<B, LeafEntry<R>, R>),
     Internal(SlottedList<B, InternalEntry, R>),
 }
 

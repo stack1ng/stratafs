@@ -1,6 +1,6 @@
 use bytes::BytesMut;
 use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueTransaction, SetRejection};
+use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
 use zerocopy::little_endian::U128;
 
 use crate::descent::DescentStep;
@@ -13,7 +13,8 @@ use crate::volume::{TreeTransaction, with_tree_failure};
 
 impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
 where
-    T: KeyValueTransaction,
+    T: KeyValueTransaction<Rejection = S::Rejection>,
+    S: KeyValueStore,
     A: Fn() -> u128 + Send + Sync + 'static,
     R: AddressableRange,
 {
@@ -21,6 +22,7 @@ where
     // against what is currently at the targetted node id.
     // It either replaces the state in place of the leaf,
     // or it iteratively handles copy on write up to the root when necessary.
+    // It also handles splitting/merging during the same pass.
     pub(crate) async fn write_over<E: ?Sized>(
         &mut self,
         steps: Vec<DescentStep<R, InternalEntry, usize>>,
@@ -28,7 +30,8 @@ where
         node_epoch: VolumeEpoch,
         kind: NodeKind,
         desired_entries: SlottedList<BytesMut, E, R>,
-    ) -> Result<(), StoreError<SetRejection<T::Rejection>, TreeFailure<T::Failure>>> {
+    ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
+    {
         self.write_upward(steps, id, node_epoch, kind, desired_entries.into_untyped())
             .await
     }
@@ -41,7 +44,8 @@ where
         mut writing_over_epoch: VolumeEpoch,
         mut writing_over_kind: NodeKind,
         mut entries_to_write: SlottedList<BytesMut, [u8], R>,
-    ) -> Result<(), StoreError<SetRejection<T::Rejection>, TreeFailure<T::Failure>>> {
+    ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
+    {
         let volume_epoch = self.get_volume_header().await?.epoch;
 
         loop {
@@ -64,7 +68,7 @@ where
                 .await
                 .map_err(with_tree_failure)?;
             if target == writing_over_id {
-                // this was editted in place, no need to continue recursing
+                // this was editted in place, no need to continue ascending
                 return Ok(());
             }
 

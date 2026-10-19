@@ -9,7 +9,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::serialized::CorruptValue;
 
 pub trait AddressableRange: Send + Sync + 'static {
-    type Stored: FromBytes + IntoBytes + KnownLayout + Immutable + Unaligned;
+    type Stored: FromBytes + IntoBytes + KnownLayout + Immutable + Unaligned + Send + Sync;
     const MAX: usize;
     const SMALLEST_OPTIMAL_CAPACITY: usize;
 

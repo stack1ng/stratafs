@@ -25,6 +25,10 @@ pub struct TreeConfig<R, const NODE_CAPACITY: usize> {
 }
 
 impl<R: AddressableRange, const NODE_CAPACITY: usize> TreeConfig<R, NODE_CAPACITY> {
+    pub(crate) const LARGEST_ENTRY_SIZE: usize =
+        (NODE_CAPACITY - size_of::<NodeHeader>() - size_of::<R::Stored>()) / 3
+            - size_of::<R::Stored>();
+
     pub fn new(merge_below_percent: u8) -> Self {
         const {
             assert!(
@@ -34,6 +38,10 @@ impl<R: AddressableRange, const NODE_CAPACITY: usize> TreeConfig<R, NODE_CAPACIT
             assert!(
                 NODE_CAPACITY >= R::SMALLEST_OPTIMAL_CAPACITY,
                 "the node capacity is below the smallest optimal capacity for this addressable range"
+            );
+            assert!(
+                Self::LARGEST_ENTRY_SIZE >= size_of::<NodeId>(),
+                "the node capacity is too small to hold a separator entry"
             );
         };
         Self {
@@ -135,7 +143,7 @@ where
     A: Fn() -> u128 + Send + Sync + 'static,
     R: AddressableRange,
 {
-    type Failure = TreeFailure<S::Failure>;
+    type Failure = TreeFailure<S::Failure, S::Rejection>;
     type CreateError =
         TransactError<S::Rejection, S::Failure, StoreError<SetRejection<S::Rejection>, S::Failure>>;
     type Volume = TreeVolume<S, A, R, NODE_CAPACITY>;

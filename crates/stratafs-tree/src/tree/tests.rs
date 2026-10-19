@@ -160,3 +160,21 @@ fn create_writes_a_header_and_an_empty_root() {
     assert_eq!(root_epoch, VolumeEpoch(U64::new(0)));
     assert!(matches!(root, Node::Leaf(list) if list.len() == 0));
 }
+
+fn split_halves_fit<R: AddressableRange, const NODE_CAPACITY: usize>() {
+    let per_node = size_of::<NodeHeader>() + size_of::<R::Stored>();
+    let largest = TreeConfig::<R, NODE_CAPACITY>::LARGEST_ENTRY_SIZE + size_of::<R::Stored>();
+    let overfull = NODE_CAPACITY - per_node + largest;
+    assert!(overfull.div_ceil(2) + largest <= NODE_CAPACITY - per_node);
+}
+
+#[test]
+fn the_largest_entry_leaves_room_for_both_halves_of_a_split() {
+    assert_eq!(TreeConfig::<u16, 4067>::LARGEST_ENTRY_SIZE, 1350);
+    split_halves_fit::<u8, 255>();
+    split_halves_fit::<u16, 256>();
+    split_halves_fit::<u16, 4067>();
+    split_halves_fit::<u16, 16355>();
+    split_halves_fit::<u32, 65536>();
+    split_halves_fit::<u32, 1048576>();
+}

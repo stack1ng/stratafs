@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use equivalent::Comparable;
-use stratafs_store::kv::ReadKeyValueTransaction;
+use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
 use crate::error::TreeFailure;
 use crate::header::{NodeId, VolumeEpoch};
@@ -19,11 +19,11 @@ pub(crate) struct DescentStep<R, T: ?Sized, P> {
     pub(crate) position: P,
 }
 
-pub(crate) struct DescentPath<R> {
+pub(crate) struct DescentPath<R: AddressableRange> {
     pub(crate) steps: Vec<DescentStep<R, InternalEntry, usize>>,
     pub(crate) destination: DescentStep<
         R,
-        LeafEntry,
+        LeafEntry<R>,
         // leaf entries might not have a match, so this expects the binary search result
         Result<usize, usize>,
     >,
@@ -32,6 +32,7 @@ pub(crate) struct DescentPath<R> {
 impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
 where
     T: ReadKeyValueTransaction,
+    S: KeyValueStore,
     R: AddressableRange,
 {
     // TODO: these methods assume KV operations are efficiently cached by the underlying kv store,
@@ -39,7 +40,7 @@ where
     pub(crate) async fn descend<Q: ?Sized>(
         &self,
         target: &Q,
-    ) -> Result<DescentPath<R>, TreeFailure<T::Failure>>
+    ) -> Result<DescentPath<R>, TreeFailure<T::Failure, S::Rejection>>
     where
         [u8]: Comparable<Q>,
     {
@@ -54,7 +55,10 @@ where
         start: NodeId,
         steps: &mut Vec<DescentStep<R, InternalEntry, usize>>,
         target: &Q,
-    ) -> Result<DescentStep<R, LeafEntry, Result<usize, usize>>, TreeFailure<T::Failure>>
+    ) -> Result<
+        DescentStep<R, LeafEntry<R>, Result<usize, usize>>,
+        TreeFailure<T::Failure, S::Rejection>,
+    >
     where
         [u8]: Comparable<Q>,
     {
@@ -122,7 +126,10 @@ where
     pub(crate) async fn next_entry<'cursor>(
         &self,
         cursor: &'cursor mut DescentPath<R>,
-    ) -> Result<Option<(&'cursor LeafEntry, &'cursor Bytes)>, TreeFailure<T::Failure>> {
+    ) -> Result<
+        Option<(&'cursor LeafEntry<R>, &'cursor Bytes)>,
+        TreeFailure<T::Failure, S::Rejection>,
+    > {
         let next_held_leaf_index = match cursor.destination.position {
             Ok(index) => index,
             Err(next_closest_index) => next_closest_index,

@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use zerocopy::little_endian::{U64, U128};
+use zerocopy::little_endian::{U16, U64, U128};
 
 use super::*;
 
@@ -22,7 +22,7 @@ fn internal_entry(child: u128, key: &[u8]) -> Vec<u8> {
 
 #[test]
 fn an_empty_leaf_reads_back() {
-    let entries = SlottedList::<BytesMut, LeafEntry, u16>::empty().into_inner();
+    let entries = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty().into_inner();
     let (epoch, node) = Node::<Bytes, u16>::read(stored_node(NodeKind::Leaf, 3, &entries)).unwrap();
     assert_eq!(epoch, VolumeEpoch(U64::new(3)));
     assert!(matches!(node, Node::Leaf(list) if list.len() == 0));
@@ -51,8 +51,8 @@ fn internal_entries_read_back_with_their_children() {
 
 #[test]
 fn leaf_entries_read_back_with_their_keys_and_values() {
-    let mut list = SlottedList::<BytesMut, LeafEntry, u16>::empty();
-    list.insert(0, &LeafEntry::new(b"key", b"value"));
+    let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
+    list.insert(0, &LeafEntry::<u16>::new(b"key", b"value").unwrap());
     let (_, node) =
         Node::<Bytes, u16>::read(stored_node(NodeKind::Leaf, 0, &list.into_inner())).unwrap();
     let Node::Leaf(list) = node else {
@@ -71,31 +71,37 @@ fn a_new_leaf_entry_holds_its_key_and_value() {
         (b"key", b""),
     ] {
         assert_eq!(
-            LeafEntry::new(key, value).key_and_value().unwrap(),
+            LeafEntry::<u16>::new(key, value)
+                .unwrap()
+                .key_and_value()
+                .unwrap(),
             (key, value)
         );
     }
 }
 
 #[test]
-#[should_panic(expected = "a leaf entry's key is at most 65535 bytes")]
-fn a_leaf_entry_key_cannot_outgrow_its_length() {
-    LeafEntry::new(&vec![0; usize::from(u16::MAX) + 1], b"");
+fn a_leaf_entry_key_must_fit_the_addressable_range() {
+    assert!(LeafEntry::<u8>::new(&[0; 255], b"").is_some());
+    assert!(LeafEntry::<u8>::new(&[0; 256], b"").is_none());
+    assert!(LeafEntry::<u16>::new(&vec![0; usize::from(u16::MAX) + 1], b"").is_none());
 }
 
 #[test]
 fn a_key_longer_than_its_entry_is_reported() {
     let entry = [U16::new(4).as_bytes(), b"abc"].concat();
     assert!(matches!(
-        LeafEntry::ref_from_bytes(&entry).unwrap().key_and_value(),
+        LeafEntry::<u16>::ref_from_bytes(&entry)
+            .unwrap()
+            .key_and_value(),
         Err(CorruptValue::KeyLongerThanEntry)
     ));
 }
 
 #[test]
 fn a_written_node_reads_back() {
-    let mut list = SlottedList::<BytesMut, LeafEntry, u16>::empty();
-    list.insert(0, &LeafEntry::new(b"key", b"value"));
+    let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
+    list.insert(0, &LeafEntry::<u16>::new(b"key", b"value").unwrap());
     let stored = Node::<Bytes, u16>::write(
         NodeHeader {
             kind: NodeKind::Leaf,
@@ -116,7 +122,7 @@ fn a_written_node_reads_back() {
 
 #[test]
 fn an_unknown_kind_is_reported() {
-    let entries = SlottedList::<BytesMut, LeafEntry, u16>::empty().into_inner();
+    let entries = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty().into_inner();
     let mut stored = stored_node(NodeKind::Leaf, 0, &entries).to_vec();
     stored[0] = 2;
     assert!(matches!(
