@@ -18,37 +18,25 @@ use crate::serialized::{CorruptValue, serialized_value};
 use crate::slotted::{AddressableRange, SlottedList};
 use crate::volume::TreeVolume;
 
-#[derive(Debug, Clone, Copy)]
-pub struct TreeConfig<R, const NODE_CAPACITY: usize> {
-    pub(crate) merge_below_percent: u8,
-    address: PhantomData<R>,
+pub trait TreeConfig: Send + Sync + 'static {
+    type Range: AddressableRange;
+    const NODE_CAPACITY: usize;
+    const MERGE_BELOW_PERCENT: u8;
 }
 
-impl<R: AddressableRange, const NODE_CAPACITY: usize> TreeConfig<R, NODE_CAPACITY> {
-    pub(crate) const LARGEST_ENTRY_SIZE: usize =
-        (NODE_CAPACITY - size_of::<NodeHeader>() - size_of::<R::Stored>()) / 3
-            - size_of::<R::Stored>();
+pub(crate) trait TreeConfigLimits: TreeConfig {
+    const LARGEST_ENTRY_SIZE: usize;
+    const MERGE_BELOW_SIZE: usize;
+}
 
-    pub fn new(merge_below_percent: u8) -> Self {
-        const {
-            assert!(
-                NODE_CAPACITY <= R::MAX,
-                "the node capacity exceeds the addressable range"
-            );
-            assert!(
-                NODE_CAPACITY >= R::SMALLEST_OPTIMAL_CAPACITY,
-                "the node capacity is below the smallest optimal capacity for this addressable range"
-            );
-            assert!(
-                Self::LARGEST_ENTRY_SIZE >= size_of::<NodeId>(),
-                "the node capacity is too small to hold a separator entry"
-            );
-        };
-        Self {
-            merge_below_percent,
-            address: PhantomData,
-        }
-    }
+impl<C: TreeConfig> TreeConfigLimits for C {
+    const LARGEST_ENTRY_SIZE: usize = (C::NODE_CAPACITY
+        - size_of::<NodeHeader>()
+        - size_of::<<C::Range as AddressableRange>::Stored>())
+        / 3
+        - size_of::<<C::Range as AddressableRange>::Stored>();
+    const MERGE_BELOW_SIZE: usize =
+        (C::NODE_CAPACITY as u64 * C::MERGE_BELOW_PERCENT as u64 / 100) as usize;
 }
 
 serialized_value! {
@@ -75,34 +63,51 @@ pub enum PinnedConfigError<R, F> {
     Store(StoreError<SetRejection<R>, F>),
 }
 
-pub struct Tree<S, A, R, const NODE_CAPACITY: usize>(Arc<TreeShared<S, A, R, NODE_CAPACITY>>);
+pub struct Tree<S, A, C>(Arc<TreeShared<S, A, C>>);
 
-pub(crate) struct TreeShared<S, A, R, const NODE_CAPACITY: usize> {
+pub(crate) struct TreeShared<S, A, C> {
     pub(crate) store: S,
-    pub(crate) config: TreeConfig<R, NODE_CAPACITY>,
     pub(crate) id_allocator: A,
+    config: PhantomData<C>,
 }
 
-impl<S, A, R, const NODE_CAPACITY: usize> Tree<S, A, R, NODE_CAPACITY>
+impl<S, A, C> Tree<S, A, C>
 where
     S: KeyValueStore,
     A: Fn() -> u128 + Send + Sync + 'static,
-    R: AddressableRange,
+    C: TreeConfig,
 {
     // new creates a new tree in the store. It validates that either there is no existing config,
     // or that the existing config matches the configured one.
     pub async fn new(
         store: S,
-        config: TreeConfig<R, NODE_CAPACITY>,
         id_allocator: A,
     ) -> Result<
         Self,
         TransactError<S::Rejection, S::Failure, PinnedConfigError<S::Rejection, S::Failure>>,
     > {
+        const {
+            assert!(
+                C::NODE_CAPACITY <= <C::Range as AddressableRange>::MAX,
+                "the node capacity exceeds the addressable range"
+            );
+            assert!(
+                C::NODE_CAPACITY >= <C::Range as AddressableRange>::SMALLEST_OPTIMAL_CAPACITY,
+                "the node capacity is below the smallest optimal capacity for this addressable range"
+            );
+            assert!(
+                C::LARGEST_ENTRY_SIZE >= size_of::<NodeId>(),
+                "the node capacity is too small to hold a separator entry"
+            );
+            assert!(
+                C::MERGE_BELOW_PERCENT < 50,
+                "the merge threshold must be below half the node capacity"
+            );
+        };
         let configured = PinnedConfig {
-            node_capacity: U64::new(NODE_CAPACITY as u64),
-            address_length: size_of::<R::Stored>() as u8,
-            merge_below_percent: config.merge_below_percent,
+            node_capacity: U64::new(C::NODE_CAPACITY as u64),
+            address_length: size_of::<<C::Range as AddressableRange>::Stored>() as u8,
+            merge_below_percent: C::MERGE_BELOW_PERCENT,
         };
         store
             .transact(move |mut transaction| {
@@ -131,22 +136,22 @@ where
             .await?;
         Ok(Self(Arc::new(TreeShared {
             store,
-            config,
             id_allocator,
+            config: PhantomData,
         })))
     }
 }
 
-impl<S, A, R, const NODE_CAPACITY: usize> ForkableKeyValueStore for Tree<S, A, R, NODE_CAPACITY>
+impl<S, A, C> ForkableKeyValueStore for Tree<S, A, C>
 where
     S: KeyValueStore,
     A: Fn() -> u128 + Send + Sync + 'static,
-    R: AddressableRange,
+    C: TreeConfig,
 {
     type Failure = TreeFailure<S::Failure, S::Rejection>;
     type CreateError =
         TransactError<S::Rejection, S::Failure, StoreError<SetRejection<S::Rejection>, S::Failure>>;
-    type Volume = TreeVolume<S, A, R, NODE_CAPACITY>;
+    type Volume = TreeVolume<S, A, C>;
 
     // create creates a new volume with no contents.
     async fn create(&self) -> Result<VolumeId, Self::CreateError> {
@@ -177,7 +182,7 @@ where
                                     BytesMut,
                                     // we aren't storing any values yet, so we intentionally make it so we cant store any with the infallible type.
                                     Infallible,
-                                    R,
+                                    C::Range,
                                 >::empty(),
                             ),
                         )

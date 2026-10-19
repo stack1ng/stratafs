@@ -16,29 +16,29 @@ use crate::concatenated_bytes::ConcatenatedBytes;
 use crate::error::TreeFailure;
 use crate::header::{TreeVolumeId, VolumeHeader};
 use crate::key::TreeKey;
-use crate::node::{InternalEntry, LeafEntry, NodeKind};
+use crate::node::{InternalEntry, LeafEntry};
 use crate::serialized::CorruptValue;
-use crate::slotted::{AddressableRange, SlottedList};
-use crate::tree::{TreeConfig, TreeShared};
+use crate::slotted::SlottedList;
+use crate::tree::{TreeConfig, TreeConfigLimits, TreeShared};
 
-pub struct TreeVolume<S, A, R, const NODE_CAPACITY: usize> {
-    shared: Arc<TreeShared<S, A, R, NODE_CAPACITY>>,
+pub struct TreeVolume<S, A, C> {
+    shared: Arc<TreeShared<S, A, C>>,
     id: TreeVolumeId,
 }
 
-pub struct TreeTransaction<'txn, T, S, A, R, const NODE_CAPACITY: usize> {
+pub struct TreeTransaction<'txn, T, S, A, C> {
     pub(crate) inner: TransactionHandle<'txn, T>,
-    pub(crate) shared: Arc<TreeShared<S, A, R, NODE_CAPACITY>>,
+    pub(crate) shared: Arc<TreeShared<S, A, C>>,
     pub(crate) volume: TreeVolumeId,
 }
 
 pub struct TreeObservation;
 
-impl<S, A, R, const NODE_CAPACITY: usize> TreeVolume<S, A, R, NODE_CAPACITY> {
+impl<S, A, C> TreeVolume<S, A, C> {
     fn transaction<'txn, T>(
         &self,
         inner: TransactionHandle<'txn, T>,
-    ) -> TreeTransaction<'txn, T, S, A, R, NODE_CAPACITY> {
+    ) -> TreeTransaction<'txn, T, S, A, C> {
         TreeTransaction {
             inner,
             shared: Arc::clone(&self.shared),
@@ -57,7 +57,7 @@ fn store_failure_as_tree_failure<R, F, E>(
     }
 }
 
-impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
     S: KeyValueStore,
@@ -76,7 +76,7 @@ where
     }
 }
 
-impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
     T: KeyValueTransaction<Rejection = S::Rejection>,
     S: KeyValueStore,
@@ -105,18 +105,17 @@ pub(crate) fn with_tree_failure<R, F>(
     }
 }
 
-impl<S, A, R, const NODE_CAPACITY: usize> KeyValueStore for TreeVolume<S, A, R, NODE_CAPACITY>
+impl<S, A, C> KeyValueStore for TreeVolume<S, A, C>
 where
     S: KeyValueStore,
     A: Fn() -> u128 + Send + Sync + 'static,
-    R: AddressableRange,
+    C: TreeConfig,
 {
     type Rejection = S::Rejection;
     type Failure = TreeFailure<S::Failure, S::Rejection>;
     type Observation = TreeObservation;
-    type ReadTransaction<'txn> =
-        TreeTransaction<'txn, S::ReadTransaction<'txn>, S, A, R, NODE_CAPACITY>;
-    type Transaction<'txn> = TreeTransaction<'txn, S::Transaction<'txn>, S, A, R, NODE_CAPACITY>;
+    type ReadTransaction<'txn> = TreeTransaction<'txn, S::ReadTransaction<'txn>, S, A, C>;
+    type Transaction<'txn> = TreeTransaction<'txn, S::Transaction<'txn>, S, A, C>;
 
     async fn transact<T: Send, E: Send>(
         &self,
@@ -154,13 +153,12 @@ where
     }
 }
 
-impl<T, S, A, R, const NODE_CAPACITY: usize> ReadKeyValueTransaction
-    for TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+impl<T, S, A, C> ReadKeyValueTransaction for TreeTransaction<'_, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
     S: KeyValueStore,
     A: Send + Sync,
-    R: AddressableRange,
+    C: TreeConfig,
 {
     type Failure = TreeFailure<T::Failure, S::Rejection>;
     type Observation = TreeObservation;
@@ -209,13 +207,12 @@ where
     }
 }
 
-impl<T, S, A, R, const NODE_CAPACITY: usize> KeyValueTransaction
-    for TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+impl<T, S, A, C> KeyValueTransaction for TreeTransaction<'_, T, S, A, C>
 where
     T: KeyValueTransaction<Rejection = S::Rejection>,
     S: KeyValueStore,
     A: Fn() -> u128 + Send + Sync + 'static,
-    R: AddressableRange,
+    C: TreeConfig,
 {
     type Rejection = T::Rejection;
 
@@ -224,65 +221,53 @@ where
         key: Bytes,
         value: Bytes,
     ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
-        let fits_as_node_entry = |length: Option<usize>| {
-            length
-                .is_some_and(|length| length <= TreeConfig::<R, NODE_CAPACITY>::LARGEST_ENTRY_SIZE)
-        };
-        if !fits_as_node_entry(LeafEntry::<R>::size_for_metadata(key.len() + value.len()))
-            || !fits_as_node_entry(InternalEntry::size_for_metadata(key.len()))
+        let fits_as_node_entry =
+            |length: Option<usize>| length.is_some_and(|length| length <= C::LARGEST_ENTRY_SIZE);
+        if !fits_as_node_entry(LeafEntry::<C::Range>::size_for_metadata(
+            key.len() + value.len(),
+        )) || !fits_as_node_entry(InternalEntry::size_for_metadata(key.len()))
         {
             return Err(StoreError::Rejected(SetRejection::TooLarge));
         }
-        let Some(new_entry) = LeafEntry::<R>::new(&key, &value) else {
+        let Some(new_entry) = LeafEntry::<C::Range>::new(&key, &value) else {
             return Err(StoreError::Rejected(SetRejection::TooLarge));
         };
         let target = self.descend(&key).await?;
-        let mut target_leaf = SlottedList::<BytesMut, _, R>::from(target.destination.entries);
+        let mut target_leaf =
+            SlottedList::<BytesMut, _, C::Range>::from(target.destination.entries);
         match target.destination.position {
             Ok(index) => target_leaf.replace(index, &new_entry),
             Err(insert_at) => target_leaf.insert(insert_at, &new_entry),
         }
 
-        self.write_over(
-            target.steps,
-            target.destination.id,
-            target.destination.epoch,
-            NodeKind::Leaf,
-            target_leaf,
-        )
-        .await
+        self.write_over(target.steps, target.destination.node, target_leaf)
+            .await
     }
 
     async fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {
         let target = self.descend(&key).await?;
-        let mut target_leaf = SlottedList::<BytesMut, _, R>::from(target.destination.entries);
+        let mut target_leaf =
+            SlottedList::<BytesMut, _, C::Range>::from(target.destination.entries);
         match target.destination.position {
             Ok(index) => target_leaf.remove(index),
             Err(_) => return Ok(()),
         }
 
-        self.write_over(
-            target.steps,
-            target.destination.id,
-            target.destination.epoch,
-            NodeKind::Leaf,
-            target_leaf,
-        )
-        .await
-        .map_err(|error| match error {
-            StoreError::Failed(failure) => failure,
-            StoreError::Rejected(rejection) => TreeFailure::RefusedWrite(rejection),
-        })
+        self.write_over(target.steps, target.destination.node, target_leaf)
+            .await
+            .map_err(|error| match error {
+                StoreError::Failed(failure) => failure,
+                StoreError::Rejected(rejection) => TreeFailure::RefusedWrite(rejection),
+            })
     }
 }
 
-impl<T, S, A, R, const NODE_CAPACITY: usize> ForkingTransaction
-    for TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+impl<T, S, A, C> ForkingTransaction for TreeTransaction<'_, T, S, A, C>
 where
     T: KeyValueTransaction<Rejection = S::Rejection>,
     S: KeyValueStore,
     A: Fn() -> u128 + Send + Sync + 'static,
-    R: AddressableRange,
+    C: TreeConfig,
 {
     async fn fork(&mut self) -> Result<VolumeId, Self::Failure> {
         todo!()

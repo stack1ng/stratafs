@@ -3,19 +3,19 @@ use equivalent::Comparable;
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
 use crate::error::TreeFailure;
-use crate::header::{NodeId, VolumeEpoch};
+use crate::header::NodeId;
 use crate::key::TreeKey;
-use crate::node::{InternalEntry, LeafEntry, Node};
+use crate::node::{InternalEntry, LeafEntry, Node, ObservedNode};
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
+use crate::tree::TreeConfig;
 use crate::volume::TreeTransaction;
 
 const MAX_DEPTH: usize = 64;
 
 pub(crate) struct DescentStep<R, T: ?Sized, P> {
-    pub(crate) id: NodeId,
+    pub(crate) node: ObservedNode,
     pub(crate) entries: SlottedList<Bytes, T, R>,
-    pub(crate) epoch: VolumeEpoch,
     pub(crate) position: P,
 }
 
@@ -29,18 +29,18 @@ pub(crate) struct DescentPath<R: AddressableRange> {
     >,
 }
 
-impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
     S: KeyValueStore,
-    R: AddressableRange,
+    C: TreeConfig,
 {
     // TODO: these methods assume KV operations are efficiently cached by the underlying kv store,
     // we need to make a wrapper for any generic kv store that does this.
     pub(crate) async fn descend<Q: ?Sized>(
         &self,
         target: &Q,
-    ) -> Result<DescentPath<R>, TreeFailure<T::Failure, S::Rejection>>
+    ) -> Result<DescentPath<C::Range>, TreeFailure<T::Failure, S::Rejection>>
     where
         [u8]: Comparable<Q>,
     {
@@ -53,10 +53,10 @@ where
     async fn descend_from<Q: ?Sized>(
         &self,
         start: NodeId,
-        steps: &mut Vec<DescentStep<R, InternalEntry, usize>>,
+        steps: &mut Vec<DescentStep<C::Range, InternalEntry, usize>>,
         target: &Q,
     ) -> Result<
-        DescentStep<R, LeafEntry<R>, Result<usize, usize>>,
+        DescentStep<C::Range, LeafEntry<C::Range>, Result<usize, usize>>,
         TreeFailure<T::Failure, S::Rejection>,
     >
     where
@@ -69,7 +69,8 @@ where
                 .get(TreeKey::Node(current).into())
                 .await?
                 .ok_or(TreeFailure::Corrupt(CorruptValue::MissingNode))?;
-            let (epoch, node) = Node::<Bytes, R>::read(node_bytes).map_err(TreeFailure::Corrupt)?;
+            let (epoch, node) =
+                Node::<Bytes, C::Range>::read(node_bytes).map_err(TreeFailure::Corrupt)?;
 
             match node {
                 Node::Leaf(entries) => {
@@ -80,9 +81,8 @@ where
                         })
                         .map_err(TreeFailure::Corrupt)?;
                     return Ok(DescentStep {
-                        id: current,
+                        node: ObservedNode { id: current, epoch },
                         entries,
-                        epoch,
                         position,
                     });
                 }
@@ -109,9 +109,11 @@ where
                         .child;
 
                     steps.push(DescentStep {
-                        id: this_step_node_id,
+                        node: ObservedNode {
+                            id: this_step_node_id,
+                            epoch,
+                        },
                         entries,
-                        epoch,
                         position: applicable_separator_index,
                     });
                 }
@@ -125,9 +127,9 @@ where
     // It returns the next leaf entry and its backing buffer.
     pub(crate) async fn next_entry<'cursor>(
         &self,
-        cursor: &'cursor mut DescentPath<R>,
+        cursor: &'cursor mut DescentPath<C::Range>,
     ) -> Result<
-        Option<(&'cursor LeafEntry<R>, &'cursor Bytes)>,
+        Option<(&'cursor LeafEntry<C::Range>, &'cursor Bytes)>,
         TreeFailure<T::Failure, S::Rejection>,
     > {
         let next_held_leaf_index = match cursor.destination.position {

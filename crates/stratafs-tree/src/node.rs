@@ -56,6 +56,12 @@ pub(crate) struct InternalEntry {
     pub(crate) key: [u8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservedNode {
+    pub(crate) id: NodeId,
+    pub(crate) epoch: VolumeEpoch,
+}
+
 pub(crate) enum Node<B, R: AddressableRange> {
     Leaf(SlottedList<B, LeafEntry<R>, R>),
     Internal(SlottedList<B, InternalEntry, R>),

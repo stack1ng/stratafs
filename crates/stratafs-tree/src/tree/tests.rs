@@ -5,14 +5,31 @@ use stratafs_redb::{Inline, RedbStore};
 use super::*;
 use crate::node::Node;
 
-type Optimal<R, const NODE_CAPACITY: usize> = fn(u8) -> TreeConfig<R, NODE_CAPACITY>;
+struct TestConfig<R, const NODE_CAPACITY: usize, const MERGE_BELOW_PERCENT: u8>(PhantomData<R>);
+
+impl<R: AddressableRange, const NODE_CAPACITY: usize, const MERGE_BELOW_PERCENT: u8> TreeConfig
+    for TestConfig<R, NODE_CAPACITY, MERGE_BELOW_PERCENT>
+{
+    type Range = R;
+    const NODE_CAPACITY: usize = NODE_CAPACITY;
+    const MERGE_BELOW_PERCENT: u8 = MERGE_BELOW_PERCENT;
+}
+
+type Config<R, const NODE_CAPACITY: usize> = TestConfig<R, NODE_CAPACITY, 25>;
+
+fn accepts_config<C: TreeConfig>() {
+    drop(Tree::<RedbStore<Inline>, fn() -> u128, C>::new(
+        memory_store(),
+        || 1,
+    ));
+}
 
 #[test]
 fn each_width_accepts_its_optimal_capacities() {
-    let _: Optimal<u8, 255> = TreeConfig::new;
-    let _: Optimal<u16, 256> = TreeConfig::new;
-    let _: Optimal<u16, 65535> = TreeConfig::new;
-    let _: Optimal<u32, 65536> = TreeConfig::new;
+    accepts_config::<Config<u8, 255>>();
+    accepts_config::<Config<u16, 256>>();
+    accepts_config::<Config<u16, 65535>>();
+    accepts_config::<Config<u32, 65536>>();
 }
 
 fn memory_store() -> RedbStore<Inline> {
@@ -22,7 +39,7 @@ fn memory_store() -> RedbStore<Inline> {
     RedbStore::new(database, Inline).unwrap()
 }
 
-fn into_store<S, A, R, const NODE_CAPACITY: usize>(tree: Tree<S, A, R, NODE_CAPACITY>) -> S {
+fn into_store<S, A, C>(tree: Tree<S, A, C>) -> S {
     Arc::into_inner(tree.0)
         .expect("the test holds the only reference to the tree")
         .store
@@ -30,15 +47,13 @@ fn into_store<S, A, R, const NODE_CAPACITY: usize>(tree: Tree<S, A, R, NODE_CAPA
 
 #[test]
 fn a_store_accepts_the_config_it_was_first_given() {
-    let tree = block_on(Tree::new(
+    let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
-        TreeConfig::<u16, 16355>::new(25),
         || 1,
     ))
     .unwrap();
-    block_on(Tree::new(
+    block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         into_store(tree),
-        TreeConfig::<u16, 16355>::new(25),
         || 1,
     ))
     .unwrap();
@@ -46,15 +61,13 @@ fn a_store_accepts_the_config_it_was_first_given() {
 
 #[test]
 fn a_store_rejects_a_different_node_capacity() {
-    let tree = block_on(Tree::new(
+    let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
-        TreeConfig::<u16, 16355>::new(25),
         || 1,
     ))
     .unwrap();
-    let reopened = block_on(Tree::new(
+    let reopened = block_on(Tree::<_, _, TestConfig<u16, 4067, 25>>::new(
         into_store(tree),
-        TreeConfig::<u16, 4067>::new(25),
         || 1,
     ));
     assert!(matches!(
@@ -66,15 +79,13 @@ fn a_store_rejects_a_different_node_capacity() {
 
 #[test]
 fn a_store_rejects_a_different_address_length() {
-    let tree = block_on(Tree::new(
+    let tree = block_on(Tree::<_, _, TestConfig<u16, 65535, 25>>::new(
         memory_store(),
-        TreeConfig::<u16, 65535>::new(25),
         || 1,
     ))
     .unwrap();
-    let reopened = block_on(Tree::new(
+    let reopened = block_on(Tree::<_, _, TestConfig<u32, 65536, 25>>::new(
         into_store(tree),
-        TreeConfig::<u32, 65536>::new(25),
         || 1,
     ));
     assert!(matches!(
@@ -86,15 +97,13 @@ fn a_store_rejects_a_different_address_length() {
 
 #[test]
 fn a_store_rejects_a_different_merge_threshold() {
-    let tree = block_on(Tree::new(
+    let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
-        TreeConfig::<u16, 16355>::new(25),
         || 1,
     ))
     .unwrap();
-    let reopened = block_on(Tree::new(
+    let reopened = block_on(Tree::<_, _, TestConfig<u16, 16355, 30>>::new(
         into_store(tree),
-        TreeConfig::<u16, 16355>::new(30),
         || 1,
     ));
     assert!(matches!(
@@ -115,7 +124,7 @@ fn a_corrupt_pinned_config_is_reported() {
         })
     }))
     .unwrap();
-    let tree = block_on(Tree::new(store, TreeConfig::<u16, 16355>::new(25), || 1));
+    let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(store, || 1));
     assert!(matches!(
         tree,
         Err(TransactError::Aborted(PinnedConfigError::Corrupt(
@@ -126,9 +135,8 @@ fn a_corrupt_pinned_config_is_reported() {
 
 #[test]
 fn create_writes_a_header_and_an_empty_root() {
-    let tree = block_on(Tree::new(
+    let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
-        TreeConfig::<u16, 16355>::new(25),
         || 7,
     ))
     .unwrap();
@@ -161,20 +169,30 @@ fn create_writes_a_header_and_an_empty_root() {
     assert!(matches!(root, Node::Leaf(list) if list.len() == 0));
 }
 
-fn split_halves_fit<R: AddressableRange, const NODE_CAPACITY: usize>() {
-    let per_node = size_of::<NodeHeader>() + size_of::<R::Stored>();
-    let largest = TreeConfig::<R, NODE_CAPACITY>::LARGEST_ENTRY_SIZE + size_of::<R::Stored>();
-    let overfull = NODE_CAPACITY - per_node + largest;
-    assert!(overfull.div_ceil(2) + largest <= NODE_CAPACITY - per_node);
+fn split_halves_fit<C: TreeConfig>() {
+    let address = size_of::<<C::Range as AddressableRange>::Stored>();
+    let per_node = size_of::<NodeHeader>() + address;
+    let largest = C::LARGEST_ENTRY_SIZE + address;
+    let overfull = C::NODE_CAPACITY - per_node + largest;
+    assert!(overfull.div_ceil(2) + largest <= C::NODE_CAPACITY - per_node);
 }
 
 #[test]
 fn the_largest_entry_leaves_room_for_both_halves_of_a_split() {
-    assert_eq!(TreeConfig::<u16, 4067>::LARGEST_ENTRY_SIZE, 1350);
-    split_halves_fit::<u8, 255>();
-    split_halves_fit::<u16, 256>();
-    split_halves_fit::<u16, 4067>();
-    split_halves_fit::<u16, 16355>();
-    split_halves_fit::<u32, 65536>();
-    split_halves_fit::<u32, 1048576>();
+    assert_eq!(Config::<u16, 4067>::LARGEST_ENTRY_SIZE, 1350);
+    split_halves_fit::<Config<u8, 255>>();
+    split_halves_fit::<Config<u16, 256>>();
+    split_halves_fit::<Config<u16, 4067>>();
+    split_halves_fit::<Config<u16, 16355>>();
+    split_halves_fit::<Config<u32, 65536>>();
+    split_halves_fit::<Config<u32, 1048576>>();
+}
+
+#[test]
+fn the_merge_threshold_is_its_percentage_of_the_node_capacity() {
+    assert_eq!(TestConfig::<u16, 16355, 25>::MERGE_BELOW_SIZE, 4088);
+    assert_eq!(
+        TestConfig::<u32, 4294967295, 49>::MERGE_BELOW_SIZE,
+        2104533974
+    );
 }
