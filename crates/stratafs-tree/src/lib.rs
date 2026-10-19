@@ -3,6 +3,7 @@ mod copy_on_write;
 mod descent;
 pub mod error;
 mod header;
+mod invariants;
 mod key;
 mod node;
 pub mod serialized;
