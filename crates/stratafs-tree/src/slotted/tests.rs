@@ -135,6 +135,63 @@ fn stored_bytes_are_read_in_place() {
 }
 
 #[test]
+fn a_stored_list_becomes_editable_in_place_when_nothing_else_holds_it() {
+    let bytes = list_of::<u16>(&[b"ab", b"cde"]).into_inner().freeze();
+    let address = bytes.as_ptr();
+    let mut list = SlottedList::<BytesMut, [u8], u16>::from(
+        SlottedList::<Bytes, [u8], u16>::new(bytes).unwrap(),
+    );
+    assert_eq!(list.get_ref().as_ptr(), address);
+    list.replace(0, b"xy");
+    assert_eq!(entries(&list), [&b"xy"[..], b"cde"]);
+}
+
+#[test]
+fn a_shared_stored_list_is_copied_when_made_editable() {
+    let bytes = list_of::<u16>(&[b"ab", b"cde"]).into_inner().freeze();
+    let mut list = SlottedList::<BytesMut, [u8], u16>::from(
+        SlottedList::<Bytes, [u8], u16>::new(bytes.clone()).unwrap(),
+    );
+    assert_ne!(list.get_ref().as_ptr(), bytes.as_ptr());
+    list.insert(2, b"f");
+    assert_eq!(entries(&list), [&b"ab"[..], b"cde", b"f"]);
+    let unchanged = SlottedList::<Bytes, [u8], u16>::new(bytes).unwrap();
+    assert_eq!(entries(&unchanged), [&b"ab"[..], b"cde"]);
+}
+
+fn child_entries(children: &[u128]) -> SlottedList<BytesMut, ChildEntry, u16> {
+    let mut list = SlottedList::<BytesMut, ChildEntry, u16>::empty();
+    for (index, child) in children.iter().enumerate() {
+        let entry = [U128::new(*child).as_bytes(), b"k"].concat();
+        list.insert(index, ChildEntry::ref_from_bytes(&entry).unwrap());
+    }
+    list
+}
+
+#[test]
+fn entries_can_be_edited_in_place() {
+    let mut list = child_entries(&[7, 8]);
+    let stored_length = list.stored_length();
+    list.get_mut(1).unwrap().unwrap().child = U128::new(9);
+    let children: Vec<_> = (0..list.len())
+        .map(|index| list.get(index).unwrap().unwrap().child.get())
+        .collect();
+    assert_eq!(children, [7, 9]);
+    assert_eq!(list.stored_length(), stored_length);
+    assert!(list.get_mut(2).is_none());
+}
+
+#[test]
+fn an_untyped_list_reads_each_entry_as_its_bytes() {
+    let list = child_entries(&[7, 8]);
+    let typed: Vec<Vec<u8>> = (0..list.len())
+        .map(|index| list.get(index).unwrap().unwrap().as_bytes().to_vec())
+        .collect();
+    let untyped = list.into_untyped();
+    assert_eq!(entries(&untyped), typed);
+}
+
+#[test]
 fn entries_can_be_dynamically_sized_structs() {
     let first = U128::new(7).as_bytes().to_vec();
     let mut second = U128::new(8).as_bytes().to_vec();

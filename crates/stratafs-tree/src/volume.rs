@@ -2,7 +2,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_core::future::BoxFuture;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkingTransaction, VolumeId};
@@ -13,8 +13,11 @@ use stratafs_store::kv::{
 
 use crate::concatenated_bytes::ConcatenatedBytes;
 use crate::error::TreeFailure;
-use crate::header::TreeVolumeId;
-use crate::slotted::AddressableRange;
+use crate::header::{TreeVolumeId, VolumeHeader};
+use crate::key::TreeKey;
+use crate::node::{LeafEntry, Node, NodeHeader, NodeKind};
+use crate::serialized::CorruptValue;
+use crate::slotted::{AddressableRange, SlottedList};
 use crate::tree::TreeShared;
 
 pub struct TreeVolume<S, A, R, const NODE_CAPACITY: usize> {
@@ -50,6 +53,47 @@ fn store_failure_as_tree_failure<R, F, E>(
         TransactError::Rejected(rejection) => TransactError::Rejected(rejection),
         TransactError::Failed(failure) => TransactError::Failed(TreeFailure::Store(failure)),
         TransactError::Aborted(error) => TransactError::Aborted(error),
+    }
+}
+
+impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+where
+    T: ReadKeyValueTransaction,
+{
+    pub(crate) async fn get_volume_header(&self) -> Result<VolumeHeader, TreeFailure<T::Failure>> {
+        let stored = self
+            .inner
+            .get(TreeKey::VolumeHeader(self.volume).into())
+            .await?
+            .ok_or(TreeFailure::Corrupt(CorruptValue::MissingVolumeHeader))?;
+        VolumeHeader::view(&stored)
+            .copied()
+            .map_err(TreeFailure::Corrupt)
+    }
+}
+
+impl<T, S, A, R, const NODE_CAPACITY: usize> TreeTransaction<'_, T, S, A, R, NODE_CAPACITY>
+where
+    T: KeyValueTransaction,
+{
+    pub(crate) async fn set_volume_header(
+        &mut self,
+        new_value: VolumeHeader,
+    ) -> Result<(), StoreError<SetRejection<T::Rejection>, TreeFailure<T::Failure>>> {
+        self.inner
+            .set(
+                TreeKey::VolumeHeader(self.volume).into(),
+                Bytes::from(&new_value),
+            )
+            .await
+            .map_err(with_tree_failure)
+    }
+}
+
+pub(crate) fn with_tree_failure<R, F>(error: StoreError<R, F>) -> StoreError<R, TreeFailure<F>> {
+    match error {
+        StoreError::Rejected(rejection) => StoreError::Rejected(rejection),
+        StoreError::Failed(failure) => StoreError::Failed(TreeFailure::Store(failure)),
     }
 }
 
@@ -172,7 +216,31 @@ where
         key: Bytes,
         value: Bytes,
     ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
-        todo!()
+        let target = self.descend(&key).await?;
+        let mut target_leaf = SlottedList::<BytesMut, _, R>::from(target.destination.entries);
+
+        let insert_at = match target.destination.position {
+            Ok(existing_index) => {
+                target_leaf.replace(existing_index, &LeafEntry::new(&key, &value));
+                self.inner
+                    .set(
+                        TreeKey::Node(target.destination.id).into(),
+                        Node::write(
+                            NodeHeader {
+                                kind: NodeKind::Leaf,
+                                epoch: target.destination.epoch, // todo: wire up COW
+                            },
+                            target_leaf,
+                        ),
+                    )
+                    .await
+                    .map_err(with_tree_failure)?;
+                return Ok(());
+            }
+            Err(insert_at) => insert_at,
+        };
+
+        todo!();
     }
 
     async fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {

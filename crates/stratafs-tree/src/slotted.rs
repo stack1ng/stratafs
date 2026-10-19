@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::Range;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use zerocopy::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -133,6 +133,16 @@ where
     }
 }
 
+impl<T: ?Sized, R> From<SlottedList<Bytes, T, R>> for SlottedList<BytesMut, T, R> {
+    fn from(list: SlottedList<Bytes, T, R>) -> Self {
+        Self {
+            bytes: BytesMut::from(list.bytes),
+            entry: PhantomData,
+            address: PhantomData,
+        }
+    }
+}
+
 impl<B, T: ?Sized, R> SlottedList<B, T, R> {
     pub(crate) fn get_ref(&self) -> &B {
         &self.bytes
@@ -140,6 +150,14 @@ impl<B, T: ?Sized, R> SlottedList<B, T, R> {
 
     pub(crate) fn into_inner(self) -> B {
         self.bytes
+    }
+
+    pub(crate) fn into_untyped(self) -> SlottedList<B, [u8], R> {
+        SlottedList {
+            bytes: self.bytes,
+            entry: PhantomData,
+            address: PhantomData,
+        }
     }
 }
 
@@ -234,6 +252,11 @@ where
             }
         }
         self.bytes[replaced.start..replaced.start + entry.len()].copy_from_slice(entry);
+    }
+
+    pub(crate) fn get_mut(&mut self, index: usize) -> Option<Result<&mut T, CorruptValue>> {
+        let entry = self.entry_range(index)?;
+        Some(T::mut_from_bytes(&mut self.bytes[entry]).map_err(|_| CorruptValue::WrongLength))
     }
 
     fn lengths(&self) -> (usize, usize) {

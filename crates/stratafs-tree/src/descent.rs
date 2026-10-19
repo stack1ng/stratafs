@@ -3,7 +3,7 @@ use equivalent::Comparable;
 use stratafs_store::kv::ReadKeyValueTransaction;
 
 use crate::error::TreeFailure;
-use crate::header::{NodeId, VolumeEpoch, VolumeHeader};
+use crate::header::{NodeId, VolumeEpoch};
 use crate::key::TreeKey;
 use crate::node::{InternalEntry, LeafEntry, Node};
 use crate::serialized::CorruptValue;
@@ -13,13 +13,14 @@ use crate::volume::TreeTransaction;
 const MAX_DEPTH: usize = 64;
 
 pub(crate) struct DescentStep<R, T: ?Sized, P> {
+    pub(crate) id: NodeId,
     pub(crate) entries: SlottedList<Bytes, T, R>,
-    epoch: VolumeEpoch,
-    position: P,
+    pub(crate) epoch: VolumeEpoch,
+    pub(crate) position: P,
 }
 
 pub(crate) struct DescentPath<R> {
-    steps: Vec<DescentStep<R, InternalEntry, usize>>,
+    pub(crate) steps: Vec<DescentStep<R, InternalEntry, usize>>,
     pub(crate) destination: DescentStep<
         R,
         LeafEntry,
@@ -35,17 +36,6 @@ where
 {
     // TODO: these methods assume KV operations are efficiently cached by the underlying kv store,
     // we need to make a wrapper for any generic kv store that does this.
-    pub(crate) async fn get_volume_header(&self) -> Result<VolumeHeader, TreeFailure<T::Failure>> {
-        let stored = self
-            .inner
-            .get(TreeKey::VolumeHeader(self.volume).into())
-            .await?
-            .ok_or(TreeFailure::Corrupt(CorruptValue::MissingVolumeHeader))?;
-        VolumeHeader::view(&stored)
-            .copied()
-            .map_err(TreeFailure::Corrupt)
-    }
-
     pub(crate) async fn descend<Q: ?Sized>(
         &self,
         target: &Q,
@@ -86,6 +76,7 @@ where
                         })
                         .map_err(TreeFailure::Corrupt)?;
                     return Ok(DescentStep {
+                        id: current,
                         entries,
                         epoch,
                         position,
@@ -106,6 +97,7 @@ where
                         Err(index) => index - 1,
                     };
 
+                    let this_step_node_id = current;
                     current = entries
                         .get(applicable_separator_index)
                         .expect("the index is in the range")
@@ -113,6 +105,7 @@ where
                         .child;
 
                     steps.push(DescentStep {
+                        id: this_step_node_id,
                         entries,
                         epoch,
                         position: applicable_separator_index,

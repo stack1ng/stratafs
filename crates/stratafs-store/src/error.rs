@@ -9,5 +9,5 @@ pub enum StoreError<R, E> {
 
     // The operation failed due to some backend failure, the operation may or may not have been applied
     #[error(transparent)]
-    Failed(E),
+    Failed(#[from] E),
 }
