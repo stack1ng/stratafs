@@ -116,14 +116,10 @@ impl<R: AddressableRange> Node<Bytes, R> {
     }
 
     pub(crate) fn write<T: ?Sized>(
-        header: NodeHeader,
+        header: &NodeHeader,
         entries: &SlottedList<BytesMut, T, R>,
-    ) -> Bytes {
-        let entries = entries.get_ref();
-        let mut stored = BytesMut::with_capacity(size_of::<NodeHeader>() + entries.len());
-        stored.extend_from_slice(header.as_bytes());
-        stored.extend_from_slice(entries);
-        stored.freeze()
+    ) -> impl Buf + Send {
+        header.as_bytes().chain(&entries.get_ref()[..])
     }
 }
 

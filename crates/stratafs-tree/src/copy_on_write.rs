@@ -121,7 +121,7 @@ where
                             .set(
                                 TreeKey::Node(target).into(),
                                 Node::write(
-                                    NodeHeader {
+                                    &NodeHeader {
                                         kind: writing_over_kind,
                                         epoch: volume.epoch,
                                     },
@@ -163,7 +163,7 @@ where
                             .set(
                                 TreeKey::Node(target).into(),
                                 Node::write(
-                                    NodeHeader {
+                                    &NodeHeader {
                                         kind: writing_over_kind,
                                         epoch: volume.epoch,
                                     },

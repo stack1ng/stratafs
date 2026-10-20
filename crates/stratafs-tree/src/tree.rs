@@ -174,7 +174,7 @@ where
                         .set(
                             TreeKey::Node(root).into(),
                             Node::write(
-                                NodeHeader {
+                                &NodeHeader {
                                     kind: NodeKind::Leaf,
                                     epoch: VolumeEpoch(U64::new(0)),
                                 },

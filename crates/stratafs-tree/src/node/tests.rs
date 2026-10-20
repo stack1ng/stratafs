@@ -158,13 +158,12 @@ fn a_key_longer_than_its_entry_is_reported() {
 fn a_written_node_reads_back() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
     list.insert(0, &LeafEntry::<u16>::new(b"key", b"value").unwrap());
-    let stored = Node::<Bytes, u16>::write(
-        NodeHeader {
-            kind: NodeKind::Leaf,
-            epoch: VolumeEpoch(U64::new(5)),
-        },
-        &list,
-    );
+    let header = NodeHeader {
+        kind: NodeKind::Leaf,
+        epoch: VolumeEpoch(U64::new(5)),
+    };
+    let mut stored = Node::<Bytes, u16>::write(&header, &list);
+    let stored = stored.copy_to_bytes(stored.remaining());
     let (epoch, node) = Node::<Bytes, u16>::read(stored).unwrap();
     assert_eq!(epoch, VolumeEpoch(U64::new(5)));
     let Node::Leaf(list) = node else {
