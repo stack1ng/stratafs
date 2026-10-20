@@ -5,10 +5,10 @@ use std::sync::Arc;
 use bytes::{Buf, Bytes, BytesMut};
 use futures_core::future::BoxFuture;
 use stratafs_store::error::StoreError;
-use stratafs_store::forkable::{ForkingTransaction, VolumeId};
+use stratafs_store::forkable::ForkingTransaction;
 use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, SetRejection,
-    TransactError, TransactionHandle,
+    TransactError, TransactionHandle, assert_valid_range,
 };
 use zerocopy::KnownLayout;
 
@@ -22,8 +22,8 @@ use crate::slotted::SlottedList;
 use crate::tree::{TreeConfig, TreeConfigLimits, TreeShared};
 
 pub struct TreeVolume<S, A, C> {
-    shared: Arc<TreeShared<S, A, C>>,
-    id: TreeVolumeId,
+    pub(crate) shared: Arc<TreeShared<S, A, C>>,
+    pub(crate) id: TreeVolumeId,
 }
 
 pub struct TreeTransaction<'txn, T, S, A, C> {
@@ -170,6 +170,7 @@ where
         range: impl RangeBounds<Bytes> + Send,
         limit: usize,
     ) -> Result<Vec<(Bytes, Bytes)>, Self::Failure> {
+        assert_valid_range(&range);
         let start_target = match range.start_bound() {
             Included(key) => ConcatenatedBytes::from(&key[..]),
             Excluded(key) => ConcatenatedBytes::new(key, &[0]),
@@ -281,7 +282,9 @@ where
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
-    async fn fork(&mut self) -> Result<VolumeId, Self::Failure> {
+    type VolumeId = TreeVolumeId;
+
+    async fn fork(&mut self) -> Result<TreeVolumeId, Self::Failure> {
         todo!()
     }
 }

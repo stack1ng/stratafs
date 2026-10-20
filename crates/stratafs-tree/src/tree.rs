@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use stratafs_store::error::StoreError;
-use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume, VolumeId};
+use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
 };
@@ -151,10 +151,11 @@ where
     type Failure = TreeFailure<S::Failure, S::Rejection>;
     type CreateError =
         TransactError<S::Rejection, S::Failure, StoreError<SetRejection<S::Rejection>, S::Failure>>;
+    type VolumeId = TreeVolumeId;
     type Volume = TreeVolume<S, A, C>;
 
     // create creates a new volume with no contents.
-    async fn create(&self) -> Result<VolumeId, Self::CreateError> {
+    async fn create(&self) -> Result<TreeVolumeId, Self::CreateError> {
         let id = TreeVolumeId((self.0.id_allocator)());
         let root = NodeId(U128::new((self.0.id_allocator)()));
         self.0
@@ -190,15 +191,34 @@ where
                 })
             })
             .await?;
-        Ok(VolumeId(Bytes::copy_from_slice(&id.0.to_be_bytes())))
+        Ok(id)
     }
 
     // open opens an existing volume by its id. If the volume does not exist, it returns UnknownVolume.
     async fn open(
         &self,
-        id: VolumeId,
+        id: TreeVolumeId,
     ) -> Result<Self::Volume, StoreError<UnknownVolume, Self::Failure>> {
-        todo!()
+        let header = self
+            .0
+            .store
+            .read_transact(move |transaction| {
+                Box::pin(async move { transaction.get(TreeKey::VolumeHeader(id).into()).await })
+            })
+            .await;
+        match header {
+            Ok(Some(_)) => Ok(TreeVolume {
+                shared: Arc::clone(&self.0),
+                id,
+            }),
+            Ok(None) => Err(StoreError::Rejected(UnknownVolume)),
+            Err(TransactError::Rejected(rejection)) => Err(StoreError::Failed(
+                TreeFailure::RefusedTransaction(rejection),
+            )),
+            Err(TransactError::Failed(failure) | TransactError::Aborted(failure)) => {
+                Err(StoreError::Failed(TreeFailure::Store(failure)))
+            }
+        }
     }
 }
 

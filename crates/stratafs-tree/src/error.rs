@@ -10,4 +10,6 @@ pub enum TreeFailure<F, R> {
     Corrupt(CorruptValue),
     #[error("the inner store refused a node write")]
     RefusedWrite(#[source] SetRejection<R>),
+    #[error("the inner store refused a transaction")]
+    RefusedTransaction(#[source] R),
 }

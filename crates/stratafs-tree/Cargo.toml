@@ -20,6 +20,7 @@ zerocopy.workspace = true
 futures-lite.workspace = true
 proptest.workspace = true
 redb = "4.4.0"
+stratafs-kv-conformance.workspace = true
 stratafs-redb.workspace = true
 
 [lints]

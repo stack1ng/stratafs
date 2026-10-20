@@ -141,10 +141,7 @@ fn create_writes_a_header_and_an_empty_root() {
     ))
     .unwrap();
     let volume = block_on(tree.create()).unwrap();
-    assert_eq!(
-        volume,
-        VolumeId(Bytes::copy_from_slice(&7u128.to_be_bytes()))
-    );
+    assert_eq!(volume, TreeVolumeId(7));
     let (header, root) = block_on(tree.0.store.read_transact(|transaction| {
         Box::pin(async move {
             let header = transaction

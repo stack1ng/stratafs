@@ -1471,6 +1471,7 @@ dependencies = [
  "redb",
  "smallvec",
  "storekey",
+ "stratafs-kv-conformance",
  "stratafs-redb",
  "stratafs-store",
  "thiserror",

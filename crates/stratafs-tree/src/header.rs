@@ -1,14 +1,30 @@
 use std::io::Write;
 
+use bytes::Bytes;
 use storekey::{Encode, EncodeError, Writer};
 use xxhash_rust::const_xxh32::xxh32;
 use zerocopy::little_endian::{U64, U128};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::serialized::{SerializedShape, serialized_value};
+use crate::serialized::{CorruptValue, SerializedShape, serialized_value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode)]
-pub(crate) struct TreeVolumeId(pub(crate) u128);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode)]
+pub struct TreeVolumeId(pub(crate) u128);
+
+impl From<TreeVolumeId> for Bytes {
+    fn from(id: TreeVolumeId) -> Self {
+        Bytes::copy_from_slice(&id.0.to_be_bytes())
+    }
+}
+
+impl TryFrom<Bytes> for TreeVolumeId {
+    type Error = CorruptValue;
+
+    fn try_from(bytes: Bytes) -> Result<Self, CorruptValue> {
+        let id = <[u8; 16]>::try_from(&bytes[..]).map_err(|_| CorruptValue::WrongLength)?;
+        Ok(Self(u128::from_be_bytes(id)))
+    }
+}
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
