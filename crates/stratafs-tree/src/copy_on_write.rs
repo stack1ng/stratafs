@@ -9,7 +9,9 @@ use crate::error::TreeFailure;
 use crate::header::{NodeId, VolumeHeader};
 use crate::invariants;
 use crate::key::TreeKey;
-use crate::node::{InternalEntry, LeafEntry, Node, NodeHeader, NodeKind, ObservedNode};
+use crate::node::{
+    InternalEntry, LEFTMOST_SEPARATOR, LeafEntry, Node, NodeHeader, NodeKind, ObservedNode,
+};
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
 use crate::tree::{TreeConfig, TreeConfigLimits};
@@ -19,6 +21,7 @@ use crate::volume::{TreeTransaction, with_tree_failure};
 // relative to the OBSERVED nodeids. In other words, all nodeids provided here should ALREADY EXIST.
 pub(crate) enum LayerMutationPlanAction<R: AddressableRange> {
     Create {
+        separator: Box<[u8]>,
         entries: SlottedList<BytesMut, [u8], R>,
     },
     Update {
@@ -96,7 +99,44 @@ where
             let node_size = size_of::<NodeHeader>() + entries_to_write.stored_length();
             let plan: [Option<LayerMutationPlanAction<C::Range>>; 2] = match node_size {
                 size if size > C::NODE_CAPACITY => {
-                    todo!("implement split")
+                    let split_at: usize = entries_to_write.midpoint_by_size(); // placeholder
+
+                    let mut right_half = entries_to_write.split_off(split_at);
+                    let first_entry = right_half
+                        .get(0)
+                        .expect("an overfull node splits into two non-empty halves")
+                        .map_err(TreeFailure::Corrupt)?;
+                    let separator: Box<[u8]> = match writing_over_kind {
+                        NodeKind::Leaf => {
+                            let (key, _) = LeafEntry::<C::Range>::ref_from_bytes(first_entry)
+                                .map_err(|_| TreeFailure::Corrupt(CorruptValue::WrongLength))?
+                                .key_and_value()
+                                .map_err(TreeFailure::Corrupt)?;
+                            key.into()
+                        }
+                        NodeKind::Internal => {
+                            let first_entry = InternalEntry::ref_from_bytes(first_entry)
+                                .map_err(|_| TreeFailure::Corrupt(CorruptValue::WrongLength))?;
+                            let (child, separator) =
+                                (first_entry.child, Box::from(&first_entry.key));
+                            let mut internal_entries = right_half.into_typed::<InternalEntry>();
+                            internal_entries.replace_entry(0, child, LEFTMOST_SEPARATOR);
+                            right_half = internal_entries.into_untyped();
+                            separator
+                        }
+                    };
+
+                    [
+                        Some(LayerMutationPlanAction::Update {
+                            node: writing_over_node,
+                            at: current_at,
+                            entries: entries_to_write,
+                        }),
+                        Some(LayerMutationPlanAction::Create {
+                            separator,
+                            entries: right_half,
+                        }),
+                    ]
                 }
                 size if size < C::MERGE_BELOW_SIZE && parent.is_some() => {
                     todo!("implement merge")
@@ -143,27 +183,8 @@ where
                             })
                         }
                     }
-                    LayerMutationPlanAction::Create { entries } => {
+                    LayerMutationPlanAction::Create { separator, entries } => {
                         let target = NodeId(U128::new((self.shared.id_allocator)()));
-
-                        let first_entry = entries
-                            .get(0)
-                            .expect("expected entries to have at least 1 entry")
-                            .map_err(TreeFailure::Corrupt)?;
-                        let lower_bound = match writing_over_kind {
-                            NodeKind::Leaf => {
-                                let (key, _) = LeafEntry::<C::Range>::ref_from_bytes(first_entry)
-                                    .map_err(|_| TreeFailure::Corrupt(CorruptValue::WrongLength))?
-                                    .key_and_value()
-                                    .map_err(TreeFailure::Corrupt)?;
-                                key
-                            }
-                            NodeKind::Internal => {
-                                &InternalEntry::ref_from_bytes(first_entry)
-                                    .map_err(|_| TreeFailure::Corrupt(CorruptValue::WrongLength))?
-                                    .key
-                            }
-                        };
 
                         self.inner
                             .set(
@@ -179,7 +200,7 @@ where
                             .await
                             .map_err(with_tree_failure)?;
                         parent_edits[i] = Some(ParentEdit::Insert {
-                            separator: lower_bound,
+                            separator,
                             child: target,
                         });
                     }
@@ -211,7 +232,7 @@ where
                 ),
                 None => {
                     let mut header_slot = SlottedList::<BytesMut, InternalEntry, C::Range>::empty();
-                    header_slot.insert_entry(0, writing_over_node.id, b"");
+                    header_slot.insert_entry(0, writing_over_node.id, LEFTMOST_SEPARATOR);
                     (header_slot, None)
                 }
             };

@@ -1,3 +1,5 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use bytes::BytesMut;
 use zerocopy::little_endian::{U16, U64, U128};
 
@@ -90,8 +92,8 @@ fn a_leaf_entry_key_must_fit_the_addressable_range() {
 #[test]
 fn leaf_entries_written_into_a_list_hold_their_keys_and_values() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
-    list.insert_entry(0, b"key", &b"value"[..]).unwrap();
-    list.replace_entry(0, b"key", &b"values"[..]).unwrap();
+    list.insert_entry(0, b"key", &b"value"[..]);
+    list.replace_entry(0, b"key", &b"values"[..]);
     assert_eq!(
         list.get(0).unwrap().unwrap().key_and_value().unwrap(),
         (&b"key"[..], &b"values"[..])
@@ -101,8 +103,7 @@ fn leaf_entries_written_into_a_list_hold_their_keys_and_values() {
 #[test]
 fn a_leaf_entry_value_in_parts_is_written_whole() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
-    list.insert_entry(0, b"key", (&b"val"[..]).chain(&b"ue"[..]))
-        .unwrap();
+    list.insert_entry(0, b"key", (&b"val"[..]).chain(&b"ue"[..]));
     assert_eq!(
         list.get(0).unwrap().unwrap().key_and_value().unwrap(),
         (&b"key"[..], &b"value"[..])
@@ -113,19 +114,33 @@ fn a_leaf_entry_value_in_parts_is_written_whole() {
 fn writing_a_leaf_entry_consumes_its_value() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
     let mut value = Bytes::from_static(b"value");
-    list.insert_entry(0, b"key", &mut value).unwrap();
+    list.insert_entry(0, b"key", &mut value);
     let mut replacement = (&b"val"[..]).chain(&b"ues"[..]);
-    list.replace_entry(0, b"key", &mut replacement).unwrap();
+    list.replace_entry(0, b"key", &mut replacement);
     assert_eq!((value.remaining(), replacement.remaining()), (0, 0));
 }
 
 #[test]
-fn a_leaf_entry_key_too_long_for_the_range_leaves_the_list_unchanged() {
+fn a_leaf_entry_key_too_long_for_the_range_panics_without_changing_the_list() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u8>, u8>::empty();
-    list.insert_entry(0, b"key", &b"value"[..]).unwrap();
+    list.insert_entry(0, b"key", &b"value"[..]);
     let before = list.get_ref().clone();
-    assert!(list.insert_entry(1, &[0; 256], &b""[..]).is_none());
-    assert!(list.replace_entry(0, &[0; 256], &b""[..]).is_none());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| list.insert_entry(
+            1,
+            &[0; 256],
+            &b""[..]
+        )))
+        .is_err()
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| list.replace_entry(
+            0,
+            &[0; 256],
+            &b""[..]
+        )))
+        .is_err()
+    );
     assert_eq!(list.get_ref(), &before);
 }
 
@@ -136,6 +151,24 @@ fn internal_entries_written_into_a_list_hold_their_children_and_keys() {
     list.insert_entry(1, NodeId(U128::new(2)), b"m");
     let first = list.get(0).unwrap().unwrap();
     assert_eq!((first.child, &first.key), (NodeId(U128::new(1)), &b""[..]));
+    let second = list.get(1).unwrap().unwrap();
+    assert_eq!(
+        (second.child, &second.key),
+        (NodeId(U128::new(2)), &b"m"[..])
+    );
+}
+
+#[test]
+fn a_replaced_internal_entry_holds_its_new_child_and_key() {
+    let mut list = SlottedList::<BytesMut, InternalEntry, u16>::empty();
+    list.insert_entry(0, NodeId(U128::new(1)), b"h");
+    list.insert_entry(1, NodeId(U128::new(2)), b"m");
+    list.replace_entry(0, NodeId(U128::new(3)), LEFTMOST_SEPARATOR);
+    let first = list.get(0).unwrap().unwrap();
+    assert_eq!(
+        (first.child, &first.key),
+        (NodeId(U128::new(3)), LEFTMOST_SEPARATOR)
+    );
     let second = list.get(1).unwrap().unwrap();
     assert_eq!(
         (second.child, &second.key),

@@ -64,7 +64,12 @@ fn a_plan_must_observe_each_node_once() {
             at: 0,
         })
     };
-    let create = || Some(LayerMutationPlanAction::Create { entries: untyped() });
+    let create = || {
+        Some(LayerMutationPlanAction::Create {
+            separator: Box::from(&b"m"[..]),
+            entries: untyped(),
+        })
+    };
     assert!(plan_has_at_most_one_action_per_node::<u16>(&[
         update(1),
         None

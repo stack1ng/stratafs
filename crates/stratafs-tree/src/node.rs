@@ -54,23 +54,20 @@ impl<R: AddressableRange> LeafEntry<R> {
 }
 
 impl<R: AddressableRange> SlottedList<BytesMut, LeafEntry<R>, R> {
-    pub(crate) fn insert_entry(&mut self, index: usize, key: &[u8], value: impl Buf) -> Option<()> {
-        let key_length = R::encode(key.len())?;
+    pub(crate) fn insert_entry(&mut self, index: usize, key: &[u8], value: impl Buf) {
+        let key_length = R::encode(key.len()).expect(
+            "callers only write keys that fit in a node, and a node fits the addressable range",
+        );
         self.insert_zeroed(index, key.len() + value.remaining())
             .fill(key_length, key, value);
-        Some(())
     }
 
-    pub(crate) fn replace_entry(
-        &mut self,
-        index: usize,
-        key: &[u8],
-        value: impl Buf,
-    ) -> Option<()> {
-        let key_length = R::encode(key.len())?;
+    pub(crate) fn replace_entry(&mut self, index: usize, key: &[u8], value: impl Buf) {
+        let key_length = R::encode(key.len()).expect(
+            "callers only write keys that fit in a node, and a node fits the addressable range",
+        );
         self.replace_zeroed(index, key.len() + value.remaining())
             .fill(key_length, key, value);
-        Some(())
     }
 }
 
@@ -81,11 +78,22 @@ pub(crate) struct InternalEntry {
     pub(crate) key: [u8],
 }
 
+pub(crate) const LEFTMOST_SEPARATOR: &[u8] = b"";
+
+impl InternalEntry {
+    fn fill(&mut self, child: NodeId, key: &[u8]) {
+        self.child = child;
+        self.key.copy_from_slice(key);
+    }
+}
+
 impl<R: AddressableRange> SlottedList<BytesMut, InternalEntry, R> {
     pub(crate) fn insert_entry(&mut self, index: usize, child: NodeId, key: &[u8]) {
-        let entry = self.insert_zeroed(index, key.len());
-        entry.child = child;
-        entry.key.copy_from_slice(key);
+        self.insert_zeroed(index, key.len()).fill(child, key);
+    }
+
+    pub(crate) fn replace_entry(&mut self, index: usize, child: NodeId, key: &[u8]) {
+        self.replace_zeroed(index, key.len()).fill(child, key);
     }
 }
 

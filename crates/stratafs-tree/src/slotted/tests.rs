@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 use bytes::Bytes;
@@ -359,6 +360,45 @@ fn binary_search_on_an_empty_list_inserts_at_the_start() {
 }
 
 #[test]
+fn the_midpoint_is_the_index_where_the_front_is_closest_to_half_the_size() {
+    assert_eq!(
+        list_of::<u16>(&[b"aaaa", b"b", b"c", b"dddd"]).midpoint_by_size(),
+        2
+    );
+    assert_eq!(
+        list_of::<u16>(&[b"aaaaaaaa", b"b", b"c"]).midpoint_by_size(),
+        1
+    );
+    assert_eq!(
+        list_of::<u16>(&[b"b", b"c", b"aaaaaaaa"]).midpoint_by_size(),
+        2
+    );
+    assert_eq!(list_of::<u16>(&[b"a"]).midpoint_by_size(), 1);
+    assert_eq!(list_of::<u16>(&[]).midpoint_by_size(), 0);
+}
+
+fn midpoint_matches_the_index_closest_to_half_the_size<R: AddressableRange>(
+    entries: Vec<Vec<u8>>,
+) -> Result<(), TestCaseError> {
+    let list = list_of::<R>(&entries.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let mut fronts = vec![0];
+    for entry in &entries {
+        fronts.push(fronts[fronts.len() - 1] + entry.len() + size_of::<R::Stored>());
+    }
+    let total = fronts[fronts.len() - 1];
+    let expected = (0..fronts.len())
+        .min_by_key(|&index| {
+            (
+                fronts[index].abs_diff(total - fronts[index]),
+                Reverse(index),
+            )
+        })
+        .unwrap();
+    prop_assert_eq!(list.midpoint_by_size(), expected);
+    Ok(())
+}
+
+#[test]
 fn binary_search_reports_corrupt_entries() {
     let bytes = stored::<u16>(b"abc", &[0]);
     let list = SlottedList::<&[u8], ChildEntry, u16>::new(&bytes[..]).unwrap();
@@ -547,5 +587,15 @@ proptest! {
     #[test]
     fn u32_edits_match_a_vector_of_entries(edits in vec(edit(), 0..64)) {
         edits_match_a_vector_of_entries::<u32>(edits)?;
+    }
+
+    #[test]
+    fn u8_midpoint_matches_the_index_closest_to_half_the_size(entries in vec(vec(any::<u8>(), 0..8), 0..16)) {
+        midpoint_matches_the_index_closest_to_half_the_size::<u8>(entries)?;
+    }
+
+    #[test]
+    fn u16_midpoint_matches_the_index_closest_to_half_the_size(entries in vec(vec(any::<u8>(), 0..24), 0..32)) {
+        midpoint_matches_the_index_closest_to_half_the_size::<u16>(entries)?;
     }
 }

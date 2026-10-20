@@ -235,13 +235,10 @@ where
         let target = self.descend(&key).await?;
         let mut target_leaf =
             SlottedList::<BytesMut, _, C::Range>::from(target.destination.entries);
-        let written = match target.destination.position {
+        match target.destination.position {
             Ok(index) => target_leaf.replace_entry(index, &key, value),
             Err(insert_at) => target_leaf.insert_entry(insert_at, &key, value),
-        };
-        let Some(()) = written else {
-            return Err(StoreError::Rejected(SetRejection::TooLarge));
-        };
+        }
 
         self.write_over(
             target.volume,
