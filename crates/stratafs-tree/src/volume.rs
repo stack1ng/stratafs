@@ -223,9 +223,11 @@ where
     ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
         let fits_as_node_entry =
             |length: Option<usize>| length.is_some_and(|length| length <= C::LARGEST_ENTRY_SIZE);
-        if !fits_as_node_entry(LeafEntry::<C::Range>::size_for_metadata(
-            key.len() + value.remaining(),
-        )) || !fits_as_node_entry(InternalEntry::size_for_metadata(key.len()))
+        if !fits_as_node_entry(
+            key.len()
+                .checked_add(value.remaining())
+                .and_then(LeafEntry::<C::Range>::size_for_metadata),
+        ) || !fits_as_node_entry(InternalEntry::size_for_metadata(key.len()))
         {
             return Err(StoreError::Rejected(SetRejection::TooLarge));
         }

@@ -271,20 +271,22 @@ impl KeyValueTransaction for RedbTransaction<'_, Table<'_, &'static [u8], &'stat
         mut value: impl Buf + Send,
     ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
         let joined;
-        let value = if value.chunk().len() == value.remaining() {
+        let contiguous = if value.chunk().len() == value.remaining() {
             value.chunk()
         } else {
             joined = value.copy_to_bytes(value.remaining());
             &joined[..]
         };
-        let previous = match self.table.insert(&key[..], value) {
+        let previous = match self.table.insert(&key[..], contiguous) {
             Ok(previous) => previous,
             Err(StorageError::ValueTooLarge(_)) => {
                 return Err(StoreError::Rejected(SetRejection::TooLarge));
             }
             Err(failure) => return Err(StoreError::Failed(failure.into())),
         };
-        if previous.is_none_or(|previous| previous.value() != value) {
+        let changed = previous.is_none_or(|previous| previous.value() != contiguous);
+        value.advance(value.remaining());
+        if changed {
             self.written.push(key);
         }
         Ok(())

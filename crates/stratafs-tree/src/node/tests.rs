@@ -110,6 +110,16 @@ fn a_leaf_entry_value_in_parts_is_written_whole() {
 }
 
 #[test]
+fn writing_a_leaf_entry_consumes_its_value() {
+    let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
+    let mut value = Bytes::from_static(b"value");
+    list.insert_entry(0, b"key", &mut value).unwrap();
+    let mut replacement = (&b"val"[..]).chain(&b"ues"[..]);
+    list.replace_entry(0, b"key", &mut replacement).unwrap();
+    assert_eq!((value.remaining(), replacement.remaining()), (0, 0));
+}
+
+#[test]
 fn a_leaf_entry_key_too_long_for_the_range_leaves_the_list_unchanged() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u8>, u8>::empty();
     list.insert_entry(0, b"key", &b"value"[..]).unwrap();
