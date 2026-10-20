@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
 
 use crate::error::StoreError;
@@ -114,7 +114,7 @@ pub trait KeyValueTransaction: ReadKeyValueTransaction {
     fn set(
         &mut self,
         key: Bytes,
-        value: Bytes,
+        value: impl Buf + Send,
     ) -> impl Future<Output = Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>>> + Send;
 
     fn clear(&mut self, key: Bytes) -> impl Future<Output = Result<(), Self::Failure>> + Send;

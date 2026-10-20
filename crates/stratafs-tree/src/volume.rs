@@ -2,7 +2,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_core::future::BoxFuture;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkingTransaction, VolumeId};
@@ -219,12 +219,12 @@ where
     async fn set(
         &mut self,
         key: Bytes,
-        value: Bytes,
+        value: impl Buf + Send,
     ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
         let fits_as_node_entry =
             |length: Option<usize>| length.is_some_and(|length| length <= C::LARGEST_ENTRY_SIZE);
         if !fits_as_node_entry(LeafEntry::<C::Range>::size_for_metadata(
-            key.len() + value.len(),
+            key.len() + value.remaining(),
         )) || !fits_as_node_entry(InternalEntry::size_for_metadata(key.len()))
         {
             return Err(StoreError::Rejected(SetRejection::TooLarge));
@@ -233,8 +233,8 @@ where
         let mut target_leaf =
             SlottedList::<BytesMut, _, C::Range>::from(target.destination.entries);
         let written = match target.destination.position {
-            Ok(index) => target_leaf.replace_entry(index, &key, &value),
-            Err(insert_at) => target_leaf.insert_entry(insert_at, &key, &value),
+            Ok(index) => target_leaf.replace_entry(index, &key, value),
+            Err(insert_at) => target_leaf.insert_entry(insert_at, &key, value),
         };
         let Some(()) = written else {
             return Err(StoreError::Rejected(SetRejection::TooLarge));

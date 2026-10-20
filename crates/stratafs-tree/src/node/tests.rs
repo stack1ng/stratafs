@@ -90,8 +90,8 @@ fn a_leaf_entry_key_must_fit_the_addressable_range() {
 #[test]
 fn leaf_entries_written_into_a_list_hold_their_keys_and_values() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
-    list.insert_entry(0, b"key", b"value").unwrap();
-    list.replace_entry(0, b"key", b"values").unwrap();
+    list.insert_entry(0, b"key", &b"value"[..]).unwrap();
+    list.replace_entry(0, b"key", &b"values"[..]).unwrap();
     assert_eq!(
         list.get(0).unwrap().unwrap().key_and_value().unwrap(),
         (&b"key"[..], &b"values"[..])
@@ -99,12 +99,23 @@ fn leaf_entries_written_into_a_list_hold_their_keys_and_values() {
 }
 
 #[test]
+fn a_leaf_entry_value_in_parts_is_written_whole() {
+    let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
+    list.insert_entry(0, b"key", (&b"val"[..]).chain(&b"ue"[..]))
+        .unwrap();
+    assert_eq!(
+        list.get(0).unwrap().unwrap().key_and_value().unwrap(),
+        (&b"key"[..], &b"value"[..])
+    );
+}
+
+#[test]
 fn a_leaf_entry_key_too_long_for_the_range_leaves_the_list_unchanged() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u8>, u8>::empty();
-    list.insert_entry(0, b"key", b"value").unwrap();
+    list.insert_entry(0, b"key", &b"value"[..]).unwrap();
     let before = list.get_ref().clone();
-    assert!(list.insert_entry(1, &[0; 256], b"").is_none());
-    assert!(list.replace_entry(0, &[0; 256], b"").is_none());
+    assert!(list.insert_entry(1, &[0; 256], &b""[..]).is_none());
+    assert!(list.replace_entry(0, &[0; 256], &b""[..]).is_none());
     assert_eq!(list.get_ref(), &before);
 }
 

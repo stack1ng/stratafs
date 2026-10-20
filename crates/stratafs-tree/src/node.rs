@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use zerocopy::{
     FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, TryFromBytes, TryReadError, Unaligned,
 };
@@ -39,11 +39,11 @@ impl<R: AddressableRange> LeafEntry<R> {
         Some(entry)
     }
 
-    fn fill(&mut self, key_length: R::Stored, key: &[u8], value: &[u8]) {
+    fn fill(&mut self, key_length: R::Stored, key: &[u8], mut value: impl Buf) {
         self.key_length = key_length;
         let (stored_key, stored_value) = self.key_then_value.split_at_mut(key.len());
         stored_key.copy_from_slice(key);
-        stored_value.copy_from_slice(value);
+        value.copy_to_slice(stored_value);
     }
 
     pub(crate) fn key_and_value(&self) -> Result<(&[u8], &[u8]), CorruptValue> {
@@ -54,16 +54,21 @@ impl<R: AddressableRange> LeafEntry<R> {
 }
 
 impl<R: AddressableRange> SlottedList<BytesMut, LeafEntry<R>, R> {
-    pub(crate) fn insert_entry(&mut self, index: usize, key: &[u8], value: &[u8]) -> Option<()> {
+    pub(crate) fn insert_entry(&mut self, index: usize, key: &[u8], value: impl Buf) -> Option<()> {
         let key_length = R::encode(key.len())?;
-        self.insert_zeroed(index, key.len() + value.len())
+        self.insert_zeroed(index, key.len() + value.remaining())
             .fill(key_length, key, value);
         Some(())
     }
 
-    pub(crate) fn replace_entry(&mut self, index: usize, key: &[u8], value: &[u8]) -> Option<()> {
+    pub(crate) fn replace_entry(
+        &mut self,
+        index: usize,
+        key: &[u8],
+        value: impl Buf,
+    ) -> Option<()> {
         let key_length = R::encode(key.len())?;
-        self.replace_zeroed(index, key.len() + value.len())
+        self.replace_zeroed(index, key.len() + value.remaining())
             .fill(key_length, key, value);
         Some(())
     }
