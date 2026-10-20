@@ -35,11 +35,15 @@ impl<R: AddressableRange> LeafEntry<R> {
         let key_length = R::encode(key.len())?;
         let mut entry = Self::new_box_zeroed_with_elems(key.len() + value.len())
             .expect("a leaf entry fits in memory");
-        entry.key_length = key_length;
-        let (stored_key, stored_value) = entry.key_then_value.split_at_mut(key.len());
+        entry.fill(key_length, key, value);
+        Some(entry)
+    }
+
+    fn fill(&mut self, key_length: R::Stored, key: &[u8], value: &[u8]) {
+        self.key_length = key_length;
+        let (stored_key, stored_value) = self.key_then_value.split_at_mut(key.len());
         stored_key.copy_from_slice(key);
         stored_value.copy_from_slice(value);
-        Some(entry)
     }
 
     pub(crate) fn key_and_value(&self) -> Result<(&[u8], &[u8]), CorruptValue> {
@@ -49,11 +53,35 @@ impl<R: AddressableRange> LeafEntry<R> {
     }
 }
 
+impl<R: AddressableRange> SlottedList<BytesMut, LeafEntry<R>, R> {
+    pub(crate) fn insert_entry(&mut self, index: usize, key: &[u8], value: &[u8]) -> Option<()> {
+        let key_length = R::encode(key.len())?;
+        self.insert_zeroed(index, key.len() + value.len())
+            .fill(key_length, key, value);
+        Some(())
+    }
+
+    pub(crate) fn replace_entry(&mut self, index: usize, key: &[u8], value: &[u8]) -> Option<()> {
+        let key_length = R::encode(key.len())?;
+        self.replace_zeroed(index, key.len() + value.len())
+            .fill(key_length, key, value);
+        Some(())
+    }
+}
+
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 pub(crate) struct InternalEntry {
     pub(crate) child: NodeId,
     pub(crate) key: [u8],
+}
+
+impl<R: AddressableRange> SlottedList<BytesMut, InternalEntry, R> {
+    pub(crate) fn insert_entry(&mut self, index: usize, child: NodeId, key: &[u8]) {
+        let entry = self.insert_zeroed(index, key.len());
+        entry.child = child;
+        entry.key.copy_from_slice(key);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,12 +112,12 @@ impl<R: AddressableRange> Node<Bytes, R> {
 
     pub(crate) fn write<T: ?Sized>(
         header: NodeHeader,
-        entries: SlottedList<BytesMut, T, R>,
+        entries: &SlottedList<BytesMut, T, R>,
     ) -> Bytes {
-        let entries = entries.into_inner();
+        let entries = entries.get_ref();
         let mut stored = BytesMut::with_capacity(size_of::<NodeHeader>() + entries.len());
         stored.extend_from_slice(header.as_bytes());
-        stored.extend_from_slice(&entries);
+        stored.extend_from_slice(entries);
         stored.freeze()
     }
 }

@@ -88,6 +88,41 @@ fn a_leaf_entry_key_must_fit_the_addressable_range() {
 }
 
 #[test]
+fn leaf_entries_written_into_a_list_hold_their_keys_and_values() {
+    let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
+    list.insert_entry(0, b"key", b"value").unwrap();
+    list.replace_entry(0, b"key", b"values").unwrap();
+    assert_eq!(
+        list.get(0).unwrap().unwrap().key_and_value().unwrap(),
+        (&b"key"[..], &b"values"[..])
+    );
+}
+
+#[test]
+fn a_leaf_entry_key_too_long_for_the_range_leaves_the_list_unchanged() {
+    let mut list = SlottedList::<BytesMut, LeafEntry<u8>, u8>::empty();
+    list.insert_entry(0, b"key", b"value").unwrap();
+    let before = list.get_ref().clone();
+    assert!(list.insert_entry(1, &[0; 256], b"").is_none());
+    assert!(list.replace_entry(0, &[0; 256], b"").is_none());
+    assert_eq!(list.get_ref(), &before);
+}
+
+#[test]
+fn internal_entries_written_into_a_list_hold_their_children_and_keys() {
+    let mut list = SlottedList::<BytesMut, InternalEntry, u16>::empty();
+    list.insert_entry(0, NodeId(U128::new(1)), b"");
+    list.insert_entry(1, NodeId(U128::new(2)), b"m");
+    let first = list.get(0).unwrap().unwrap();
+    assert_eq!((first.child, &first.key), (NodeId(U128::new(1)), &b""[..]));
+    let second = list.get(1).unwrap().unwrap();
+    assert_eq!(
+        (second.child, &second.key),
+        (NodeId(U128::new(2)), &b"m"[..])
+    );
+}
+
+#[test]
 fn a_key_longer_than_its_entry_is_reported() {
     let entry = [U16::new(4).as_bytes(), b"abc"].concat();
     assert!(matches!(
@@ -107,7 +142,7 @@ fn a_written_node_reads_back() {
             kind: NodeKind::Leaf,
             epoch: VolumeEpoch(U64::new(5)),
         },
-        list,
+        &list,
     );
     let (epoch, node) = Node::<Bytes, u16>::read(stored).unwrap();
     assert_eq!(epoch, VolumeEpoch(U64::new(5)));

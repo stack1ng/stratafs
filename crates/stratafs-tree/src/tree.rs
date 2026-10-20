@@ -178,7 +178,7 @@ where
                                     kind: NodeKind::Leaf,
                                     epoch: VolumeEpoch(U64::new(0)),
                                 },
-                                SlottedList::<
+                                &SlottedList::<
                                     BytesMut,
                                     // we aren't storing any values yet, so we intentionally make it so we cant store any with the infallible type.
                                     Infallible,

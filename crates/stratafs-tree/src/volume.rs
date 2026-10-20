@@ -229,16 +229,16 @@ where
         {
             return Err(StoreError::Rejected(SetRejection::TooLarge));
         }
-        let Some(new_entry) = LeafEntry::<C::Range>::new(&key, &value) else {
-            return Err(StoreError::Rejected(SetRejection::TooLarge));
-        };
         let target = self.descend(&key).await?;
         let mut target_leaf =
             SlottedList::<BytesMut, _, C::Range>::from(target.destination.entries);
-        match target.destination.position {
-            Ok(index) => target_leaf.replace(index, &new_entry),
-            Err(insert_at) => target_leaf.insert(insert_at, &new_entry),
-        }
+        let written = match target.destination.position {
+            Ok(index) => target_leaf.replace_entry(index, &key, &value),
+            Err(insert_at) => target_leaf.insert_entry(insert_at, &key, &value),
+        };
+        let Some(()) = written else {
+            return Err(StoreError::Rejected(SetRejection::TooLarge));
+        };
 
         self.write_over(target.steps, target.destination.node, target_leaf)
             .await

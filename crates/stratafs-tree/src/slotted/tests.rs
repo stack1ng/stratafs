@@ -126,6 +126,19 @@ fn replaces_resize_only_their_entry() {
 }
 
 #[test]
+fn zeroed_edits_hand_back_their_entry_cleared() {
+    let mut list = list_of::<u16>(&[b"ab", b"cde"]);
+    let inserted = list.insert_zeroed(1, 3);
+    assert_eq!(inserted, [0, 0, 0]);
+    inserted.copy_from_slice(b"xyz");
+    let replaced = list.replace_zeroed(0, 4);
+    assert_eq!(replaced, [0, 0, 0, 0]);
+    replaced.copy_from_slice(b"long");
+    assert_eq!(list.replace_zeroed(2, 1), [0]);
+    assert_eq!(entries(&list), [&b"long"[..], b"xyz", b"\0"]);
+}
+
+#[test]
 fn stored_bytes_are_read_in_place() {
     let bytes = list_of::<u16>(&[b"ab", b"cde"]).into_inner().freeze();
     let list = SlottedList::<Bytes, [u8], u16>::new(bytes.clone()).unwrap();

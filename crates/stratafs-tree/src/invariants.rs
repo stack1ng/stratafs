@@ -8,10 +8,9 @@ pub(crate) fn plan_has_at_most_one_action_per_node<R: AddressableRange>(
 ) -> bool {
     let observed = || {
         plan.iter().flatten().filter_map(|action| match action {
-            LayerMutationPlanAction::Update(node, _) | LayerMutationPlanAction::Delete(node) => {
-                Some(node.id)
-            }
-            LayerMutationPlanAction::Create(_) => None,
+            LayerMutationPlanAction::Update { node, .. }
+            | LayerMutationPlanAction::Delete { node, .. } => Some(node.id),
+            LayerMutationPlanAction::Create { .. } => None,
         })
     };
     observed()
