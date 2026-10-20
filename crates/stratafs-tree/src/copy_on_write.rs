@@ -216,7 +216,24 @@ where
                 }
             };
 
-            for edit in parent_edits.into_iter().flatten() {
+            for i in 0..parent_edits.len() {
+                fn adjust_future_slots(
+                    future_edits: &mut [Option<ParentEdit>],
+                    adjust: impl Fn(&mut usize),
+                ) {
+                    for future_edit in future_edits.iter_mut().flatten() {
+                        match future_edit {
+                            ParentEdit::Retarget { at, .. } | ParentEdit::Remove { at } => {
+                                adjust(at)
+                            }
+                            ParentEdit::Insert { .. } => {}
+                        }
+                    }
+                }
+
+                let Some(edit) = parent_edits[i].take() else {
+                    continue;
+                };
                 match edit {
                     ParentEdit::Retarget { at, to } => {
                         // retarged the separator on the parent in place
@@ -232,8 +249,22 @@ where
                             .map_err(TreeFailure::Corrupt)?
                             .expect_err("a new separator should not already be in the parent");
                         parent_entries.insert_entry(at, child, separator);
+
+                        // now that we have inserted, all future index references need to be incremented +1
+                        adjust_future_slots(&mut parent_edits[i + 1..], |future_at| {
+                            if *future_at >= at {
+                                *future_at += 1;
+                            }
+                        });
                     }
-                    ParentEdit::Remove { at } => parent_entries.remove(at),
+                    ParentEdit::Remove { at } => {
+                        parent_entries.remove(at);
+                        adjust_future_slots(&mut parent_edits[i + 1..], |future_at| {
+                            if *future_at > at {
+                                *future_at -= 1;
+                            }
+                        });
+                    }
                 }
             }
 
