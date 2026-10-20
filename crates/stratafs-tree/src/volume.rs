@@ -242,8 +242,13 @@ where
             return Err(StoreError::Rejected(SetRejection::TooLarge));
         };
 
-        self.write_over(target.steps, target.destination.node, target_leaf)
-            .await
+        self.write_over(
+            target.volume,
+            target.steps,
+            target.destination.node,
+            target_leaf,
+        )
+        .await
     }
 
     async fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {
@@ -255,12 +260,17 @@ where
             Err(_) => return Ok(()),
         }
 
-        self.write_over(target.steps, target.destination.node, target_leaf)
-            .await
-            .map_err(|error| match error {
-                StoreError::Failed(failure) => failure,
-                StoreError::Rejected(rejection) => TreeFailure::RefusedWrite(rejection),
-            })
+        self.write_over(
+            target.volume,
+            target.steps,
+            target.destination.node,
+            target_leaf,
+        )
+        .await
+        .map_err(|error| match error {
+            StoreError::Failed(failure) => failure,
+            StoreError::Rejected(rejection) => TreeFailure::RefusedWrite(rejection),
+        })
     }
 }
 

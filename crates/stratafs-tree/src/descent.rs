@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
 use crate::error::TreeFailure;
-use crate::header::NodeId;
+use crate::header::{NodeId, VolumeHeader};
 use crate::key::TreeKey;
 use crate::node::{InternalEntry, LeafEntry, Node, ObservedNode};
 use crate::serialized::CorruptValue;
@@ -24,6 +24,7 @@ pub(crate) struct DescentStep<R, T: ?Sized, P> {
 pub(crate) type DescentSteps<R> = SmallVec<[DescentStep<R, InternalEntry, usize>; INLINE_DEPTH]>;
 
 pub(crate) struct DescentPath<R: AddressableRange> {
+    pub(crate) volume: VolumeHeader,
     pub(crate) steps: DescentSteps<R>,
     pub(crate) destination: DescentStep<
         R,
@@ -39,8 +40,6 @@ where
     S: KeyValueStore,
     C: TreeConfig,
 {
-    // TODO: these methods assume KV operations are efficiently cached by the underlying kv store,
-    // we need to make a wrapper for any generic kv store that does this.
     pub(crate) async fn descend<Q: ?Sized>(
         &self,
         target: &Q,
@@ -48,10 +47,14 @@ where
     where
         [u8]: Comparable<Q>,
     {
-        let root = self.get_volume_header().await?.root;
+        let volume = self.get_volume_header().await?;
         let mut steps = SmallVec::new();
-        let destination = self.descend_from(root, &mut steps, target).await?;
-        Ok(DescentPath { steps, destination })
+        let destination = self.descend_from(volume.root, &mut steps, target).await?;
+        Ok(DescentPath {
+            volume,
+            steps,
+            destination,
+        })
     }
 
     async fn descend_from<Q: ?Sized>(

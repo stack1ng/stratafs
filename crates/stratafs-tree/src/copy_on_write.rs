@@ -60,27 +60,33 @@ where
     // It also handles splitting/merging during the same pass.
     pub(crate) async fn write_over(
         &mut self,
+        volume: VolumeHeader,
         steps: DescentSteps<C::Range>,
         node: ObservedNode,
         desired_entries: SlottedList<BytesMut, LeafEntry<C::Range>, C::Range>,
     ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
     {
         debug_assert!(invariants::leaf_keys_ascend(&desired_entries));
-        self.write_upward(steps, node, NodeKind::Leaf, desired_entries.into_untyped())
-            .await
+        self.write_upward(
+            volume,
+            steps,
+            node,
+            NodeKind::Leaf,
+            desired_entries.into_untyped(),
+        )
+        .await
     }
 
     // write_upward is a little helper to remove all the immutable param identifiers from scope, purely for ergonomics.
     async fn write_upward(
         &mut self,
+        volume: VolumeHeader,
         mut ancestry: DescentSteps<C::Range>,
         mut writing_over_node: ObservedNode,
         mut writing_over_kind: NodeKind,
         mut entries_to_write: SlottedList<BytesMut, [u8], C::Range>,
     ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
     {
-        let volume = self.get_volume_header().await?;
-
         loop {
             let parent = ancestry.pop();
             // no parent in the acestry means our parent is implicitly the volume header, which only has a single slot (so we are at it, being index 0)
