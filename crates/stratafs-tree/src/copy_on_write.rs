@@ -99,6 +99,7 @@ where
             let node_size = size_of::<NodeHeader>() + entries_to_write.stored_length();
             let plan: [Option<LayerMutationPlanAction<C::Range>>; 2] = match node_size {
                 size if size > C::NODE_CAPACITY => {
+                    // handle splitting a node
                     let split_at: usize = entries_to_write.midpoint_by_size(); // placeholder
 
                     let mut right_half = entries_to_write.split_off(split_at);

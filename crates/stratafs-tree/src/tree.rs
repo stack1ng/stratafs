@@ -27,6 +27,7 @@ pub trait TreeConfig: Send + Sync + 'static {
 pub(crate) trait TreeConfigLimits: TreeConfig {
     const LARGEST_ENTRY_SIZE: usize;
     const MERGE_BELOW_SIZE: usize;
+    const EMPTY_NODE_SIZE: usize;
 }
 
 impl<C: TreeConfig> TreeConfigLimits for C {
@@ -37,6 +38,8 @@ impl<C: TreeConfig> TreeConfigLimits for C {
         - size_of::<<C::Range as AddressableRange>::Stored>();
     const MERGE_BELOW_SIZE: usize =
         (C::NODE_CAPACITY as u64 * C::MERGE_BELOW_PERCENT as u64 / 100) as usize;
+    const EMPTY_NODE_SIZE: usize =
+        size_of::<NodeHeader>() + size_of::<<C::Range as AddressableRange>::Stored>();
 }
 
 serialized_value! {
@@ -100,8 +103,16 @@ where
                 "the node capacity is too small to hold a separator entry"
             );
             assert!(
-                C::MERGE_BELOW_PERCENT < 50,
-                "the merge threshold must be below half the node capacity"
+                C::MERGE_BELOW_SIZE
+                    > C::EMPTY_NODE_SIZE
+                        + size_of::<<C::Range as AddressableRange>::Stored>()
+                        + size_of::<NodeId>(),
+                "the merge threshold must be above the size of an internal node with one child, or a node can be left without a sibling to merge with"
+            );
+            assert!(
+                C::MERGE_BELOW_SIZE
+                    <= C::EMPTY_NODE_SIZE + (C::NODE_CAPACITY - C::EMPTY_NODE_SIZE) / 3,
+                "the merge threshold must be at or below the smallest half a split can produce"
             );
         };
         let configured = PinnedConfig {
