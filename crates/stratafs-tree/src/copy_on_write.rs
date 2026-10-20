@@ -253,9 +253,29 @@ where
                             .await?;
                             return Ok(());
                         }
-                        2 => todo!(
-                            "need to handle the 'new root' case here, by growing the tree vertically"
-                        ),
+                        2 => {
+                            // create a new root node
+                            let new_root = NodeId(U128::new((self.shared.id_allocator)()));
+                            self.inner
+                                .set(
+                                    TreeKey::Node(new_root).into(),
+                                    Node::write(
+                                        &NodeHeader {
+                                            kind: NodeKind::Internal,
+                                            epoch: volume.epoch,
+                                        },
+                                        &parent_entries,
+                                    ),
+                                )
+                                .await
+                                .map_err(with_tree_failure)?;
+                            self.set_volume_header(VolumeHeader {
+                                root: new_root,
+                                epoch: volume.epoch,
+                            })
+                            .await?;
+                            return Ok(());
+                        }
                         count => unreachable!(
                             "the root never merges, so the header slot has 1 or 2 entries, not {count}"
                         ),
@@ -264,12 +284,12 @@ where
                 Some(parent_node) => {
                     // retarget to write over the parent next
                     writing_over_node = parent_node;
-                    writing_over_kind = NodeKind::Internal;
-
-                    debug_assert!(invariants::separator_keys_ascend(&parent_entries));
-                    entries_to_write = parent_entries.into_untyped();
                 }
             }
+            writing_over_kind = NodeKind::Internal;
+
+            debug_assert!(invariants::separator_keys_ascend(&parent_entries));
+            entries_to_write = parent_entries.into_untyped();
         }
     }
 }
