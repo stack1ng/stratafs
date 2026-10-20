@@ -126,6 +126,25 @@ fn replaces_resize_only_their_entry() {
 }
 
 #[test]
+fn split_off_keeps_the_front_and_returns_the_back() {
+    let mut front = list_of::<u16>(&[b"ab", b"cde", b"f", b"ghij"]);
+    let back = front.split_off(2);
+    assert_eq!(&front.into_inner()[..], stored::<u16>(b"abcde", &[0, 2]));
+    assert_eq!(&back.into_inner()[..], stored::<u16>(b"fghij", &[0, 1]));
+}
+
+#[test]
+fn split_off_at_either_end_leaves_one_side_empty() {
+    let mut front = list_of::<u16>(&[b"ab", b"cde"]);
+    let back = front.split_off(2);
+    assert_eq!(entries(&front), [&b"ab"[..], b"cde"]);
+    assert_eq!(&back.into_inner()[..], stored::<u16>(b"", &[]));
+    let back = front.split_off(0);
+    assert_eq!(&front.into_inner()[..], stored::<u16>(b"", &[]));
+    assert_eq!(entries(&back), [&b"ab"[..], b"cde"]);
+}
+
+#[test]
 fn zeroed_edits_hand_back_their_entry_cleared() {
     let mut list = list_of::<u16>(&[b"ab", b"cde"]);
     let inserted = list.insert_zeroed(1, 3);
@@ -278,6 +297,14 @@ fn removing_past_the_end_panics() {
 #[should_panic(expected = "replace index 1 is past the end of a list of 1")]
 fn replacing_past_the_end_panics() {
     edit_panics_without_changing::<u16>(&stored::<u16>(b"a", &[0]), |list| list.replace(1, b"b"));
+}
+
+#[test]
+#[should_panic(expected = "split index 2 is past the end of a list of 1")]
+fn splitting_past_the_end_panics() {
+    edit_panics_without_changing::<u16>(&stored::<u16>(b"a", &[0]), |list| {
+        list.split_off(2);
+    });
 }
 
 fn the_largest_stored_address_is_the_max<R: AddressableRange>() {
@@ -448,6 +475,7 @@ enum Edit {
     Insert(usize, Vec<u8>),
     Remove(usize),
     Replace(usize, Vec<u8>),
+    SplitOff(usize),
 }
 
 fn edit() -> impl Strategy<Value = Edit> {
@@ -457,6 +485,7 @@ fn edit() -> impl Strategy<Value = Edit> {
         any::<usize>().prop_map(Edit::Remove),
         (any::<usize>(), vec(any::<u8>(), 0..24))
             .prop_map(|(index, entry)| Edit::Replace(index, entry)),
+        any::<usize>().prop_map(Edit::SplitOff),
     ]
 }
 
@@ -486,6 +515,12 @@ fn edits_match_a_vector_of_entries<R: AddressableRange>(
                     list.replace(index, &entry);
                     model[index] = entry;
                 }
+            }
+            Edit::SplitOff(index) => {
+                let index = index % (model.len() + 1);
+                let back =
+                    SlottedList::<_, [u8], R>::new(list.split_off(index).into_inner()).unwrap();
+                prop_assert_eq!(entries(&back), model.split_off(index));
             }
             Edit::Insert(..) | Edit::Remove(_) | Edit::Replace(..) => {}
         }

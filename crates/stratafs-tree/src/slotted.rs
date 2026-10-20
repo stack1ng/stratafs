@@ -211,6 +211,37 @@ where
         self.set_count(count - 1);
     }
 
+    // split_off has the same semantics as Vec::split_off: this list keeps the entries [0, index),
+    // and the returned list holds the entries [index, len). It panics if index is past the end.
+    pub(crate) fn split_off(&mut self, index: usize) -> Self {
+        let (data_length, count) = self.lengths();
+        assert!(
+            index <= count,
+            "split index {index} is past the end of a list of {count}"
+        );
+        let at = self
+            .entry_range(index)
+            .map_or(data_length, |first| first.start);
+        let moved_starts = &self.parts().1[index..];
+        let mut back = BytesMut::with_capacity(
+            data_length - at + (moved_starts.len() + 1) * Self::ADDRESS_LENGTH,
+        );
+        back.extend_from_slice(&self.bytes[at..data_length]);
+        for start in moved_starts {
+            back.extend_from_slice(address::<R>(R::decode(start) - at).as_bytes());
+        }
+        back.extend_from_slice(address::<R>(count - index).as_bytes());
+        self.bytes
+            .copy_within(data_length..data_length + index * Self::ADDRESS_LENGTH, at);
+        self.bytes.truncate(at + (index + 1) * Self::ADDRESS_LENGTH);
+        self.set_count(index);
+        Self {
+            bytes: back,
+            entry: PhantomData,
+            address: PhantomData,
+        }
+    }
+
     pub(crate) fn replace(&mut self, index: usize, entry: &T) {
         let entry = entry.as_bytes();
         let space = self.replace_space(index, entry.len());
