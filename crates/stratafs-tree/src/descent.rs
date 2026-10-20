@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use equivalent::Comparable;
+use smallvec::SmallVec;
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
 use crate::error::TreeFailure;
@@ -12,6 +13,7 @@ use crate::tree::TreeConfig;
 use crate::volume::TreeTransaction;
 
 const MAX_DEPTH: usize = 64;
+const INLINE_DEPTH: usize = 8;
 
 pub(crate) struct DescentStep<R, T: ?Sized, P> {
     pub(crate) node: ObservedNode,
@@ -19,8 +21,10 @@ pub(crate) struct DescentStep<R, T: ?Sized, P> {
     pub(crate) position: P,
 }
 
+pub(crate) type DescentSteps<R> = SmallVec<[DescentStep<R, InternalEntry, usize>; INLINE_DEPTH]>;
+
 pub(crate) struct DescentPath<R: AddressableRange> {
-    pub(crate) steps: Vec<DescentStep<R, InternalEntry, usize>>,
+    pub(crate) steps: DescentSteps<R>,
     pub(crate) destination: DescentStep<
         R,
         LeafEntry<R>,
@@ -45,7 +49,7 @@ where
         [u8]: Comparable<Q>,
     {
         let root = self.get_volume_header().await?.root;
-        let mut steps = Vec::new();
+        let mut steps = SmallVec::new();
         let destination = self.descend_from(root, &mut steps, target).await?;
         Ok(DescentPath { steps, destination })
     }
@@ -53,7 +57,7 @@ where
     async fn descend_from<Q: ?Sized>(
         &self,
         start: NodeId,
-        steps: &mut Vec<DescentStep<C::Range, InternalEntry, usize>>,
+        steps: &mut DescentSteps<C::Range>,
         target: &Q,
     ) -> Result<
         DescentStep<C::Range, LeafEntry<C::Range>, Result<usize, usize>>,

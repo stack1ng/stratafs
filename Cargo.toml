@@ -25,6 +25,7 @@ opendal = { version = "0.59.4", default-features = false }
 proptest = { version = "1.5", default-features = false, features = ["std"] }
 send_wrapper = { version = "0.6", features = ["futures"] }
 shuttle = "0.9.7"
+smallvec = { version = "1.16", features = ["union"] }
 stateright = "0.31"
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }

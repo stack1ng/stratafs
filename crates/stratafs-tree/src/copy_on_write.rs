@@ -4,7 +4,7 @@ use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
 use zerocopy::FromBytes;
 use zerocopy::little_endian::U128;
 
-use crate::descent::DescentStep;
+use crate::descent::DescentSteps;
 use crate::error::TreeFailure;
 use crate::header::{NodeId, VolumeHeader};
 use crate::invariants;
@@ -60,7 +60,7 @@ where
     // It also handles splitting/merging during the same pass.
     pub(crate) async fn write_over(
         &mut self,
-        steps: Vec<DescentStep<C::Range, InternalEntry, usize>>,
+        steps: DescentSteps<C::Range>,
         node: ObservedNode,
         desired_entries: SlottedList<BytesMut, LeafEntry<C::Range>, C::Range>,
     ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
@@ -73,7 +73,7 @@ where
     // write_upward is a little helper to remove all the immutable param identifiers from scope, purely for ergonomics.
     async fn write_upward(
         &mut self,
-        mut ancestry: Vec<DescentStep<C::Range, InternalEntry, usize>>,
+        mut ancestry: DescentSteps<C::Range>,
         mut writing_over_node: ObservedNode,
         mut writing_over_kind: NodeKind,
         mut entries_to_write: SlottedList<BytesMut, [u8], C::Range>,

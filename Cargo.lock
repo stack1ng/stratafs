@@ -1469,6 +1469,7 @@ dependencies = [
  "futures-lite",
  "proptest",
  "redb",
+ "smallvec",
  "storekey",
  "stratafs-redb",
  "stratafs-store",
