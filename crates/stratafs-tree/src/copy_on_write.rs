@@ -260,6 +260,10 @@ where
                     ParentEdit::Remove { at } => {
                         parent_entries.remove(at);
                         adjust_future_slots(&mut parent_edits[i + 1..], |future_at| {
+                            debug_assert_ne!(
+                                *future_at, at,
+                                "a later edit should not target the removed slot"
+                            );
                             if *future_at > at {
                                 *future_at -= 1;
                             }
