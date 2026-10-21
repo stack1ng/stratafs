@@ -8,11 +8,8 @@ license.workspace = true
 [dependencies]
 blake3.workspace = true
 bytes.workspace = true
-derive_more.workspace = true
 futures-core.workspace = true
-impl-trait-for-tuples.workspace = true
 thiserror.workspace = true
-vec1.workspace = true
 
 [lints]
 workspace = true

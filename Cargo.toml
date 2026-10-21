@@ -13,14 +13,12 @@ blake3 = "1.8"
 blocking = "1.7"
 bytes = "1.12"
 cfg_aliases = "0.2"
-derive_more = { version = "2.1", features = ["from", "try_into"] }
 equivalent = "1.0"
 event-listener = "5.4"
 futures-channel = "0.3.34"
 futures-core = "0.3.34"
 futures-lite = "2.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
-impl-trait-for-tuples = "0.2.3"
 opendal = { version = "0.59.4", default-features = false }
 proptest = { version = "1.5", default-features = false, features = ["std"] }
 send_wrapper = { version = "0.6", features = ["futures"] }
@@ -33,7 +31,6 @@ stratafs-redb = { path = "crates/stratafs-redb" }
 stratafs-store = { path = "crates/stratafs-store" }
 storekey = "0.11"
 thiserror = "2.0"
-vec1 = "1.12"
 xxhash-rust = { version = "0.8", features = ["const_xxh32"] }
 zerocopy = { version = "0.8", features = ["alloc", "derive"] }
 
