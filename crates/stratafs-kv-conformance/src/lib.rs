@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod durability;
 mod execute;
+mod forking;
 mod model;
 mod observation_lifecycle;
 pub mod runtime;
@@ -15,10 +16,12 @@ use futures_lite::future::block_on;
 use futures_util::FutureExt;
 use proptest::prelude::any;
 use proptest::proptest;
+use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
 
 use crate::activity::{simulated_client_activity, simulated_client_transactions, simulated_stop};
 use crate::durability::{CrashableStorage, simulate_and_reopen};
+use crate::forking::simulate_and_fork;
 use crate::observation_lifecycle::{
     KeyChange, Observations, ObserverOutcome, ObservingTransaction, change_key,
     count_suspensions_on_a_fresh_store, observe, run_observation_scenario,
@@ -166,6 +169,32 @@ pub fn is_durable<R, S, C>(
             simulated_client_activity_after_reopen,
             seed,
             stop,
+        )?;
+    });
+}
+
+pub fn forks_stay_isolated<R, F>(
+    runtime: R,
+    new_forkable_store: impl Fn() -> F + Send + Sync + 'static,
+) where
+    R: ReplayingRuntime,
+    F: ForkableKeyValueStore,
+    F::Volume: 'static,
+{
+    let new_forkable_store = Arc::new(new_forkable_store);
+    proptest!(|(
+        simulated_client_activity_before_fork in simulated_client_activity(),
+        simulated_client_activity_on_source in simulated_client_activity(),
+        simulated_client_activity_on_fork in simulated_client_activity(),
+        seed in any::<u64>(),
+    )| {
+        simulate_and_fork(
+            &runtime,
+            new_forkable_store.clone(),
+            simulated_client_activity_before_fork,
+            simulated_client_activity_on_source,
+            simulated_client_activity_on_fork,
+            seed,
         )?;
     });
 }

@@ -116,7 +116,7 @@ where
     .await?;
     drop(store);
     let reopened = reopen(storage);
-    let reopened_model = read_reopened_store(&reopened, &history, final_client).await?;
+    let reopened_model = read_whole_store(&reopened, &history, final_client).await?;
     let before_reopen = std::mem::take(&mut *history.lock().unwrap());
     let after_reopen = run_simulated_client_activity(
         replay,
@@ -262,7 +262,7 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
     Ok(())
 }
 
-async fn read_reopened_store<S: KeyValueStore>(
+pub(crate) async fn read_whole_store<S: KeyValueStore>(
     store: &S,
     history: &Mutex<Vec<Event>>,
     final_client: usize,
@@ -290,9 +290,7 @@ async fn read_reopened_store<S: KeyValueStore>(
             Box::pin(async move { transaction.get_range(.., usize::MAX).await })
         })
         .await
-        .map_err(|error| {
-            TestCaseError::fail(format!("reading the reopened store failed: {error}"))
-        })?;
+        .map_err(|error| TestCaseError::fail(format!("reading the whole store failed: {error}")))?;
     history.lock().unwrap().push(Event::Returned(
         id,
         Outcome::Completed(vec![Seen::GetRange(entries.clone())]),

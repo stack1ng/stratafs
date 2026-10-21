@@ -98,3 +98,13 @@ fn observation_lifecycle_across_small_nodes() {
         open_volume::<SmallNodeConfig>,
     );
 }
+
+#[test]
+fn forks_stay_isolated_in_a_single_leaf() {
+    stratafs_kv_conformance::forks_stay_isolated(seeded(), new_tree::<SingleLeafConfig>);
+}
+
+#[test]
+fn forks_stay_isolated_across_small_nodes() {
+    stratafs_kv_conformance::forks_stay_isolated(seeded(), new_tree::<SmallNodeConfig>);
+}
