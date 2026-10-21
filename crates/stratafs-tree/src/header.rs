@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::ops::AddAssign;
 
 use bytes::Bytes;
 use storekey::{Encode, EncodeError, Writer};
@@ -50,6 +51,12 @@ impl SerializedShape for NodeId {
 )]
 #[repr(transparent)]
 pub(crate) struct VolumeEpoch(pub(crate) U64);
+
+impl AddAssign<u64> for VolumeEpoch {
+    fn add_assign(&mut self, increment: u64) {
+        self.0 += increment;
+    }
+}
 
 impl SerializedShape for VolumeEpoch {
     const FINGERPRINT: u32 = xxh32(

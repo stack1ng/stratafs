@@ -105,6 +105,15 @@ pub(crate) fn with_tree_failure<R, F>(
     }
 }
 
+fn refused_write_as_failure<F, R>(
+    error: StoreError<SetRejection<R>, TreeFailure<F, R>>,
+) -> TreeFailure<F, R> {
+    match error {
+        StoreError::Failed(failure) => failure,
+        StoreError::Rejected(rejection) => TreeFailure::RefusedWrite(rejection),
+    }
+}
+
 impl<S, A, C> KeyValueStore for TreeVolume<S, A, C>
 where
     S: KeyValueStore,
@@ -265,10 +274,7 @@ where
             target_leaf,
         )
         .await
-        .map_err(|error| match error {
-            StoreError::Failed(failure) => failure,
-            StoreError::Rejected(rejection) => TreeFailure::RefusedWrite(rejection),
-        })
+        .map_err(refused_write_as_failure)
     }
 }
 
@@ -282,6 +288,22 @@ where
     type VolumeId = TreeVolumeId;
 
     async fn fork(&mut self) -> Result<TreeVolumeId, Self::Failure> {
-        todo!()
+        let mut from_header = self.get_volume_header().await?;
+        from_header.epoch += 1;
+        self.set_volume_header(from_header)
+            .await
+            .map_err(refused_write_as_failure)?;
+
+        let new_volume = TreeVolumeId((self.shared.id_allocator)());
+        self.inner
+            .set(
+                TreeKey::VolumeHeader(new_volume).into(),
+                Bytes::from(&from_header),
+            )
+            .await
+            .map_err(with_tree_failure)
+            .map_err(refused_write_as_failure)?;
+
+        Ok(new_volume)
     }
 }
