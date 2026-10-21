@@ -1,4 +1,5 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+use futures_util::future::{OptionFuture, join};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
 use zerocopy::FromBytes;
@@ -29,10 +30,23 @@ pub(crate) enum LayerMutationPlanAction<R: AddressableRange> {
         at: usize,
         entries: SlottedList<BytesMut, [u8], R>,
     },
+    // Replace is the same as Update, except is makes the parent update its selector to separator
+    Replace {
+        node: ObservedNode,
+        at: usize,
+        separator: Box<[u8]>,
+        entries: SlottedList<BytesMut, [u8], R>,
+    },
     Delete {
         node: ObservedNode,
         at: usize,
     },
+}
+
+#[derive(Clone, Copy)]
+enum NeighborSide {
+    Left,
+    Right,
 }
 
 enum ParentEdit<'plan> {
@@ -47,6 +61,37 @@ enum ParentEdit<'plan> {
     Remove {
         at: usize,
     },
+    Replace {
+        at: usize,
+        separator: &'plan [u8],
+        child: NodeId,
+    },
+}
+
+fn separator_for_parent<R: AddressableRange>(
+    kind: NodeKind,
+    right_half: SlottedList<BytesMut, [u8], R>,
+) -> Result<(Box<[u8]>, SlottedList<BytesMut, [u8], R>), CorruptValue> {
+    let first_entry = right_half
+        .get(0)
+        .expect("a split leaves both halves with entries")?;
+    match kind {
+        NodeKind::Leaf => {
+            let (key, _) = LeafEntry::<R>::ref_from_bytes(first_entry)
+                .map_err(|_| CorruptValue::WrongLength)?
+                .key_and_value()?;
+            let separator = Box::from(key);
+            Ok((separator, right_half))
+        }
+        NodeKind::Internal => {
+            let first_entry = InternalEntry::ref_from_bytes(first_entry)
+                .map_err(|_| CorruptValue::WrongLength)?;
+            let (child, separator) = (first_entry.child, Box::from(&first_entry.key));
+            let mut right_half = right_half.into_typed::<InternalEntry>();
+            right_half.replace_entry(0, child, LEFTMOST_SEPARATOR);
+            Ok((separator, right_half.into_untyped()))
+        }
+    }
 }
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
@@ -100,32 +145,13 @@ where
             let plan: [Option<LayerMutationPlanAction<C::Range>>; 2] = match node_size {
                 size if size > C::NODE_CAPACITY => {
                     // handle splitting a node
-                    let split_at: usize = entries_to_write.midpoint_by_size(); // placeholder
+                    let split_at: usize = entries_to_write.midpoint_by_size();
 
-                    let mut right_half = entries_to_write.split_off(split_at);
-                    let first_entry = right_half
-                        .get(0)
-                        .expect("an overfull node splits into two non-empty halves")
-                        .map_err(TreeFailure::Corrupt)?;
-                    let separator: Box<[u8]> = match writing_over_kind {
-                        NodeKind::Leaf => {
-                            let (key, _) = LeafEntry::<C::Range>::ref_from_bytes(first_entry)
-                                .map_err(|_| TreeFailure::Corrupt(CorruptValue::WrongLength))?
-                                .key_and_value()
-                                .map_err(TreeFailure::Corrupt)?;
-                            key.into()
-                        }
-                        NodeKind::Internal => {
-                            let first_entry = InternalEntry::ref_from_bytes(first_entry)
-                                .map_err(|_| TreeFailure::Corrupt(CorruptValue::WrongLength))?;
-                            let (child, separator) =
-                                (first_entry.child, Box::from(&first_entry.key));
-                            let mut internal_entries = right_half.into_typed::<InternalEntry>();
-                            internal_entries.replace_entry(0, child, LEFTMOST_SEPARATOR);
-                            right_half = internal_entries.into_untyped();
-                            separator
-                        }
-                    };
+                    let (separator, right_half) = separator_for_parent(
+                        writing_over_kind,
+                        entries_to_write.split_off(split_at),
+                    )
+                    .map_err(TreeFailure::Corrupt)?;
 
                     [
                         Some(LayerMutationPlanAction::Update {
@@ -139,8 +165,171 @@ where
                         }),
                     ]
                 }
-                size if size < C::MERGE_BELOW_SIZE && parent.is_some() => {
-                    todo!("implement merge")
+                size if size < C::MERGE_BELOW_SIZE
+                    && let Some(parent) = &parent =>
+                {
+                    // merge the current node into its least loaded neighbor
+                    let left_at = parent.position.checked_sub(1);
+                    let right_at =
+                        Some(parent.position + 1).filter(|&at| at < parent.entries.len());
+                    let inner = &self.inner;
+                    let read_neighbor = |side: NeighborSide, at: usize| async move {
+                        let id = parent
+                            .entries
+                            .get(at)
+                            .expect("the neighbor's slot is in the parent")
+                            .map_err(TreeFailure::Corrupt)?
+                            .child;
+                        let stored = inner
+                            .get(TreeKey::Node(id).into())
+                            .await
+                            .map_err(TreeFailure::Store)?
+                            .ok_or(TreeFailure::Corrupt(CorruptValue::MissingNode))?;
+                        let (epoch, node) =
+                            Node::<Bytes, C::Range>::read(stored).map_err(TreeFailure::Corrupt)?;
+                        debug_assert!(matches!(
+                            (&node, writing_over_kind),
+                            (Node::Leaf(_), NodeKind::Leaf)
+                                | (Node::Internal(_), NodeKind::Internal)
+                        ));
+                        let entries = match node {
+                            Node::Leaf(entries) => entries.into_untyped(),
+                            Node::Internal(entries) => entries.into_untyped(),
+                        };
+                        Ok::<_, TreeFailure<T::Failure, S::Rejection>>((
+                            side,
+                            at,
+                            ObservedNode { id, epoch },
+                            entries,
+                        ))
+                    };
+                    let (left_neighbor, right_neighbor) = join(
+                        OptionFuture::from(left_at.map(|at| read_neighbor(NeighborSide::Left, at))),
+                        OptionFuture::from(
+                            right_at.map(|at| read_neighbor(NeighborSide::Right, at)),
+                        ),
+                    )
+                    .await;
+                    let (side, neighbor_at, neighbor, neighbor_entries) =
+                        [left_neighbor.transpose()?, right_neighbor.transpose()?]
+                            .into_iter()
+                            .flatten()
+                            .min_by_key(|(_, _, _, entries)| entries.stored_length())
+                            .expect("a node with a parent always has a sibling");
+
+                    // combine the 2 entry lists then split, to evenly distribute the load between them
+                    let with_separator_brought_down =
+                        |right: SlottedList<BytesMut, [u8], C::Range>, right_at: usize| {
+                            match writing_over_kind {
+                                NodeKind::Leaf => Ok(right),
+                                NodeKind::Internal => {
+                                    let separator = &parent
+                                        .entries
+                                        .get(right_at)
+                                        .expect("the right node's slot is in the parent")
+                                        .map_err(TreeFailure::Corrupt)?
+                                        .key;
+                                    let mut right = right.into_typed::<InternalEntry>();
+                                    let child = right
+                                        .get(0)
+                                        .expect("an internal node being merged has a child")
+                                        .map_err(TreeFailure::Corrupt)?
+                                        .child;
+                                    right.replace_entry(0, child, separator);
+                                    Ok::<_, TreeFailure<T::Failure, S::Rejection>>(
+                                        right.into_untyped(),
+                                    )
+                                }
+                            }
+                        };
+                    let mut combined_entries = match side {
+                        NeighborSide::Left => {
+                            let right =
+                                with_separator_brought_down(entries_to_write, parent.position)?;
+                            let mut combined =
+                                SlottedList::<BytesMut, [u8], C::Range>::from(neighbor_entries);
+                            combined.extend_from_list(&right);
+                            combined
+                        }
+                        NeighborSide::Right => {
+                            let right = with_separator_brought_down(
+                                SlottedList::from(neighbor_entries),
+                                neighbor_at,
+                            )?;
+                            entries_to_write.extend_from_list(&right);
+                            entries_to_write
+                        }
+                    };
+                    let ((left_node, left_node_at), (right_node, right_node_at)) = match side {
+                        NeighborSide::Left => {
+                            ((neighbor, neighbor_at), (writing_over_node, current_at))
+                        }
+                        NeighborSide::Right => {
+                            ((writing_over_node, current_at), (neighbor, neighbor_at))
+                        }
+                    };
+                    match size_of::<NodeHeader>() + combined_entries.stored_length() {
+                        // redistribute between the 2 nodes
+                        size if size > C::NODE_CAPACITY => {
+                            let split_at = combined_entries.midpoint_by_size();
+                            let (separator, right_half) = separator_for_parent(
+                                writing_over_kind,
+                                combined_entries.split_off(split_at),
+                            )
+                            .map_err(TreeFailure::Corrupt)?;
+                            [
+                                Some(LayerMutationPlanAction::Update {
+                                    node: left_node,
+                                    at: left_node_at,
+                                    entries: combined_entries, // after the split off this is now the left half
+                                }),
+                                Some(LayerMutationPlanAction::Replace {
+                                    node: right_node,
+                                    at: right_node_at,
+                                    separator,
+                                    entries: right_half,
+                                }),
+                            ]
+                        }
+                        // move all entries into one node
+                        _ => [
+                            Some(LayerMutationPlanAction::Update {
+                                node: left_node,
+                                at: left_node_at,
+                                entries: combined_entries,
+                            }),
+                            Some(LayerMutationPlanAction::Delete {
+                                node: right_node,
+                                at: right_node_at,
+                            }),
+                        ],
+                    }
+                }
+                _ if writing_over_kind == NodeKind::Internal
+                    && parent.is_none()
+                    && entries_to_write.len() == 1 =>
+                {
+                    // handle the root node collapsing (aka when the root nodes children have (over time) merged into 1
+                    let only_child = InternalEntry::ref_from_bytes(
+                        entries_to_write
+                            .get(0)
+                            .expect("the list has one entry")
+                            .map_err(TreeFailure::Corrupt)?,
+                    )
+                    .map_err(|_| TreeFailure::Corrupt(CorruptValue::WrongLength))?
+                    .child;
+                    if writing_over_node.epoch == volume.epoch {
+                        self.inner
+                            .clear(TreeKey::Node(writing_over_node.id).into())
+                            .await
+                            .map_err(TreeFailure::Store)?;
+                    }
+                    self.set_volume_header(VolumeHeader {
+                        root: only_child,
+                        epoch: volume.epoch,
+                    })
+                    .await?;
+                    return Ok(());
                 }
                 _ => [
                     Some(LayerMutationPlanAction::Update {
@@ -158,7 +347,10 @@ where
             let mut parent_edits: [Option<ParentEdit>; 2] = [None, None];
             for (i, action) in plan.iter().flatten().enumerate() {
                 match action {
-                    LayerMutationPlanAction::Update { node, at, entries } => {
+                    LayerMutationPlanAction::Update { node, at, entries }
+                    | LayerMutationPlanAction::Replace {
+                        node, at, entries, ..
+                    } => {
                         let target = match volume.epoch {
                             current_epoch if current_epoch == node.epoch => node.id,
                             _ => NodeId(U128::new((self.shared.id_allocator)())),
@@ -177,12 +369,20 @@ where
                             )
                             .await
                             .map_err(with_tree_failure)?;
-                        if node.id != target {
-                            parent_edits[i] = Some(ParentEdit::Retarget {
+                        parent_edits[i] = match action {
+                            LayerMutationPlanAction::Replace { separator, .. } => {
+                                Some(ParentEdit::Replace {
+                                    at: *at,
+                                    separator,
+                                    child: target,
+                                })
+                            }
+                            _ if node.id != target => Some(ParentEdit::Retarget {
                                 at: *at,
                                 to: target,
-                            })
-                        }
+                            }),
+                            _ => None,
+                        };
                     }
                     LayerMutationPlanAction::Create { separator, entries } => {
                         let target = NodeId(U128::new((self.shared.id_allocator)()));
@@ -245,9 +445,9 @@ where
                 ) {
                     for future_edit in future_edits.iter_mut().flatten() {
                         match future_edit {
-                            ParentEdit::Retarget { at, .. } | ParentEdit::Remove { at } => {
-                                adjust(at)
-                            }
+                            ParentEdit::Retarget { at, .. }
+                            | ParentEdit::Remove { at }
+                            | ParentEdit::Replace { at, .. } => adjust(at),
                             ParentEdit::Insert { .. } => {}
                         }
                     }
@@ -279,6 +479,11 @@ where
                             }
                         });
                     }
+                    ParentEdit::Replace {
+                        at,
+                        separator,
+                        child,
+                    } => parent_entries.replace_entry(at, child, separator),
                     ParentEdit::Remove { at } => {
                         parent_entries.remove(at);
                         adjust_future_slots(&mut parent_edits[i + 1..], |future_at| {

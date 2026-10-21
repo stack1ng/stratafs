@@ -70,6 +70,14 @@ fn a_plan_must_observe_each_node_once() {
             entries: untyped(),
         })
     };
+    let replace = |id| {
+        Some(LayerMutationPlanAction::Replace {
+            node: observed(id),
+            at: 0,
+            separator: Box::from(&b"m"[..]),
+            entries: untyped(),
+        })
+    };
     assert!(plan_has_at_most_one_action_per_node::<u16>(&[
         update(1),
         None
@@ -89,5 +97,13 @@ fn a_plan_must_observe_each_node_once() {
     assert!(!plan_has_at_most_one_action_per_node::<u16>(&[
         update(1),
         update(1)
+    ]));
+    assert!(plan_has_at_most_one_action_per_node::<u16>(&[
+        update(1),
+        replace(2)
+    ]));
+    assert!(!plan_has_at_most_one_action_per_node::<u16>(&[
+        update(1),
+        replace(1)
     ]));
 }

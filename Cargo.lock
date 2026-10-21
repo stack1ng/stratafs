@@ -1467,6 +1467,7 @@ dependencies = [
  "equivalent",
  "futures-core",
  "futures-lite",
+ "futures-util",
  "proptest",
  "redb",
  "smallvec",

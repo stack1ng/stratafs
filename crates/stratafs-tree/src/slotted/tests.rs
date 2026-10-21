@@ -135,6 +135,29 @@ fn split_off_keeps_the_front_and_returns_the_back() {
 }
 
 #[test]
+fn extend_from_list_copies_the_other_lists_entries_onto_the_end() {
+    let mut front = list_of::<u16>(&[b"ab", b"cde"]);
+    let back_bytes = list_of::<u16>(&[b"f", b"ghij"]).into_inner().freeze();
+    let back = SlottedList::<Bytes, [u8], u16>::new(back_bytes.clone()).unwrap();
+    front.extend_from_list(&back);
+    assert_eq!(
+        &front.into_inner()[..],
+        stored::<u16>(b"abcdefghij", &[0, 2, 5, 6])
+    );
+    assert_eq!(back.into_inner(), back_bytes);
+}
+
+#[test]
+fn extend_from_list_with_an_empty_side() {
+    let mut list = list_of::<u16>(&[b"ab", b"cde"]);
+    list.extend_from_list(&list_of::<u16>(&[]));
+    assert_eq!(entries(&list), [&b"ab"[..], b"cde"]);
+    let mut empty = list_of::<u16>(&[]);
+    empty.extend_from_list(&list);
+    assert_eq!(entries(&empty), [&b"ab"[..], b"cde"]);
+}
+
+#[test]
 fn split_off_at_either_end_leaves_one_side_empty() {
     let mut front = list_of::<u16>(&[b"ab", b"cde"]);
     let back = front.split_off(2);
@@ -452,6 +475,12 @@ fn replaced_entry_data_cannot_outgrow_the_range<R: AddressableRange>() {
     });
 }
 
+fn extended_entry_data_cannot_outgrow_the_range<R: AddressableRange>() {
+    edit_panics_without_changing::<R>(&stored::<R>(&vec![0; R::MAX], &[0]), |list| {
+        list.extend_from_list(&list_of::<R>(&[b"x"]))
+    });
+}
+
 fn entry_count_can_fill_the_range<R: AddressableRange>() {
     let mut list = editable::<R>(&stored::<R>(b"", &vec![0; R::MAX - 1]));
     list.insert(0, b"");
@@ -495,6 +524,12 @@ macro_rules! limit_tests {
             }
 
             #[test]
+            #[should_panic(expected = "bytes of entry data")]
+            fn extended_entry_data_cannot_outgrow_the_range() {
+                super::extended_entry_data_cannot_outgrow_the_range::<$range>();
+            }
+
+            #[test]
             fn entry_count_can_fill_the_range() {
                 super::entry_count_can_fill_the_range::<$range>();
             }
@@ -516,6 +551,7 @@ enum Edit {
     Remove(usize),
     Replace(usize, Vec<u8>),
     SplitOff(usize),
+    ExtendFromList(Vec<Vec<u8>>),
 }
 
 fn edit() -> impl Strategy<Value = Edit> {
@@ -526,6 +562,7 @@ fn edit() -> impl Strategy<Value = Edit> {
         (any::<usize>(), vec(any::<u8>(), 0..24))
             .prop_map(|(index, entry)| Edit::Replace(index, entry)),
         any::<usize>().prop_map(Edit::SplitOff),
+        vec(vec(any::<u8>(), 0..24), 0..4).prop_map(Edit::ExtendFromList),
     ]
 }
 
@@ -562,7 +599,16 @@ fn edits_match_a_vector_of_entries<R: AddressableRange>(
                     SlottedList::<_, [u8], R>::new(list.split_off(index).into_inner()).unwrap();
                 prop_assert_eq!(entries(&back), model.split_off(index));
             }
-            Edit::Insert(..) | Edit::Remove(_) | Edit::Replace(..) => {}
+            Edit::ExtendFromList(others)
+                if data_length + others.iter().map(Vec::len).sum::<usize>() <= R::MAX
+                    && model.len() + others.len() <= R::MAX =>
+            {
+                list.extend_from_list(&list_of::<R>(
+                    &others.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                ));
+                model.extend(others);
+            }
+            Edit::Insert(..) | Edit::Remove(_) | Edit::Replace(..) | Edit::ExtendFromList(_) => {}
         }
         list = SlottedList::new(list.into_inner()).unwrap();
         prop_assert_eq!(&entries(&list), &model);

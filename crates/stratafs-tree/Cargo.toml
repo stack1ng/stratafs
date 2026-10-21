@@ -9,6 +9,7 @@ license.workspace = true
 bytes.workspace = true
 equivalent.workspace = true
 futures-core.workspace = true
+futures-util.workspace = true
 smallvec.workspace = true
 storekey.workspace = true
 stratafs-store.workspace = true

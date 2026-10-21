@@ -244,6 +244,30 @@ where
         self.set_count(count - 1);
     }
 
+    // extend_from_list has the same semantics as Vec::extend_from_slice: it copies the other list's entries
+    // onto the end of this list, and leaves the other list unchanged.
+    pub(crate) fn extend_from_list<B: AsRef<[u8]>>(&mut self, other: &SlottedList<B, T, R>) {
+        let (data_length, count) = self.lengths();
+        let (other_data, other_starts) = other.parts();
+        assert!(
+            data_length + other_data.len() <= R::MAX && count + other_starts.len() <= R::MAX,
+            "a slotted list holds at most {max} entries and {max} bytes of entry data",
+            max = R::MAX
+        );
+        let slots = data_length..data_length + count * Self::ADDRESS_LENGTH;
+        self.bytes.resize(
+            self.bytes.len() + other_data.len() + other_starts.len() * Self::ADDRESS_LENGTH,
+            0,
+        );
+        self.bytes
+            .copy_within(slots, data_length + other_data.len());
+        self.bytes[data_length..data_length + other_data.len()].copy_from_slice(other_data);
+        self.set_count(count + other_starts.len());
+        for (slot, start) in self.starts_mut()[count..].iter_mut().zip(other_starts) {
+            *slot = address::<R>(R::decode(start) + data_length);
+        }
+    }
+
     // split_off has the same semantics as Vec::split_off: this list keeps the entries [0, index),
     // and the returned list holds the entries [index, len). It panics if index is past the end.
     pub(crate) fn split_off(&mut self, index: usize) -> Self {
