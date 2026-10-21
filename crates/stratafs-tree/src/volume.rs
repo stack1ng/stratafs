@@ -121,7 +121,7 @@ where
 {
     type Rejection = S::Rejection;
     type Failure = TreeFailure<S::Failure, S::Rejection>;
-    type Observation = BranchWatch;
+    type Observation = BranchWatch<S::Observation>;
     type ReadTransaction<'txn> = TreeTransaction<'txn, S::ReadTransaction<'txn>, S, A, C>;
     type Transaction<'txn> = TreeTransaction<'txn, S::Transaction<'txn>, S, A, C>;
 
@@ -169,7 +169,16 @@ where
     C: TreeConfig,
 {
     type Failure = TreeFailure<T::Failure, S::Rejection>;
-    type Observation = BranchWatch;
+    type Observation = BranchWatch<T::Observation>;
+
+    async fn get(&self, key: Bytes) -> Result<Option<Bytes>, Self::Failure> {
+        let descent = self.descend(&key).await?;
+        Ok(descent
+            .destination
+            .found_value()
+            .map_err(TreeFailure::Corrupt)?
+            .map(|value| descent.destination.entries.get_ref().slice_ref(value)))
+    }
 
     // get_range is implemented by walking the tree. The returned Bytes
     // are all pinned to their containing leaf node's buffer, so for any long lived usage, they should be copied.
@@ -212,7 +221,8 @@ where
     }
 
     async fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure> {
-        self.observe_branch(key).await
+        let descent = self.descend(&key).await?;
+        self.observe_branch(key, &descent).await
     }
 }
 

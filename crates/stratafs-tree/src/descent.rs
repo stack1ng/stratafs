@@ -34,6 +34,20 @@ pub(crate) struct DescentPath<R: AddressableRange> {
     >,
 }
 
+impl<R: AddressableRange> DescentStep<R, LeafEntry<R>, Result<usize, usize>> {
+    pub(crate) fn found_value(&self) -> Result<Option<&[u8]>, CorruptValue> {
+        let Ok(index) = self.position else {
+            return Ok(None);
+        };
+        let entry = self
+            .entries
+            .get(index)
+            .expect("the descent found the key at this index")?;
+        let (_, value) = entry.key_and_value()?;
+        Ok(Some(value))
+    }
+}
+
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
