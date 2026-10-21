@@ -142,7 +142,10 @@ pub trait ReadKeyValueTransaction: Send + Sync {
     // observe returns an observation, which can be observed from the store (with changed())
     // to give a future that resolves once this key is in a different state
     // from what this transaction saw, after the transaction finishes.
-    fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure>;
+    fn observe(
+        &self,
+        key: Bytes,
+    ) -> impl Future<Output = Result<Self::Observation, Self::Failure>> + Send;
 }
 
 pub fn is_valid_range<T: Ord + ?Sized>(range: &impl RangeBounds<T>) -> bool {

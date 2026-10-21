@@ -398,7 +398,7 @@ async fn settle_observation_waiters<S: KeyValueStore>(
                     let key = key.clone();
                     Box::pin(async move {
                         let current = transaction.get(key.clone()).await?;
-                        Ok((current, transaction.observe(key)?))
+                        Ok((current, transaction.observe(key).await?))
                     })
                 })
                 .await

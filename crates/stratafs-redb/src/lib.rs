@@ -242,7 +242,7 @@ where
             .collect()
     }
 
-    fn observe(&self, key: Bytes) -> Result<RedbObservation, Self::Failure> {
+    async fn observe(&self, key: Bytes) -> Result<RedbObservation, Self::Failure> {
         let seen = self
             .table
             .get(&key[..])?

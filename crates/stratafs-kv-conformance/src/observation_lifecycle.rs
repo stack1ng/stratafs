@@ -157,7 +157,7 @@ async fn observe_key<T: ReadKeyValueTransaction>(
     key: &Bytes,
 ) -> Result<(Option<Bytes>, T::Observation), T::Failure> {
     let seen = transaction.get(key.clone()).await?;
-    Ok((seen, transaction.observe(key.clone())?))
+    Ok((seen, transaction.observe(key.clone()).await?))
 }
 
 async fn finish_observer_work(attempt: usize, log: &Mutex<Vec<ObservationEvent>>, panics: bool) {

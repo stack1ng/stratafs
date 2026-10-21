@@ -163,7 +163,7 @@ async fn perform_read<T: ReadKeyValueTransaction>(
             None,
         ),
         SimulatedRead::Observe(key) => {
-            let observation = transaction.observe(key.clone())?;
+            let observation = transaction.observe(key.clone()).await?;
             let seen = transaction.get(key.clone()).await?;
             (
                 Seen::Observe(seen.clone()),
