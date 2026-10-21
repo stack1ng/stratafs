@@ -12,6 +12,7 @@ use stratafs_store::kv::{
 };
 use zerocopy::KnownLayout;
 
+use crate::branch_observation::BranchWatch;
 use crate::concatenated_bytes::ConcatenatedBytes;
 use crate::error::TreeFailure;
 use crate::header::{TreeVolumeId, VolumeHeader};
@@ -31,8 +32,6 @@ pub struct TreeTransaction<'txn, T, S, A, C> {
     pub(crate) shared: Arc<TreeShared<S, A, C>>,
     pub(crate) volume: TreeVolumeId,
 }
-
-pub struct TreeObservation;
 
 impl<S, A, C> TreeVolume<S, A, C> {
     fn transaction<'txn, T>(
@@ -122,7 +121,7 @@ where
 {
     type Rejection = S::Rejection;
     type Failure = TreeFailure<S::Failure, S::Rejection>;
-    type Observation = TreeObservation;
+    type Observation = BranchWatch;
     type ReadTransaction<'txn> = TreeTransaction<'txn, S::ReadTransaction<'txn>, S, A, C>;
     type Transaction<'txn> = TreeTransaction<'txn, S::Transaction<'txn>, S, A, C>;
 
@@ -158,7 +157,7 @@ where
         &self,
         observation: Self::Observation,
     ) -> Result<(), StoreError<NotCommitted, Self::Failure>> {
-        todo!()
+        self.branch_changed(observation).await
     }
 }
 
@@ -170,7 +169,7 @@ where
     C: TreeConfig,
 {
     type Failure = TreeFailure<T::Failure, S::Rejection>;
-    type Observation = TreeObservation;
+    type Observation = BranchWatch;
 
     // get_range is implemented by walking the tree. The returned Bytes
     // are all pinned to their containing leaf node's buffer, so for any long lived usage, they should be copied.
@@ -212,8 +211,8 @@ where
         Ok(entries)
     }
 
-    fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure> {
-        todo!()
+    async fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure> {
+        self.observe_branch(key).await
     }
 }
 

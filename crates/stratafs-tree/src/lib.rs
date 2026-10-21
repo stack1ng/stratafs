@@ -1,3 +1,4 @@
+mod branch_observation;
 mod concatenated_bytes;
 mod copy_on_write;
 mod descent;
