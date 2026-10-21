@@ -2,8 +2,8 @@ use bytes::{Bytes, BytesMut};
 use futures_util::future::{OptionFuture, join};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
-use zerocopy::FromBytes;
 use zerocopy::little_endian::U128;
+use zerocopy::{FromBytes, KnownLayout};
 
 use crate::descent::DescentSteps;
 use crate::error::TreeFailure;
@@ -70,8 +70,8 @@ enum ParentEdit<'plan> {
 
 fn separator_for_parent<R: AddressableRange>(
     kind: NodeKind,
-    right_half: SlottedList<BytesMut, [u8], R>,
-) -> Result<(Box<[u8]>, SlottedList<BytesMut, [u8], R>), CorruptValue> {
+    right_half: &mut SlottedList<BytesMut, [u8], R>,
+) -> Result<Box<[u8]>, CorruptValue> {
     let first_entry = right_half
         .get(0)
         .expect("a split leaves both halves with entries")?;
@@ -80,16 +80,18 @@ fn separator_for_parent<R: AddressableRange>(
             let (key, _) = LeafEntry::<R>::ref_from_bytes(first_entry)
                 .map_err(|_| CorruptValue::WrongLength)?
                 .key_and_value()?;
-            let separator = Box::from(key);
-            Ok((separator, right_half))
+            Ok(Box::from(key))
         }
         NodeKind::Internal => {
             let first_entry = InternalEntry::ref_from_bytes(first_entry)
                 .map_err(|_| CorruptValue::WrongLength)?;
             let (child, separator) = (first_entry.child, Box::from(&first_entry.key));
-            let mut right_half = right_half.into_typed::<InternalEntry>();
-            right_half.replace_entry(0, child, LEFTMOST_SEPARATOR);
-            Ok((separator, right_half.into_untyped()))
+            let leftmost_length = InternalEntry::size_for_metadata(LEFTMOST_SEPARATOR.len())
+                .expect("an internal entry fits in memory");
+            InternalEntry::mut_from_bytes(right_half.replace_zeroed(0, leftmost_length))
+                .expect("the replaced space is sized for a leftmost entry")
+                .child = child;
+            Ok(separator)
         }
     }
 }
@@ -147,11 +149,9 @@ where
                     // handle splitting a node
                     let split_at: usize = entries_to_write.midpoint_by_size();
 
-                    let (separator, right_half) = separator_for_parent(
-                        writing_over_kind,
-                        entries_to_write.split_off(split_at),
-                    )
-                    .map_err(TreeFailure::Corrupt)?;
+                    let mut right_half = entries_to_write.split_off(split_at);
+                    let separator = separator_for_parent(writing_over_kind, &mut right_half)
+                        .map_err(TreeFailure::Corrupt)?;
 
                     [
                         Some(LayerMutationPlanAction::Update {
@@ -272,11 +272,10 @@ where
                         // redistribute between the 2 nodes
                         size if size > C::NODE_CAPACITY => {
                             let split_at = combined_entries.midpoint_by_size();
-                            let (separator, right_half) = separator_for_parent(
-                                writing_over_kind,
-                                combined_entries.split_off(split_at),
-                            )
-                            .map_err(TreeFailure::Corrupt)?;
+                            let mut right_half = combined_entries.split_off(split_at);
+                            let separator =
+                                separator_for_parent(writing_over_kind, &mut right_half)
+                                    .map_err(TreeFailure::Corrupt)?;
                             [
                                 Some(LayerMutationPlanAction::Update {
                                     node: left_node,
