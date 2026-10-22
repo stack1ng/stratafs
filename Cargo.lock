@@ -1353,6 +1353,7 @@ dependencies = [
  "bitflags 2.13.2",
  "bytes",
  "futures-core",
+ "storekey",
  "stratafs-store",
  "thiserror",
 ]

@@ -9,6 +9,7 @@ license.workspace = true
 bitflags.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
+storekey.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
 

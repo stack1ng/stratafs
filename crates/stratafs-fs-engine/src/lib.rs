@@ -1,12 +1,14 @@
 use std::marker::PhantomData;
 
 use futures_core::future::BoxFuture;
+use storekey::Encode;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
 
 pub mod attributes;
 pub mod content;
 pub mod directories;
 pub mod error;
+mod key;
 pub mod observation;
 
 pub trait FsConfig: Send + Sync + 'static {
@@ -23,7 +25,7 @@ pub struct FsEngine<M, C, A, N, S> {
     config: PhantomData<S>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode)]
 pub struct Inode(pub u64);
 
 impl Inode {
