@@ -1347,6 +1347,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-content-conformance"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-lite",
+ "proptest",
+ "stratafs-store",
+]
+
+[[package]]
 name = "stratafs-fs-engine"
 version = "0.1.0"
 dependencies = [
@@ -1354,8 +1364,10 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-lite",
+ "opendal",
  "redb",
  "storekey",
+ "stratafs-opendal",
  "stratafs-redb",
  "stratafs-store",
  "thiserror",
@@ -1393,6 +1405,7 @@ dependencies = [
  "futures-util",
  "opendal",
  "send_wrapper",
+ "stratafs-content-conformance",
  "stratafs-store",
  "thiserror",
 ]

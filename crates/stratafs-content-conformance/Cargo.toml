@@ -1,0 +1,15 @@
+[package]
+name = "stratafs-content-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-lite.workspace = true
+proptest.workspace = true
+stratafs-store.workspace = true
+
+[lints]
+workspace = true

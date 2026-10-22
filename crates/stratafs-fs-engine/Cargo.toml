@@ -16,7 +16,9 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 futures-lite.workspace = true
+opendal = { workspace = true, features = ["services-memory"] }
 redb = "4.4.0"
+stratafs-opendal.workspace = true
 stratafs-redb.workspace = true
 
 [lints]

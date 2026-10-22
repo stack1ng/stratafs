@@ -13,6 +13,10 @@ opendal.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+opendal = { workspace = true, features = ["services-memory"] }
+stratafs-content-conformance.workspace = true
+
 [features]
 fs = ["opendal/services-fs"]
 

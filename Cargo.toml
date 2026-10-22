@@ -26,8 +26,10 @@ send_wrapper = { version = "0.6", features = ["futures"] }
 shuttle = "0.9.7"
 smallvec = { version = "1.16", features = ["union"] }
 stateright = "0.31"
+stratafs-content-conformance = { path = "crates/stratafs-content-conformance" }
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
+stratafs-opendal = { path = "crates/stratafs-opendal" }
 stratafs-redb = { path = "crates/stratafs-redb" }
 stratafs-serialized = { path = "crates/stratafs-serialized" }
 stratafs-store = { path = "crates/stratafs-store" }
