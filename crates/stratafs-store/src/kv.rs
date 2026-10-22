@@ -70,7 +70,8 @@ pub trait KeyValueStore: Send + Sync + 'static {
 }
 
 // TransactionHandle gives work its transaction by value, so a store can wrap another store's transaction in its own without allocating.
-// It exists only to carry the transaction+store's lifetime, which Rust ignores inside Self::Transaction<'txn>.
+// It exists only to carry two lifetimes: the transaction's, which Rust ignores inside Self::Transaction<'txn>,
+// and the store's, which outlives the transaction, so a wrapping store can lend its own fields to the transaction instead of cloning them.
 pub struct TransactionHandle<'txn, 'store, T> {
     transaction: T,
     lifetime: PhantomData<&'txn &'store ()>,
