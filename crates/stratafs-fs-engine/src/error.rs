@@ -1,5 +1,5 @@
 #[derive(Debug, thiserror::Error)]
-pub enum FsError<F> {
+pub enum FsError<M, C> {
     #[error("ENOENT: No such file or directory")]
     NotFound,
     #[error("ESTALE: Stale file handle")]
@@ -21,5 +21,23 @@ pub enum FsError<F> {
     #[error("ENOATTR: Attribute not found")]
     AttributeNotFound,
     #[error("EIO: Input/output error")]
-    InputOutputError(#[source] F),
+    InputOutputError(#[source] IoFailure<M, C>),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum IoFailure<M, C> {
+    #[error(transparent)]
+    Metadata(M),
+    #[error(transparent)]
+    Content(C),
+    #[error(transparent)]
+    Corrupt(CorruptValue),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CorruptValue {
+    #[error("the stored value has the wrong length for its type")]
+    WrongLength,
+    #[error("the stored spillable kind is not a known kind")]
+    UnknownSpillableKind,
 }

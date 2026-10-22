@@ -1359,6 +1359,7 @@ dependencies = [
  "stratafs-redb",
  "stratafs-store",
  "thiserror",
+ "zerocopy",
 ]
 
 [[package]]

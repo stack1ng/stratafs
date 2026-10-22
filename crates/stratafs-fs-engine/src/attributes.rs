@@ -1,5 +1,6 @@
 use bitflags::bitflags;
 use bytes::Bytes;
+use stratafs_store::content::ContentStore;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
 use crate::error::FsError;
@@ -68,8 +69,11 @@ pub enum SetXattrMode {
     Replace,
 }
 
-impl<T: ReadKeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
-    pub async fn getattr(&self, inode: Inode) -> Result<Attributes, FsError<T::Failure>> {
+impl<T: ReadKeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
+    pub async fn getattr(
+        &self,
+        inode: Inode,
+    ) -> Result<Attributes, FsError<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -77,21 +81,24 @@ impl<T: ReadKeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S
         &self,
         inode: Inode,
         name: &[u8],
-    ) -> Result<Option<Bytes>, FsError<T::Failure>> {
+    ) -> Result<Option<Bytes>, FsError<T::Failure, C::Failure>> {
         todo!()
     }
 
-    pub async fn listxattr(&self, inode: Inode) -> Result<Vec<Bytes>, FsError<T::Failure>> {
+    pub async fn listxattr(
+        &self,
+        inode: Inode,
+    ) -> Result<Vec<Bytes>, FsError<T::Failure, C::Failure>> {
         todo!()
     }
 }
 
-impl<T: KeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
+impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn setattr(
         &mut self,
         inode: Inode,
         update: impl FnOnce(&mut SettableAttributes) + Send,
-    ) -> Result<Attributes, FsError<T::Failure>> {
+    ) -> Result<Attributes, FsError<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -101,7 +108,7 @@ impl<T: KeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
         name: &[u8],
         value: Bytes,
         mode: SetXattrMode,
-    ) -> Result<(), FsError<T::Failure>> {
+    ) -> Result<(), FsError<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -109,7 +116,7 @@ impl<T: KeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
         &mut self,
         inode: Inode,
         name: &[u8],
-    ) -> Result<(), FsError<T::Failure>> {
+    ) -> Result<(), FsError<T::Failure, C::Failure>> {
         todo!()
     }
 }

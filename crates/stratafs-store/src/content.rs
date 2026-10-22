@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::Buf;
 use thiserror::Error;
 
 use crate::error::StoreError;
@@ -28,12 +28,15 @@ pub enum GetRejection {
 pub trait ContentStore: Send + Sync {
     type Failure: std::error::Error + Send + Sync + 'static;
 
-    fn put(&self, bytes: Bytes) -> impl Future<Output = Result<ContentHash, Self::Failure>> + Send;
+    fn put(
+        &self,
+        content: impl Buf + Send,
+    ) -> impl Future<Output = Result<ContentHash, Self::Failure>> + Send;
 
     fn get(
         &self,
         hash: &ContentHash,
         offset: u64,
         size: u64,
-    ) -> impl Future<Output = Result<Bytes, StoreError<GetRejection, Self::Failure>>> + Send;
+    ) -> impl Future<Output = Result<impl Buf + Send, StoreError<GetRejection, Self::Failure>>> + Send;
 }

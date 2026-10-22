@@ -12,6 +12,7 @@ futures-core.workspace = true
 storekey.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
+zerocopy.workspace = true
 
 [dev-dependencies]
 futures-lite.workspace = true

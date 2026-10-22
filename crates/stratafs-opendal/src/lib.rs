@@ -2,9 +2,9 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use bytes::Bytes;
+use bytes::Buf;
 use futures_util::TryStreamExt;
-use opendal::{ErrorKind, Operator};
+use opendal::{Buffer, ErrorKind, Operator};
 use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
 use stratafs_store::error::StoreError;
 use thiserror::Error;
@@ -41,14 +41,19 @@ impl OpendalContentStore {
         Ok(Self::new(Operator::new(builder)?))
     }
 
-    async fn store(&self, bytes: Bytes) -> Result<ContentHash, OpendalError> {
-        let hash = ContentHash::of(&bytes);
+    async fn store(&self, mut content: impl Buf + Send) -> Result<ContentHash, OpendalError> {
+        let len = content.remaining() as u64;
+        let mut hasher = blake3::Hasher::new();
+        let mut chunks = Vec::new();
+        while content.has_remaining() {
+            let chunk = content.copy_to_bytes(content.chunk().len());
+            hasher.update(&chunk);
+            chunks.push(chunk);
+        }
+        let hash = ContentHash(*hasher.finalize().as_bytes());
         let path = object_path(&hash);
-        if !self
-            .stored_object_matches(&path, &hash, bytes.len() as u64)
-            .await?
-        {
-            self.operator.write(&path, bytes).await?;
+        if !self.stored_object_matches(&path, &hash, len).await? {
+            self.operator.write(&path, Buffer::from(chunks)).await?;
         }
         Ok(hash)
     }
@@ -95,7 +100,7 @@ impl OpendalContentStore {
         hash: ContentHash,
         offset: u64,
         size: u64,
-    ) -> Result<Bytes, StoreError<GetRejection, OpendalError>> {
+    ) -> Result<Buffer, StoreError<GetRejection, OpendalError>> {
         let path = object_path(&hash);
         let len = self
             .operator
@@ -113,7 +118,7 @@ impl OpendalContentStore {
             Some(_) | None => return Err(StoreError::Rejected(GetRejection::OutOfBounds { len })),
         };
         if size == 0 {
-            return Ok(Bytes::new());
+            return Ok(Buffer::new());
         }
         let buffer = self
             .operator
@@ -121,15 +126,18 @@ impl OpendalContentStore {
             .range(offset..end)
             .await
             .map_err(rejection_or_failure)?;
-        Ok(buffer.to_bytes())
+        Ok(buffer)
     }
 }
 
 impl ContentStore for OpendalContentStore {
     type Failure = OpendalError;
 
-    fn put(&self, bytes: Bytes) -> impl Future<Output = Result<ContentHash, Self::Failure>> + Send {
-        sendable(self.store(bytes))
+    fn put(
+        &self,
+        content: impl Buf + Send,
+    ) -> impl Future<Output = Result<ContentHash, Self::Failure>> + Send {
+        sendable(self.store(content))
     }
 
     fn get(
@@ -137,7 +145,8 @@ impl ContentStore for OpendalContentStore {
         hash: &ContentHash,
         offset: u64,
         size: u64,
-    ) -> impl Future<Output = Result<Bytes, StoreError<GetRejection, Self::Failure>>> + Send {
+    ) -> impl Future<Output = Result<impl Buf + Send, StoreError<GetRejection, Self::Failure>>> + Send
+    {
         sendable(self.load(*hash, offset, size))
     }
 }
