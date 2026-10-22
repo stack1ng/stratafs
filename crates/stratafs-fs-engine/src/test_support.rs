@@ -21,6 +21,7 @@ pub(crate) type InMemoryEngine =
 
 thread_local! {
     static CLOCK: Cell<i64> = const { Cell::new(0) };
+    static NEXT_INODE: Cell<u64> = const { Cell::new(1) };
 }
 
 pub(crate) fn set_clock(at: i64) {
@@ -31,11 +32,16 @@ fn clock() -> Timestamp {
     Timestamp(CLOCK.get())
 }
 
+fn next_inode() -> u64 {
+    NEXT_INODE.replace(NEXT_INODE.get() + 1)
+}
+
 pub(crate) fn new_test_engine() -> InMemoryEngine {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
-    let allocate_inode: fn() -> u64 = || 0;
+    NEXT_INODE.set(1);
+    let allocate_inode: fn() -> u64 = next_inode;
     let now: fn() -> Timestamp = clock;
     block_on(FsEngine::new(
         RedbStore::new(database, Inline).unwrap(),

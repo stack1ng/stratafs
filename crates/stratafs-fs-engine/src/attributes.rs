@@ -27,7 +27,7 @@ use crate::{FsConfig, FsTransaction, Inode, LARGEST_NAME_LENGTH, Timestamp};
 pub enum FileType {
     File,
     Directory,
-    Symlink,
+    SymbolicLink,
 }
 
 bitflags! {
@@ -65,7 +65,7 @@ pub struct Attributes {
     pub settable: SettableAttributes,
 
     pub kind: FileType,
-    pub link_count: u32,
+    pub hard_link_count: u32,
     pub allocated_size: u64,
     pub attribute_changed_at: Timestamp,
 
@@ -87,7 +87,7 @@ pub enum SetXattrMode {
 }
 
 impl Attributes {
-    fn record_change(&mut self, now: Timestamp) {
+    pub(crate) fn record_change(&mut self, now: Timestamp) {
         self.attribute_changed_at = now;
         self.change_version += 1;
     }
@@ -97,7 +97,7 @@ serialized_value! {
     struct StoredAttributes {
         kind: u8,
         mode: U16,
-        link_count: U32,
+        hard_link_count: U32,
         user_id: U32,
         group_id: U32,
         size: U64,
@@ -117,7 +117,7 @@ impl From<&Attributes> for StoredAttributes {
         StoredAttributes {
             kind: attributes.kind as u8,
             mode: U16::new(settable.mode.bits()),
-            link_count: U32::new(attributes.link_count),
+            hard_link_count: U32::new(attributes.hard_link_count),
             user_id: U32::new(settable.ownership.user_id),
             group_id: U32::new(settable.ownership.group_id),
             size: U64::new(settable.size),
@@ -150,7 +150,7 @@ impl TryFrom<&StoredAttributes> for Attributes {
             },
             kind: FileType::try_read_from_bytes(&[stored.kind])
                 .map_err(|_| CorruptValue::UnknownFileType)?,
-            link_count: stored.link_count.get(),
+            hard_link_count: stored.hard_link_count.get(),
             allocated_size: stored.allocated_size.get(),
             attribute_changed_at: Timestamp(stored.attribute_changed_at.get()),
             parent: Inode(stored.parent.get()),
@@ -300,7 +300,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                     created_at: now,
                 },
                 kind: FileType::Directory,
-                link_count: 2,
+                hard_link_count: 2,
                 allocated_size: 0,
                 attribute_changed_at: now,
                 parent: Inode::ROOT,

@@ -31,6 +31,12 @@ pub enum CorruptValue {
     UndecodableKey(#[source] storekey::DecodeError),
     #[error("a stored key is not the kind of key its position in the store implies")]
     UnexpectedKey,
+    #[error("a directory entry names an inode that does not exist")]
+    DanglingEntry,
+    #[error("a directory's parent does not exist")]
+    MissingParent,
+    #[error("a symlink has no stored target")]
+    MissingSymbolicLinkTarget,
 }
 
 impl From<ViewError> for CorruptValue {

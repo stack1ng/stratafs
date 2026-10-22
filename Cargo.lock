@@ -1373,6 +1373,7 @@ dependencies = [
  "stratafs-serialized",
  "stratafs-store",
  "thiserror",
+ "xxhash-rust",
  "zerocopy",
 ]
 

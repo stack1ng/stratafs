@@ -104,3 +104,125 @@ fn decoding_a_name_from_an_attributes_key_is_an_unexpected_key() {
         Err(CorruptValue::UnexpectedKey)
     ));
 }
+
+#[test]
+fn every_kind_of_key_sorts_together_under_its_inode_in_declaration_order() {
+    let ordered = [
+        Bytes::from(FsKey::new_symbolic_link_target(Inode(255))),
+        Bytes::from(FsKey::new_attributes(Inode(256))),
+        Bytes::from(FsKey::new_extended_attribute(Inode(256), b"user.a")),
+        Bytes::from(FsKey::new_directory_entry(Inode(256), 3)),
+        Bytes::from(FsKey::new_directory_entry(Inode(256), 0x0100)),
+        Bytes::from(FsKey::new_directory_entry(Inode(256), u64::MAX >> 1)),
+        Bytes::from(FsKey::new_hard_link(Inode(256), Inode(0), 0)),
+        Bytes::from(FsKey::new_hard_link(Inode(256), Inode(7), 3)),
+        Bytes::from(FsKey::new_symbolic_link_target(Inode(256))),
+        Bytes::from(FsKey::new_attributes(Inode(257))),
+    ];
+    let mut sorted = ordered.to_vec();
+    sorted.reverse();
+    sorted.sort();
+    assert_eq!(sorted, ordered);
+}
+
+#[test]
+fn directory_entry_ranges_hold_exactly_the_requested_positions() {
+    let entry = |dir, position| Bytes::from(FsKey::new_directory_entry(Inode(dir), position));
+    let after = directory_entries_after(Inode(256), 5);
+    for (key, inside) in [
+        (
+            Bytes::from(FsKey::new_extended_attribute(Inode(256), &[0xff; 255])),
+            false,
+        ),
+        (entry(256, 5), false),
+        (entry(256, 6), true),
+        (entry(256, u64::MAX >> 1), true),
+        (
+            Bytes::from(FsKey::new_hard_link(Inode(256), Inode(0), 0)),
+            false,
+        ),
+        (entry(257, 6), false),
+    ] {
+        assert_eq!(after.contains(&key), inside, "{key:?}");
+    }
+    let between = directory_entries_between(Inode(256), 5, 7);
+    for (position, inside) in [(4, false), (5, true), (7, true), (8, false)] {
+        assert_eq!(
+            between.contains(&entry(256, position)),
+            inside,
+            "{position}"
+        );
+    }
+}
+
+#[test]
+fn the_hard_link_range_holds_exactly_the_inodes_hard_links() {
+    let range = hard_links_of(Inode(256));
+    for (key, inside) in [
+        (
+            Bytes::from(FsKey::new_directory_entry(Inode(256), u64::MAX)),
+            false,
+        ),
+        (
+            Bytes::from(FsKey::new_hard_link(Inode(256), Inode(0), 0)),
+            true,
+        ),
+        (
+            Bytes::from(FsKey::new_hard_link(Inode(256), Inode(u64::MAX), u64::MAX)),
+            true,
+        ),
+        (
+            Bytes::from(FsKey::new_symbolic_link_target(Inode(256))),
+            false,
+        ),
+        (
+            Bytes::from(FsKey::new_hard_link(Inode(257), Inode(0), 0)),
+            false,
+        ),
+    ] {
+        assert_eq!(range.contains(&key), inside, "{key:?}");
+    }
+}
+
+#[test]
+fn every_key_of_an_inode_holds_all_its_kinds_and_no_neighbours() {
+    let range = every_key_of(Inode(256));
+    for (key, inside) in [
+        (
+            Bytes::from(FsKey::new_symbolic_link_target(Inode(255))),
+            false,
+        ),
+        (Bytes::from(FsKey::new_attributes(Inode(256))), true),
+        (
+            Bytes::from(FsKey::new_extended_attribute(Inode(256), &[0xff; 255])),
+            true,
+        ),
+        (
+            Bytes::from(FsKey::new_directory_entry(Inode(256), u64::MAX)),
+            true,
+        ),
+        (
+            Bytes::from(FsKey::new_hard_link(Inode(256), Inode(u64::MAX), u64::MAX)),
+            true,
+        ),
+        (
+            Bytes::from(FsKey::new_symbolic_link_target(Inode(256))),
+            true,
+        ),
+        (Bytes::from(FsKey::new_attributes(Inode(257))), false),
+    ] {
+        assert_eq!(range.contains(&key), inside, "{key:?}");
+    }
+}
+
+#[test]
+fn directory_entry_positions_and_hard_link_directories_decode_from_their_keys() {
+    let entry = Bytes::from(FsKey::new_directory_entry(Inode(256), 0x0102));
+    assert_eq!(directory_entry_position(&entry).unwrap(), 0x0102);
+    let hard_link = Bytes::from(FsKey::new_hard_link(Inode(256), Inode(9), 3));
+    assert_eq!(hard_link_directory(&hard_link).unwrap(), Inode(9));
+    assert!(matches!(
+        directory_entry_position(&hard_link),
+        Err(CorruptValue::UnexpectedKey)
+    ));
+}

@@ -99,7 +99,7 @@ fn root_created_at(at: i64) -> Attributes {
             created_at: Timestamp(at),
         },
         kind: FileType::Directory,
-        link_count: 2,
+        hard_link_count: 2,
         allocated_size: 0,
         attribute_changed_at: Timestamp(at),
         parent: Inode::ROOT,
@@ -362,13 +362,13 @@ fn extended_attribute_operations_on_a_missing_inode_are_stale_file_handles() {
 #[test]
 fn stored_attributes_are_the_fingerprint_then_each_field_in_little_endian() {
     let mut attributes = root_created_at(-3);
-    attributes.kind = FileType::Symlink;
+    attributes.kind = FileType::SymbolicLink;
     attributes.settable.size = 6;
     attributes.settable.ownership = Ownership {
         user_id: 501,
         group_id: 20,
     };
-    attributes.link_count = 1;
+    attributes.hard_link_count = 1;
     attributes.allocated_size = 7;
     attributes.settable.content_changed_at = Timestamp(8);
     attributes.attribute_changed_at = Timestamp(9);
@@ -401,7 +401,7 @@ fn file_types_are_stored_as_their_variant_index() {
     for (kind, stored) in [
         (FileType::File, 0),
         (FileType::Directory, 1),
-        (FileType::Symlink, 2),
+        (FileType::SymbolicLink, 2),
     ] {
         let mut attributes = root_created_at(0);
         attributes.kind = kind;
