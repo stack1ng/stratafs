@@ -1347,6 +1347,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-fs-engine"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytes",
+ "futures-core",
+ "stratafs-store",
+ "thiserror",
+]
+
+[[package]]
 name = "stratafs-keyed-notify"
 version = "0.1.0"
 dependencies = [
