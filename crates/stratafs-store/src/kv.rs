@@ -37,6 +37,8 @@ pub trait KeyValueStore: Send + Sync + 'static {
             Observation = Self::Observation,
         >;
 
+    const LARGEST_ACCEPTED_ENTRY: usize;
+
     // transact runs a transaction, returning the result.
     // If work returns an error, the transaction is not applied, and transact returns that error as Aborted.
     // A panic inside work propagates to the caller of transact.

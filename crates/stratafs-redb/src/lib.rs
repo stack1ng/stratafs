@@ -93,6 +93,8 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
     type ReadTransaction<'txn> = RedbTransaction<'txn, ReadOnlyTable<&'static [u8], &'static [u8]>>;
     type Transaction<'txn> = RedbTransaction<'txn, Table<'txn, &'static [u8], &'static [u8]>>;
 
+    const LARGEST_ACCEPTED_ENTRY: usize = 3 * 1024 * 1024 * 1024;
+
     async fn transact<'store, T: Send, E: Send>(
         &'store self,
         mut work: impl for<'txn> FnMut(

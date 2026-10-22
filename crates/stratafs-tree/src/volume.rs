@@ -15,7 +15,7 @@ use zerocopy::KnownLayout;
 use crate::branch_observation::BranchWatch;
 use crate::concatenated_bytes::ConcatenatedBytes;
 use crate::error::TreeFailure;
-use crate::header::{TreeVolumeId, VolumeHeader};
+use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
 use crate::key::TreeKey;
 use crate::node::{InternalEntry, LeafEntry};
 use crate::serialized::CorruptValue;
@@ -124,6 +124,8 @@ where
     type Observation = BranchWatch<S::Observation>;
     type ReadTransaction<'txn> = TreeTransaction<'txn, S::ReadTransaction<'txn>, S, A, C>;
     type Transaction<'txn> = TreeTransaction<'txn, S::Transaction<'txn>, S, A, C>;
+
+    const LARGEST_ACCEPTED_ENTRY: usize = C::LARGEST_ENTRY_SIZE.saturating_sub(size_of::<NodeId>());
 
     async fn transact<'store, T: Send, E: Send>(
         &'store self,
