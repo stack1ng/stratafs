@@ -41,10 +41,10 @@ pub trait KeyValueStore: Send + Sync + 'static {
     // If work returns an error, the transaction is not applied, and transact returns that error as Aborted.
     // A panic inside work propagates to the caller of transact.
     // The transaction is not applied, and the store stays usable.
-    fn transact<T: Send, E: Send>(
-        &self,
+    fn transact<'store, T: Send, E: Send>(
+        &'store self,
         work: impl for<'txn> FnMut(
-            TransactionHandle<'txn, Self::Transaction<'txn>>,
+            TransactionHandle<'txn, 'store, Self::Transaction<'txn>>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
     ) -> impl Future<Output = Result<T, TransactError<Self::Rejection, Self::Failure, E>>> + Send;
@@ -53,10 +53,10 @@ pub trait KeyValueStore: Send + Sync + 'static {
     // If work returns an error, read_transact returns that error as Aborted.
     // A panic inside work propagates to the caller of read_transact.
     // The transaction is not applied, and the store stays usable.
-    fn read_transact<T: Send, E: Send>(
-        &self,
+    fn read_transact<'store, T: Send, E: Send>(
+        &'store self,
         work: impl for<'txn> FnMut(
-            TransactionHandle<'txn, Self::ReadTransaction<'txn>>,
+            TransactionHandle<'txn, 'store, Self::ReadTransaction<'txn>>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
     ) -> impl Future<Output = Result<T, TransactError<Self::Rejection, Self::Failure, E>>> + Send;
@@ -70,13 +70,13 @@ pub trait KeyValueStore: Send + Sync + 'static {
 }
 
 // TransactionHandle gives work its transaction by value, so a store can wrap another store's transaction in its own without allocating.
-// It exists only to carry the transaction's lifetime, which Rust ignores inside Self::Transaction<'txn>.
-pub struct TransactionHandle<'txn, T> {
+// It exists only to carry the transaction+store's lifetime, which Rust ignores inside Self::Transaction<'txn>.
+pub struct TransactionHandle<'txn, 'store, T> {
     transaction: T,
-    lifetime: PhantomData<&'txn ()>,
+    lifetime: PhantomData<&'txn &'store ()>,
 }
 
-impl<T> TransactionHandle<'_, T> {
+impl<T> TransactionHandle<'_, '_, T> {
     pub fn new(transaction: T) -> Self {
         Self {
             transaction,
@@ -85,7 +85,7 @@ impl<T> TransactionHandle<'_, T> {
     }
 }
 
-impl<T> Deref for TransactionHandle<'_, T> {
+impl<T> Deref for TransactionHandle<'_, '_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -93,7 +93,7 @@ impl<T> Deref for TransactionHandle<'_, T> {
     }
 }
 
-impl<T> DerefMut for TransactionHandle<'_, T> {
+impl<T> DerefMut for TransactionHandle<'_, '_, T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.transaction
     }

@@ -28,19 +28,19 @@ pub struct TreeVolume<S, A, C> {
 }
 
 pub struct TreeTransaction<'txn, T, S, A, C> {
-    pub(crate) inner: TransactionHandle<'txn, T>,
-    pub(crate) shared: Arc<TreeShared<S, A, C>>,
+    pub(crate) inner: TransactionHandle<'txn, 'txn, T>,
+    pub(crate) shared: &'txn TreeShared<S, A, C>,
     pub(crate) volume: TreeVolumeId,
 }
 
 impl<S, A, C> TreeVolume<S, A, C> {
     fn transaction<'txn, T>(
-        &self,
-        inner: TransactionHandle<'txn, T>,
+        &'txn self,
+        inner: TransactionHandle<'txn, 'txn, T>,
     ) -> TreeTransaction<'txn, T, S, A, C> {
         TreeTransaction {
             inner,
-            shared: Arc::clone(&self.shared),
+            shared: &self.shared,
             volume: self.id,
         }
     }
@@ -125,10 +125,10 @@ where
     type ReadTransaction<'txn> = TreeTransaction<'txn, S::ReadTransaction<'txn>, S, A, C>;
     type Transaction<'txn> = TreeTransaction<'txn, S::Transaction<'txn>, S, A, C>;
 
-    async fn transact<T: Send, E: Send>(
-        &self,
+    async fn transact<'store, T: Send, E: Send>(
+        &'store self,
         mut work: impl for<'txn> FnMut(
-            TransactionHandle<'txn, Self::Transaction<'txn>>,
+            TransactionHandle<'txn, 'store, Self::Transaction<'txn>>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
@@ -139,10 +139,10 @@ where
             .map_err(store_failure_as_tree_failure)
     }
 
-    async fn read_transact<T: Send, E: Send>(
-        &self,
+    async fn read_transact<'store, T: Send, E: Send>(
+        &'store self,
         mut work: impl for<'txn> FnMut(
-            TransactionHandle<'txn, Self::ReadTransaction<'txn>>,
+            TransactionHandle<'txn, 'store, Self::ReadTransaction<'txn>>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {

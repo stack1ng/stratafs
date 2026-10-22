@@ -93,10 +93,10 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
     type ReadTransaction<'txn> = RedbTransaction<'txn, ReadOnlyTable<&'static [u8], &'static [u8]>>;
     type Transaction<'txn> = RedbTransaction<'txn, Table<'txn, &'static [u8], &'static [u8]>>;
 
-    async fn transact<T: Send, E: Send>(
-        &self,
+    async fn transact<'store, T: Send, E: Send>(
+        &'store self,
         mut work: impl for<'txn> FnMut(
-            TransactionHandle<'txn, Self::Transaction<'txn>>,
+            TransactionHandle<'txn, 'store, Self::Transaction<'txn>>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
@@ -146,10 +146,10 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
         }
     }
 
-    async fn read_transact<T: Send, E: Send>(
-        &self,
+    async fn read_transact<'store, T: Send, E: Send>(
+        &'store self,
         mut work: impl for<'txn> FnMut(
-            TransactionHandle<'txn, Self::ReadTransaction<'txn>>,
+            TransactionHandle<'txn, 'store, Self::ReadTransaction<'txn>>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
