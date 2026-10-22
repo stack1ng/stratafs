@@ -62,7 +62,7 @@ pub enum SetXattrMode {
     Replace,
 }
 
-impl<T: ReadKeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
+impl<T: ReadKeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn getattr(&self, inode: Inode) -> Result<Attributes, FsError<T::Failure>> {
         todo!()
     }
@@ -80,7 +80,7 @@ impl<T: ReadKeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
     }
 }
 
-impl<T: KeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
+impl<T: KeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn setattr(
         &mut self,
         inode: Inode,

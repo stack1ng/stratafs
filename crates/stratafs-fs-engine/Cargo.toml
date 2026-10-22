@@ -13,5 +13,10 @@ storekey.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+futures-lite.workspace = true
+redb = "4.4.0"
+stratafs-redb.workspace = true
+
 [lints]
 workspace = true

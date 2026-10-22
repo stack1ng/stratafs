@@ -4,7 +4,7 @@ use stratafs_store::kv::{KeyValueStore, NotCommitted, ReadKeyValueTransaction};
 use crate::error::FsError;
 use crate::{FsEngine, FsTransaction, Inode};
 
-impl<T: ReadKeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
+impl<T: ReadKeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn observe(&self, inode: Inode) -> Result<T::Observation, FsError<T::Failure>> {
         todo!()
     }

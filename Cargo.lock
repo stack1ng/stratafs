@@ -1353,7 +1353,10 @@ dependencies = [
  "bitflags 2.13.2",
  "bytes",
  "futures-core",
+ "futures-lite",
+ "redb",
  "storekey",
+ "stratafs-redb",
  "stratafs-store",
  "thiserror",
 ]

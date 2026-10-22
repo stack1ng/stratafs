@@ -43,7 +43,7 @@ pub struct RenameChange {
     pub replaced: Option<(Inode, Attributes)>,
 }
 
-impl<T: ReadKeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
+impl<T: ReadKeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn lookup(
         &self,
         dir: Inode,
@@ -71,7 +71,7 @@ impl<T: ReadKeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
     }
 }
 
-impl<T: KeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
+impl<T: KeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn create(
         &mut self,
         dir: Inode,

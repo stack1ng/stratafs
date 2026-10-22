@@ -5,7 +5,7 @@ use crate::attributes::Attributes;
 use crate::error::FsError;
 use crate::{FsTransaction, Inode};
 
-impl<T: ReadKeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
+impl<T: ReadKeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn read(
         &self,
         inode: Inode,
@@ -20,7 +20,7 @@ impl<T: ReadKeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
     }
 }
 
-impl<T: KeyValueTransaction, C, A, N> FsTransaction<'_, '_, T, C, A, N> {
+impl<T: KeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn write(
         &mut self,
         inode: Inode,

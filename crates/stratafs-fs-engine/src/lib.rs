@@ -10,6 +10,7 @@ pub mod directories;
 pub mod error;
 mod key;
 pub mod observation;
+mod spillable;
 
 pub trait FsConfig: Send + Sync + 'static {
     const LARGEST_INLINE_ENTRY: usize;
@@ -35,14 +36,15 @@ impl Inode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(pub i64);
 
-pub struct FsTransaction<'txn, 'engine, T, C, A, N> {
+pub struct FsTransaction<'txn, 'engine, T, C, A, N, S> {
     metadata: TransactionHandle<'txn, 'engine, T>,
     content: &'engine C,
     allocate_inode: &'engine A,
     now: &'engine N,
+    config: PhantomData<S>,
 }
 
-impl<T, C, A, N: Fn() -> Timestamp> FsTransaction<'_, '_, T, C, A, N> {
+impl<T, C, A, N: Fn() -> Timestamp, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub fn now(&self) -> Timestamp {
         (self.now)()
     }
@@ -74,7 +76,7 @@ impl<M: KeyValueStore, C: Sync, A: Sync, N: Sync, S: FsConfig> FsEngine<M, C, A,
     pub fn transact<'engine, T: Send, E: Send>(
         &'engine self,
         mut work: impl for<'txn> FnMut(
-            FsTransaction<'txn, 'engine, M::Transaction<'txn>, C, A, N>,
+            FsTransaction<'txn, 'engine, M::Transaction<'txn>, C, A, N, S>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
     ) -> impl Future<Output = Result<T, TransactError<M::Rejection, M::Failure, E>>> + Send {
@@ -85,7 +87,7 @@ impl<M: KeyValueStore, C: Sync, A: Sync, N: Sync, S: FsConfig> FsEngine<M, C, A,
     pub fn read_transact<'engine, T: Send, E: Send>(
         &'engine self,
         mut work: impl for<'txn> FnMut(
-            FsTransaction<'txn, 'engine, M::ReadTransaction<'txn>, C, A, N>,
+            FsTransaction<'txn, 'engine, M::ReadTransaction<'txn>, C, A, N, S>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
     ) -> impl Future<Output = Result<T, TransactError<M::Rejection, M::Failure, E>>> + Send {
@@ -96,12 +98,13 @@ impl<M: KeyValueStore, C: Sync, A: Sync, N: Sync, S: FsConfig> FsEngine<M, C, A,
     fn transaction<'txn, 'engine, T>(
         &'engine self,
         metadata: TransactionHandle<'txn, 'engine, T>,
-    ) -> FsTransaction<'txn, 'engine, T, C, A, N> {
+    ) -> FsTransaction<'txn, 'engine, T, C, A, N, S> {
         FsTransaction {
             metadata,
             content: &self.content,
             allocate_inode: &self.allocate_inode,
             now: &self.now,
+            config: PhantomData,
         }
     }
 }
