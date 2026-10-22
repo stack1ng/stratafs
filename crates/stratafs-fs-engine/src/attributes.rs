@@ -31,19 +31,25 @@ bitflags! {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Attributes {
-    pub kind: FileType,
+pub struct SettableAttributes {
     pub mode: Mode,
-    pub link_count: u32,
-    pub owner: Ownership,
+    pub ownership: Ownership,
 
     pub size: u64,
-    pub allocated_size: u64,
 
     pub last_accessed_at: Timestamp,
     pub content_changed_at: Timestamp,
-    pub attribute_changed_at: Timestamp,
     pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attributes {
+    pub settable: SettableAttributes,
+
+    pub kind: FileType,
+    pub link_count: u32,
+    pub allocated_size: u64,
+    pub attribute_changed_at: Timestamp,
 
     pub parent: Inode,
     pub change_version: u64,
@@ -84,7 +90,7 @@ impl<T: KeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     pub async fn setattr(
         &mut self,
         inode: Inode,
-        update: impl FnOnce(&mut Attributes) + Send,
+        update: impl FnOnce(&mut SettableAttributes) + Send,
     ) -> Result<Attributes, FsError<T::Failure>> {
         todo!()
     }

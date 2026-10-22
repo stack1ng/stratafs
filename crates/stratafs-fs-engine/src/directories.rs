@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
-use crate::attributes::{Attributes, FileType};
+use crate::attributes::{Attributes, FileType, SettableAttributes};
 use crate::error::FsError;
 use crate::{FsTransaction, Inode};
 
@@ -77,7 +77,7 @@ impl<T: KeyValueTransaction, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
         dir: Inode,
         name: &[u8],
         item: NewItem,
-        update: impl FnOnce(&mut Attributes) + Send,
+        update: impl FnOnce(&mut SettableAttributes) + Send,
     ) -> Result<EntryChange, FsError<T::Failure>> {
         todo!()
     }
