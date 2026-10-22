@@ -12,6 +12,7 @@ futures-core.workspace = true
 futures-util.workspace = true
 smallvec.workspace = true
 storekey.workspace = true
+stratafs-serialized.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
 xxhash-rust.workspace = true

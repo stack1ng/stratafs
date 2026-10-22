@@ -71,7 +71,7 @@ where
             .ok_or(TreeFailure::Corrupt(CorruptValue::MissingVolumeHeader))?;
         VolumeHeader::view(&stored)
             .copied()
-            .map_err(TreeFailure::Corrupt)
+            .map_err(|corrupt| TreeFailure::Corrupt(corrupt.into()))
     }
 }
 

@@ -1415,6 +1415,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-serialized"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "xxhash-rust",
+ "zerocopy",
+]
+
+[[package]]
 name = "stratafs-store"
 version = "0.1.0"
 dependencies = [
@@ -1439,6 +1448,7 @@ dependencies = [
  "storekey",
  "stratafs-kv-conformance",
  "stratafs-redb",
+ "stratafs-serialized",
  "stratafs-store",
  "thiserror",
  "xxhash-rust",

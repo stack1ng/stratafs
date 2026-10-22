@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
+use stratafs_serialized::serialized_value;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::kv::{
@@ -14,7 +15,7 @@ use crate::error::TreeFailure;
 use crate::header::{NodeId, TreeVolumeId, VolumeEpoch, VolumeHeader};
 use crate::key::TreeKey;
 use crate::node::{Node, NodeHeader, NodeKind};
-use crate::serialized::{CorruptValue, serialized_value};
+use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
 use crate::volume::TreeVolume;
 
@@ -139,7 +140,7 @@ where
                                 stored: *stored,
                                 configured,
                             }),
-                            Err(corrupt) => Err(PinnedConfigError::Corrupt(corrupt)),
+                            Err(corrupt) => Err(PinnedConfigError::Corrupt(corrupt.into())),
                         },
                     }
                 })

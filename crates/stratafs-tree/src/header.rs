@@ -3,11 +3,12 @@ use std::ops::AddAssign;
 
 use bytes::Bytes;
 use storekey::{Encode, EncodeError, Writer};
+use stratafs_serialized::{SerializedShape, serialized_value};
 use xxhash_rust::const_xxh32::xxh32;
 use zerocopy::little_endian::{U64, U128};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::serialized::{CorruptValue, SerializedShape, serialized_value};
+use crate::serialized::CorruptValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode)]
 pub struct TreeVolumeId(pub(crate) u128);

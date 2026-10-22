@@ -29,6 +29,7 @@ stateright = "0.31"
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
 stratafs-redb = { path = "crates/stratafs-redb" }
+stratafs-serialized = { path = "crates/stratafs-serialized" }
 stratafs-store = { path = "crates/stratafs-store" }
 storekey = "0.11"
 thiserror = "2.0"

@@ -1,0 +1,14 @@
+[package]
+name = "stratafs-serialized"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+xxhash-rust.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true
