@@ -3,7 +3,7 @@ use stratafs_store::content::ContentStore;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
 use crate::attributes::{Attributes, FileType, SettableAttributes};
-use crate::error::FsError;
+use crate::error::IoFailure;
 use crate::{FsTransaction, Inode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +49,7 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_,
         &self,
         dir: Inode,
         name: &[u8],
-    ) -> Result<Option<(Inode, Attributes)>, FsError<T::Failure, C::Failure>> {
+    ) -> Result<Option<(Inode, Attributes)>, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -58,7 +58,7 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_,
         dir: Inode,
         after: u64,
         limit: usize,
-    ) -> Result<Vec<DirectoryEntry>, FsError<T::Failure, C::Failure>> {
+    ) -> Result<Vec<DirectoryEntry>, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -67,7 +67,7 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_,
         dir: Inode,
         after: u64,
         limit: usize,
-    ) -> Result<Vec<(DirectoryEntry, Attributes)>, FsError<T::Failure, C::Failure>> {
+    ) -> Result<Vec<(DirectoryEntry, Attributes)>, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 }
@@ -79,7 +79,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, 
         name: &[u8],
         item: NewItem,
         update: impl FnOnce(&mut SettableAttributes) + Send,
-    ) -> Result<EntryChange, FsError<T::Failure, C::Failure>> {
+    ) -> Result<EntryChange, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -88,7 +88,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, 
         inode: Inode,
         dir: Inode,
         name: &[u8],
-    ) -> Result<EntryChange, FsError<T::Failure, C::Failure>> {
+    ) -> Result<EntryChange, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -97,7 +97,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, 
         dir: Inode,
         name: &[u8],
         expected: Option<Inode>,
-    ) -> Result<EntryChange, FsError<T::Failure, C::Failure>> {
+    ) -> Result<EntryChange, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -106,7 +106,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, 
         dir: Inode,
         name: &[u8],
         expected: Option<Inode>,
-    ) -> Result<EntryChange, FsError<T::Failure, C::Failure>> {
+    ) -> Result<EntryChange, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 
@@ -118,7 +118,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, 
         new_name: &[u8],
         mode: RenameMode,
         expected: Option<Inode>,
-    ) -> Result<RenameChange, FsError<T::Failure, C::Failure>> {
+    ) -> Result<RenameChange, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 }

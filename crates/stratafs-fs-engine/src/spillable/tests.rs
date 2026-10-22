@@ -1,34 +1,9 @@
 use futures_lite::future::block_on;
-use opendal::Operator;
-use redb::backends::InMemoryBackend;
-use stratafs_opendal::OpendalContentStore;
-use stratafs_redb::{Inline, RedbStore};
 use stratafs_store::content::GetRejection;
 use stratafs_store::error::StoreError;
 
 use super::*;
-use crate::{FsEngine, Timestamp};
-
-struct OneKibInline;
-
-impl FsConfig for OneKibInline {
-    const LARGEST_INLINE_ENTRY: usize = 1024;
-}
-
-type InMemoryEngine =
-    FsEngine<RedbStore<Inline>, OpendalContentStore, fn() -> u64, fn() -> Timestamp, OneKibInline>;
-
-fn new_engine() -> InMemoryEngine {
-    let database = redb::Database::builder()
-        .create_with_backend(InMemoryBackend::new())
-        .unwrap();
-    FsEngine::new(
-        RedbStore::new(database, Inline).unwrap(),
-        OpendalContentStore::new(Operator::new(opendal::services::Memory::default()).unwrap()),
-        || 0,
-        || Timestamp(0),
-    )
-}
+use crate::test_support::{InMemoryEngine, OneKibInline, new_test_engine};
 
 const KEY: &[u8] = b"key";
 
@@ -54,7 +29,7 @@ fn content_of_length(length: usize) -> Bytes {
 
 #[test]
 fn small_content_stays_inline() {
-    let engine = new_engine();
+    let engine = new_test_engine();
     let content = content_of_length(10);
     assert_eq!(
         make_spillable(&engine, content.clone()),
@@ -68,7 +43,7 @@ fn small_content_stays_inline() {
 
 #[test]
 fn content_filling_the_largest_inline_entry_exactly_stays_inline() {
-    let engine = new_engine();
+    let engine = new_test_engine();
     let content = content_of_length(
         OneKibInline::LARGEST_INLINE_ENTRY - KEY.len() - SpillableValue::TAG_LENGTH,
     );
@@ -84,7 +59,7 @@ fn content_filling_the_largest_inline_entry_exactly_stays_inline() {
 
 #[test]
 fn content_one_byte_over_the_largest_inline_entry_spills_to_the_content_store() {
-    let engine = new_engine();
+    let engine = new_test_engine();
     let content = content_of_length(
         OneKibInline::LARGEST_INLINE_ENTRY - KEY.len() - SpillableValue::TAG_LENGTH + 1,
     );

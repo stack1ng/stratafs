@@ -1,7 +1,9 @@
 use std::marker::PhantomData;
 
 use futures_core::future::BoxFuture;
-use storekey::Encode;
+use storekey::{BorrowDecode, Encode};
+use stratafs_store::content::ContentStore;
+use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
 
 pub mod attributes;
@@ -10,13 +12,17 @@ pub mod directories;
 pub mod error;
 mod key;
 pub mod observation;
-mod spillable;
+pub mod spillable;
+#[cfg(test)]
+mod test_support;
 
 pub trait FsConfig: Send + Sync + 'static {
     const LARGEST_INLINE_ENTRY: usize;
 }
 
 const SMALLEST_INLINE_ENTRY: usize = 1024;
+
+pub const LARGEST_NAME_LENGTH: usize = 255;
 
 pub struct FsEngine<M, C, A, N, S> {
     metadata: M,
@@ -26,7 +32,7 @@ pub struct FsEngine<M, C, A, N, S> {
     config: PhantomData<S>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, BorrowDecode)]
 pub struct Inode(pub u64);
 
 impl Inode {
@@ -50,8 +56,29 @@ impl<T, C, A, N: Fn() -> Timestamp, S> FsTransaction<'_, '_, T, C, A, N, S> {
     }
 }
 
-impl<M: KeyValueStore, C, A, N, S: FsConfig> FsEngine<M, C, A, N, S> {
-    pub fn new(metadata: M, content: C, allocate_inode: A, now: N) -> Self {
+impl<M, C, A, N, S> FsEngine<M, C, A, N, S>
+where
+    M: KeyValueStore,
+    C: ContentStore,
+    A: Send + Sync,
+    N: Fn() -> Timestamp + Send + Sync,
+    S: FsConfig,
+{
+    // new returns `impl Future + Send` instead of being `async fn`, so Send is proven here once, for every store.
+    // As `async fn`, rustc checks Send at each call site and wrongly rejects stores whose types contain 'static lifetimes,
+    // such as redb's (https://github.com/rust-lang/rust/issues/110338). The long return type comes from that form.
+    #[allow(clippy::type_complexity)]
+    pub fn new(
+        metadata: M,
+        content: C,
+        allocate_inode: A,
+        now: N,
+    ) -> impl Future<
+        Output = Result<
+            Self,
+            TransactError<M::Rejection, M::Failure, StoreError<M::Rejection, M::Failure>>,
+        >,
+    > + Send {
         const {
             assert!(
                 S::LARGEST_INLINE_ENTRY <= M::LARGEST_ACCEPTED_ENTRY,
@@ -62,12 +89,20 @@ impl<M: KeyValueStore, C, A, N, S: FsConfig> FsEngine<M, C, A, N, S> {
                 "the largest inline entry is too small to hold the engine's fixed size entries"
             );
         };
-        Self {
-            metadata,
-            content,
-            allocate_inode,
-            now,
-            config: PhantomData,
+        async move {
+            let engine = Self {
+                metadata,
+                content,
+                allocate_inode,
+                now,
+                config: PhantomData,
+            };
+            engine
+                .transact(|mut transaction| {
+                    Box::pin(async move { transaction.create_root_if_missing().await })
+                })
+                .await?;
+            Ok(engine)
         }
     }
 }

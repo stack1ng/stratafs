@@ -1,12 +1,29 @@
+// These functions return `impl Future + Send` instead of being `async fn`, so Send is proven here once, for every store.
+// As `async fn`, rustc checks Send at each call site and wrongly rejects stores whose types contain 'static lifetimes,
+// such as redb's (https://github.com/rust-lang/rust/issues/110338).
+// The long return types come from that form.
+#![allow(clippy::manual_async_fn, clippy::type_complexity)]
+
 use bitflags::bitflags;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use futures_util::future::join;
+use stratafs_serialized::serialized_value;
 use stratafs_store::content::ContentStore;
+use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
+use zerocopy::little_endian::{I64, U16, U32, U64};
+use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 
-use crate::error::FsError;
-use crate::{FsTransaction, Inode, Timestamp};
+use crate::attributes::error::{
+    GetxattrError, ListxattrError, RemovexattrError, SetattrError, SetxattrError,
+};
+use crate::error::{CorruptValue, IoFailure, refused_or_failed};
+use crate::key::{FsKey, extended_attribute_name, extended_attributes_range};
+use crate::spillable::{SpillableContent, SpillableValue};
+use crate::{FsConfig, FsTransaction, Inode, LARGEST_NAME_LENGTH, Timestamp};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable)]
+#[repr(u8)]
 pub enum FileType {
     File,
     Directory,
@@ -69,54 +86,325 @@ pub enum SetXattrMode {
     Replace,
 }
 
-impl<T: ReadKeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
-    pub async fn getattr(
-        &self,
-        inode: Inode,
-    ) -> Result<Attributes, FsError<T::Failure, C::Failure>> {
-        todo!()
-    }
-
-    pub async fn getxattr(
-        &self,
-        inode: Inode,
-        name: &[u8],
-    ) -> Result<Option<Bytes>, FsError<T::Failure, C::Failure>> {
-        todo!()
-    }
-
-    pub async fn listxattr(
-        &self,
-        inode: Inode,
-    ) -> Result<Vec<Bytes>, FsError<T::Failure, C::Failure>> {
-        todo!()
+impl Attributes {
+    fn record_change(&mut self, now: Timestamp) {
+        self.attribute_changed_at = now;
+        self.change_version += 1;
     }
 }
 
-impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
-    pub async fn setattr(
+serialized_value! {
+    struct StoredAttributes {
+        kind: u8,
+        mode: U16,
+        link_count: U32,
+        user_id: U32,
+        group_id: U32,
+        size: U64,
+        allocated_size: U64,
+        last_accessed_at: I64,
+        content_changed_at: I64,
+        attribute_changed_at: I64,
+        created_at: I64,
+        parent: U64,
+        change_version: U64,
+    }
+}
+
+impl From<&Attributes> for StoredAttributes {
+    fn from(attributes: &Attributes) -> Self {
+        let settable = &attributes.settable;
+        StoredAttributes {
+            kind: attributes.kind as u8,
+            mode: U16::new(settable.mode.bits()),
+            link_count: U32::new(attributes.link_count),
+            user_id: U32::new(settable.ownership.user_id),
+            group_id: U32::new(settable.ownership.group_id),
+            size: U64::new(settable.size),
+            allocated_size: U64::new(attributes.allocated_size),
+            last_accessed_at: I64::new(settable.last_accessed_at.0),
+            content_changed_at: I64::new(settable.content_changed_at.0),
+            attribute_changed_at: I64::new(attributes.attribute_changed_at.0),
+            created_at: I64::new(settable.created_at.0),
+            parent: U64::new(attributes.parent.0),
+            change_version: U64::new(attributes.change_version),
+        }
+    }
+}
+
+impl TryFrom<&StoredAttributes> for Attributes {
+    type Error = CorruptValue;
+
+    fn try_from(stored: &StoredAttributes) -> Result<Self, CorruptValue> {
+        Ok(Attributes {
+            settable: SettableAttributes {
+                mode: Mode::from_bits(stored.mode.get()).ok_or(CorruptValue::UnknownModeBits)?,
+                ownership: Ownership {
+                    user_id: stored.user_id.get(),
+                    group_id: stored.group_id.get(),
+                },
+                size: stored.size.get(),
+                last_accessed_at: Timestamp(stored.last_accessed_at.get()),
+                content_changed_at: Timestamp(stored.content_changed_at.get()),
+                created_at: Timestamp(stored.created_at.get()),
+            },
+            kind: FileType::try_read_from_bytes(&[stored.kind])
+                .map_err(|_| CorruptValue::UnknownFileType)?,
+            link_count: stored.link_count.get(),
+            allocated_size: stored.allocated_size.get(),
+            attribute_changed_at: Timestamp(stored.attribute_changed_at.get()),
+            parent: Inode(stored.parent.get()),
+            change_version: stored.change_version.get(),
+        })
+    }
+}
+
+impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
+    FsTransaction<'_, '_, T, C, A, N, S>
+{
+    pub fn getattr(
+        &self,
+        inode: Inode,
+    ) -> impl Future<Output = Result<Option<Attributes>, IoFailure<T::Failure, C::Failure>>> + Send
+    {
+        async move {
+            let Some(stored) = self
+                .metadata
+                .get(FsKey::new_attributes(inode).into())
+                .await
+                .map_err(IoFailure::Metadata)?
+            else {
+                return Ok(None);
+            };
+            let stored = StoredAttributes::view(&stored)
+                .map_err(|corrupt| IoFailure::Corrupt(corrupt.into()))?;
+            Attributes::try_from(stored)
+                .map(Some)
+                .map_err(IoFailure::Corrupt)
+        }
+    }
+
+    pub fn getxattr(
+        &self,
+        inode: Inode,
+        name: &[u8],
+    ) -> impl Future<
+        Output = Result<
+            Option<SpillableContent<C::Content>>,
+            GetxattrError<T::Failure, C::Failure>,
+        >,
+    > + Send {
+        async move {
+            if name.is_empty() {
+                return Err(GetxattrError::InvalidInput);
+            }
+            if name.len() > LARGEST_NAME_LENGTH {
+                return Err(GetxattrError::FileNameTooLong);
+            }
+            let (attributes, content) = join(self.getattr(inode), async {
+                let Some(stored) = self
+                    .metadata
+                    .get(FsKey::new_extended_attribute(inode, name).into())
+                    .await
+                    .map_err(IoFailure::Metadata)?
+                else {
+                    return Ok(None);
+                };
+                let value = SpillableValue::from_stored(stored).map_err(IoFailure::Corrupt)?;
+                let content = self
+                    .read_spillable(value)
+                    .await
+                    .map_err(IoFailure::ContentRead)?;
+                Ok::<_, IoFailure<T::Failure, C::Failure>>(Some(content))
+            })
+            .await;
+            if attributes?.is_none() {
+                return Err(GetxattrError::StaleFileHandle);
+            }
+            Ok(content?)
+        }
+    }
+
+    pub fn listxattr(
+        &self,
+        inode: Inode,
+    ) -> impl Future<Output = Result<Vec<Bytes>, ListxattrError<T::Failure, C::Failure>>> + Send
+    {
+        async move {
+            let (attributes, stored) = join(
+                self.getattr(inode),
+                self.metadata
+                    .get_range(extended_attributes_range(inode), usize::MAX),
+            )
+            .await;
+            if attributes?.is_none() {
+                return Err(ListxattrError::StaleFileHandle);
+            }
+            let names = stored
+                .map_err(IoFailure::Metadata)?
+                .into_iter()
+                .map(|(key, _)| extended_attribute_name(&key))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(IoFailure::Corrupt)?;
+            Ok(names)
+        }
+    }
+}
+
+impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sync, S: FsConfig>
+    FsTransaction<'_, '_, T, C, A, N, S>
+{
+    pub(crate) fn write_attributes(
+        &mut self,
+        inode: Inode,
+        attributes: &Attributes,
+    ) -> impl Future<Output = Result<(), StoreError<T::Rejection, T::Failure>>> + Send {
+        let stored = Bytes::from(&StoredAttributes::from(attributes));
+        async move {
+            self.metadata
+                .set(FsKey::new_attributes(inode).into(), stored)
+                .await
+                .map_err(refused_or_failed)
+        }
+    }
+
+    pub(crate) fn create_root_if_missing(
+        &mut self,
+    ) -> impl Future<Output = Result<(), StoreError<T::Rejection, T::Failure>>> + Send {
+        async move {
+            if self
+                .metadata
+                .get(FsKey::new_attributes(Inode::ROOT).into())
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            let now = self.now();
+            let root = Attributes {
+                settable: SettableAttributes {
+                    mode: Mode::OWNER_READ
+                        | Mode::OWNER_WRITE
+                        | Mode::OWNER_EXECUTE
+                        | Mode::GROUP_READ
+                        | Mode::GROUP_EXECUTE
+                        | Mode::OTHERS_READ
+                        | Mode::OTHERS_EXECUTE,
+                    ownership: Ownership {
+                        user_id: 0,
+                        group_id: 0,
+                    },
+                    size: 0,
+                    last_accessed_at: now,
+                    content_changed_at: now,
+                    created_at: now,
+                },
+                kind: FileType::Directory,
+                link_count: 2,
+                allocated_size: 0,
+                attribute_changed_at: now,
+                parent: Inode::ROOT,
+                change_version: 0,
+            };
+            self.write_attributes(Inode::ROOT, &root).await
+        }
+    }
+
+    pub fn setattr(
         &mut self,
         inode: Inode,
         update: impl FnOnce(&mut SettableAttributes) + Send,
-    ) -> Result<Attributes, FsError<T::Failure, C::Failure>> {
-        todo!()
+    ) -> impl Future<Output = Result<Attributes, SetattrError<T::Failure, T::Rejection, C::Failure>>>
+    + Send {
+        async move {
+            let mut attributes = self
+                .getattr(inode)
+                .await?
+                .ok_or(SetattrError::StaleFileHandle)?;
+            let size = attributes.settable.size;
+            update(&mut attributes.settable);
+            if attributes.settable.size != size {
+                todo!("resizing a file's content")
+            }
+            attributes.record_change(self.now());
+            self.write_attributes(inode, &attributes).await?;
+            Ok(attributes)
+        }
     }
 
-    pub async fn setxattr(
+    pub fn setxattr(
         &mut self,
         inode: Inode,
         name: &[u8],
-        value: Bytes,
+        value: impl Buf + Send,
         mode: SetXattrMode,
-    ) -> Result<(), FsError<T::Failure, C::Failure>> {
-        todo!()
+    ) -> impl Future<Output = Result<(), SetxattrError<T::Failure, T::Rejection, C::Failure>>> + Send
+    {
+        async move {
+            if name.is_empty() {
+                return Err(SetxattrError::InvalidInput);
+            }
+            if name.len() > LARGEST_NAME_LENGTH {
+                return Err(SetxattrError::FileNameTooLong);
+            }
+            let key = Bytes::from(FsKey::new_extended_attribute(inode, name));
+            let (attributes, existing) =
+                join(self.getattr(inode), self.metadata.get(key.clone())).await;
+            let mut attributes = attributes?.ok_or(SetxattrError::StaleFileHandle)?;
+            let exists = existing.map_err(IoFailure::Metadata)?.is_some();
+            match (mode, exists) {
+                (SetXattrMode::Create, true) => return Err(SetxattrError::AlreadyExists),
+                (SetXattrMode::Replace, false) => return Err(SetxattrError::AttributeNotFound),
+                (SetXattrMode::CreateOrReplace, _)
+                | (SetXattrMode::Create, false)
+                | (SetXattrMode::Replace, true) => {}
+            }
+            let value = self
+                .make_spillable(&key, value)
+                .await
+                .map_err(IoFailure::ContentWrite)?;
+            self.metadata
+                .set(key, value.to_stored())
+                .await
+                .map_err(refused_or_failed)?;
+            attributes.record_change(self.now());
+            self.write_attributes(inode, &attributes).await?;
+            Ok(())
+        }
     }
 
-    pub async fn removexattr(
+    pub fn removexattr(
         &mut self,
         inode: Inode,
         name: &[u8],
-    ) -> Result<(), FsError<T::Failure, C::Failure>> {
-        todo!()
+    ) -> impl Future<Output = Result<(), RemovexattrError<T::Failure, T::Rejection, C::Failure>>> + Send
+    {
+        async move {
+            if name.is_empty() {
+                return Err(RemovexattrError::InvalidInput);
+            }
+            if name.len() > LARGEST_NAME_LENGTH {
+                return Err(RemovexattrError::FileNameTooLong);
+            }
+            let key = Bytes::from(FsKey::new_extended_attribute(inode, name));
+            let (attributes, existing) =
+                join(self.getattr(inode), self.metadata.get(key.clone())).await;
+            let mut attributes = attributes?.ok_or(RemovexattrError::StaleFileHandle)?;
+            if existing.map_err(IoFailure::Metadata)?.is_none() {
+                return Err(RemovexattrError::AttributeNotFound);
+            }
+            self.metadata
+                .clear(key)
+                .await
+                .map_err(IoFailure::Metadata)?;
+            attributes.record_change(self.now());
+            self.write_attributes(inode, &attributes).await?;
+            Ok(())
+        }
     }
 }
+
+pub mod error;
+
+#[cfg(test)]
+mod tests;

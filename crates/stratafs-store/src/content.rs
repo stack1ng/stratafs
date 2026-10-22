@@ -27,6 +27,7 @@ pub enum GetRejection {
 
 pub trait ContentStore: Send + Sync {
     type Failure: std::error::Error + Send + Sync + 'static;
+    type Content: Buf + Send;
 
     fn put(
         &self,
@@ -38,5 +39,5 @@ pub trait ContentStore: Send + Sync {
         hash: &ContentHash,
         offset: u64,
         size: u64,
-    ) -> impl Future<Output = Result<impl Buf + Send, StoreError<GetRejection, Self::Failure>>> + Send;
+    ) -> impl Future<Output = Result<Self::Content, StoreError<GetRejection, Self::Failure>>> + Send;
 }

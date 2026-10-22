@@ -1,43 +1,55 @@
-#[derive(Debug, thiserror::Error)]
-pub enum FsError<M, C> {
-    #[error("ENOENT: No such file or directory")]
-    NotFound,
-    #[error("ESTALE: Stale file handle")]
-    StaleFileHandle,
-    #[error("EEXIST: File exists")]
-    AlreadyExists,
-    #[error("ENOTEMPTY: Directory not empty")]
-    DirectoryNotEmpty,
-    #[error("ENOTDIR: Not a directory")]
-    NotADirectory,
-    #[error("EISDIR: Is a directory")]
-    IsADirectory,
-    #[error("EINVAL: Invalid argument")]
-    InvalidInput,
-    #[error("EMLINK: Too many links")]
-    TooManyLinks,
-    #[error("ENAMETOOLONG: File name too long")]
-    FileNameTooLong,
-    #[error("ENOATTR: Attribute not found")]
-    AttributeNotFound,
-    #[error("EIO: Input/output error")]
-    InputOutputError(#[source] IoFailure<M, C>),
-}
+use stratafs_serialized::ViewError;
+use stratafs_store::content::GetRejection;
+use stratafs_store::error::StoreError;
+use stratafs_store::kv::SetRejection;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoFailure<M, C> {
     #[error(transparent)]
     Metadata(M),
     #[error(transparent)]
-    Content(C),
+    ContentRead(StoreError<GetRejection, C>),
+    #[error(transparent)]
+    ContentWrite(C),
     #[error(transparent)]
     Corrupt(CorruptValue),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CorruptValue {
+    #[error("the stored value was written as a different type")]
+    WrongFingerprint,
     #[error("the stored value has the wrong length for its type")]
     WrongLength,
     #[error("the stored spillable kind is not a known kind")]
     UnknownSpillableKind,
+    #[error("the stored file type is not a known file type")]
+    UnknownFileType,
+    #[error("the stored mode has bits that are not mode bits")]
+    UnknownModeBits,
+    #[error("a stored key could not be decoded")]
+    UndecodableKey(#[source] storekey::DecodeError),
+    #[error("a stored key is not the kind of key its position in the store implies")]
+    UnexpectedKey,
+}
+
+impl From<ViewError> for CorruptValue {
+    fn from(error: ViewError) -> Self {
+        match error {
+            ViewError::WrongFingerprint => CorruptValue::WrongFingerprint,
+            ViewError::WrongLength => CorruptValue::WrongLength,
+        }
+    }
+}
+
+pub(crate) fn refused_or_failed<R: std::error::Error, M>(
+    error: StoreError<SetRejection<R>, M>,
+) -> StoreError<R, M> {
+    match error {
+        StoreError::Rejected(SetRejection::Store(rejection)) => StoreError::Rejected(rejection),
+        StoreError::Rejected(rejection) => panic!(
+            "the metadata store rejected an entry the engine sized to fit its largest accepted entry, which should be impossible: {rejection}"
+        ),
+        StoreError::Failed(failure) => StoreError::Failed(failure),
+    }
 }

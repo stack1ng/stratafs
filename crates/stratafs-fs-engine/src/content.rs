@@ -3,7 +3,7 @@ use stratafs_store::content::ContentStore;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
 use crate::attributes::Attributes;
-use crate::error::FsError;
+use crate::error::IoFailure;
 use crate::{FsTransaction, Inode};
 
 impl<T: ReadKeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
@@ -12,11 +12,11 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_,
         inode: Inode,
         offset: u64,
         size: u64,
-    ) -> Result<impl Buf + Send, FsError<T::Failure, C::Failure>> {
+    ) -> Result<impl Buf + Send, IoFailure<T::Failure, C::Failure>> {
         Ok::<Bytes, _>(todo!())
     }
 
-    pub async fn readlink(&self, inode: Inode) -> Result<Bytes, FsError<T::Failure, C::Failure>> {
+    pub async fn readlink(&self, inode: Inode) -> Result<Bytes, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 }
@@ -27,7 +27,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, 
         inode: Inode,
         offset: u64,
         data: impl Buf + Send,
-    ) -> Result<Attributes, FsError<T::Failure, C::Failure>> {
+    ) -> Result<Attributes, IoFailure<T::Failure, C::Failure>> {
         todo!()
     }
 }
