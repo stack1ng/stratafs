@@ -8,7 +8,7 @@ use std::ops::Bound;
 
 use bytes::{Buf, Bytes};
 use futures_util::FutureExt;
-use futures_util::future::{join, join3};
+use futures_util::future::join;
 use stratafs_store::content::{ContentHash, ContentStore};
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
@@ -69,6 +69,53 @@ enum ContentPiece {
 impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
+    // overlapping_extents returns all extents that overlap at all with the range: [start, end)
+    fn overlapping_extents(
+        &self,
+        inode: Inode,
+        start: u64,
+        end: u64,
+    ) -> impl Future<Output = Result<Vec<(u64, ExtentValue)>, IoFailure<T::Failure, C::Failure>>> + Send
+    {
+        async move {
+            let directly_in_bounds_future = self.metadata.get_range(
+                (
+                    Bound::Excluded(Bytes::from(FsKey::new_extent(inode, start))),
+                    Bound::Included(Bytes::from(FsKey::new_extent(inode, end))),
+                ),
+                usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX),
+            );
+            let indirectly_in_bounds_future = self
+                .metadata
+                .get_range(
+                    (
+                        Bound::Excluded(Bytes::from(FsKey::new_extent(inode, end))),
+                        Bound::Unbounded,
+                    ),
+                    1,
+                )
+                .map(|found| found.map(|extents| extents.into_iter().next()));
+            let (directly_in_bounds, indirectly_in_bounds) =
+                join(directly_in_bounds_future, indirectly_in_bounds_future).await;
+            let directly_in_bounds = directly_in_bounds.map_err(IoFailure::Metadata)?;
+            let indirectly_in_bounds = indirectly_in_bounds.map_err(IoFailure::Metadata)?;
+            let mut extents = Vec::with_capacity(
+                directly_in_bounds.len() + usize::from(indirectly_in_bounds.is_some()),
+            );
+            for (key, value) in directly_in_bounds.into_iter().chain(indirectly_in_bounds) {
+                let extent_end = content_extent_end(&key).map_err(IoFailure::Corrupt)?;
+                let extent = ExtentValue::from_stored(value).map_err(IoFailure::Corrupt)?;
+                if extent.start >= extent_end {
+                    return Err(IoFailure::Corrupt(CorruptValue::InvalidExtent));
+                }
+                if extent.start < end {
+                    extents.push((extent_end, extent));
+                }
+            }
+            Ok(extents)
+        }
+    }
+
     pub fn read(
         &self,
         inode: Inode,
@@ -77,29 +124,9 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
     ) -> impl Future<Output = Result<ContentLoadPlan, ReadError<T::Failure, C::Failure>>> + Send
     {
         async move {
-            let requested_end = offset.saturating_add(size);
-            let directly_in_bounds_future = self.metadata.get_range(
-                (
-                    Bound::Excluded(Bytes::from(FsKey::new_extent(inode, offset))),
-                    Bound::Included(Bytes::from(FsKey::new_extent(inode, requested_end))),
-                ),
-                usize::try_from(size).unwrap_or(usize::MAX),
-            );
-            let indirectly_in_bounds_future = self
-                .metadata
-                .get_range(
-                    (
-                        Bound::Excluded(Bytes::from(FsKey::new_extent(inode, requested_end))),
-                        Bound::Unbounded,
-                    ),
-                    1,
-                )
-                .map(|found| found.map(|extents| extents.into_iter().next()));
-
-            let (attributes, directly_in_bounds, indirectly_in_bounds) = join3(
+            let (attributes, extents) = join(
                 self.getattr(inode),
-                directly_in_bounds_future,
-                indirectly_in_bounds_future,
+                self.overlapping_extents(inode, offset, offset.saturating_add(size)),
             )
             .await;
             let attributes = attributes?.ok_or(ReadError::StaleFileHandle)?;
@@ -110,17 +137,10 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
             }
             let size = size.min(attributes.settable.size.saturating_sub(offset));
             let read_end = offset + size;
-            let pieces = directly_in_bounds
-                .map_err(IoFailure::Metadata)?
+            let pieces = extents?
                 .into_iter()
-                .chain(indirectly_in_bounds.map_err(IoFailure::Metadata)?)
                 .map(
-                    |(key, value)| -> Result<Option<ContentPiece>, IoFailure<T::Failure, C::Failure>> {
-                        let end = content_extent_end(&key).map_err(IoFailure::Corrupt)?;
-                        let extent = ExtentValue::from_stored(value).map_err(IoFailure::Corrupt)?;
-                        if extent.start >= end {
-                            return Err(IoFailure::Corrupt(CorruptValue::InvalidExtent));
-                        }
+                    |(end, extent)| -> Result<Option<ContentPiece>, IoFailure<T::Failure, C::Failure>> {
                         let view_start = extent.start.max(offset);
                         let view_end = end.min(read_end);
                         if view_start >= view_end {

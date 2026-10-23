@@ -292,3 +292,56 @@ fn a_view_outside_the_stored_bytes_is_an_invalid_extent() {
         )))
     ));
 }
+
+fn overlapping(engine: &InMemoryEngine, inode: Inode, start: u64, end: u64) -> Vec<(u64, u64)> {
+    block_on(engine.read_transact(|txn| {
+        Box::pin(async move { txn.overlapping_extents(inode, start, end).await })
+    }))
+    .map_err(aborted)
+    .unwrap()
+    .into_iter()
+    .map(|(end, extent)| (extent.start, end))
+    .collect()
+}
+
+#[test]
+fn overlapping_extents_returns_whole_extents_touching_the_range() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    three_extents(&engine, inode);
+    assert_eq!(overlapping(&engine, inode, 12, 20), vec![(10, 30)]);
+    assert_eq!(
+        overlapping(&engine, inode, 5, 35),
+        vec![(0, 10), (10, 30), (30, 40)]
+    );
+    assert_eq!(overlapping(&engine, inode, 10, 30), vec![(10, 30)]);
+    assert_eq!(overlapping(&engine, inode, 40, 50), vec![]);
+}
+
+#[test]
+fn overlapping_extents_skips_an_extent_that_starts_after_a_hole() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    write_extent(
+        &engine,
+        inode,
+        10,
+        &ExtentValue {
+            start: 0,
+            offset: 0,
+            content: SpillableValue::Inline(Bytes::from_static(b"0123456789")),
+        },
+    );
+    write_extent(
+        &engine,
+        inode,
+        30,
+        &ExtentValue {
+            start: 20,
+            offset: 0,
+            content: SpillableValue::Inline(Bytes::from_static(b"abcdefghij")),
+        },
+    );
+    assert_eq!(overlapping(&engine, inode, 12, 15), vec![]);
+    assert_eq!(overlapping(&engine, inode, 12, 25), vec![(20, 30)]);
+}
