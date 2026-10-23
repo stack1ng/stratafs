@@ -66,7 +66,6 @@ pub struct Attributes {
 
     pub kind: FileType,
     pub hard_link_count: u32,
-    pub allocated_size: u64,
     pub attribute_changed_at: Timestamp,
 
     pub parent: Inode,
@@ -101,7 +100,6 @@ serialized_value! {
         user_id: U32,
         group_id: U32,
         size: U64,
-        allocated_size: U64,
         last_accessed_at: I64,
         content_changed_at: I64,
         attribute_changed_at: I64,
@@ -121,7 +119,6 @@ impl From<&Attributes> for StoredAttributes {
             user_id: U32::new(settable.ownership.user_id),
             group_id: U32::new(settable.ownership.group_id),
             size: U64::new(settable.size),
-            allocated_size: U64::new(attributes.allocated_size),
             last_accessed_at: I64::new(settable.last_accessed_at.0),
             content_changed_at: I64::new(settable.content_changed_at.0),
             attribute_changed_at: I64::new(attributes.attribute_changed_at.0),
@@ -151,7 +148,6 @@ impl TryFrom<&StoredAttributes> for Attributes {
             kind: FileType::try_read_from_bytes(&[stored.kind])
                 .map_err(|_| CorruptValue::UnknownFileType)?,
             hard_link_count: stored.hard_link_count.get(),
-            allocated_size: stored.allocated_size.get(),
             attribute_changed_at: Timestamp(stored.attribute_changed_at.get()),
             parent: Inode(stored.parent.get()),
             change_version: stored.change_version.get(),
@@ -301,7 +297,6 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 },
                 kind: FileType::Directory,
                 hard_link_count: 2,
-                allocated_size: 0,
                 attribute_changed_at: now,
                 parent: Inode::ROOT,
                 change_version: 0,

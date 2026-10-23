@@ -303,9 +303,7 @@ where
                 return Ok(attributes);
             }
             // clear out any overlaps before we write
-            let mut overwritten: u64 = 0;
             for (end, extent) in overlap? {
-                overwritten += end.min(write_end) - extent.start.max(write_start);
                 let kept_before = (extent.start < write_start).then_some(extent.start..write_start);
                 let kept_after = (write_end < end).then_some(write_end..end);
 
@@ -365,8 +363,6 @@ where
 
             let now = self.now();
             attributes.settable.size = attributes.settable.size.max(write_end);
-            attributes.allocated_size =
-                attributes.allocated_size.saturating_sub(overwritten) + write_length as u64;
             attributes.settable.content_changed_at = now;
             attributes.record_change(now);
             self.write_attributes(inode, &attributes).await?;

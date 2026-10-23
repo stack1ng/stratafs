@@ -468,7 +468,6 @@ where
                 },
                 kind,
                 hard_link_count,
-                allocated_size: 0,
                 attribute_changed_at: now,
                 parent: dir,
                 change_version: 0,

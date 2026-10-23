@@ -100,7 +100,6 @@ fn root_created_at(at: i64) -> Attributes {
         },
         kind: FileType::Directory,
         hard_link_count: 2,
-        allocated_size: 0,
         attribute_changed_at: Timestamp(at),
         parent: Inode::ROOT,
         change_version: 0,
@@ -369,7 +368,6 @@ fn stored_attributes_are_the_fingerprint_then_each_field_in_little_endian() {
         group_id: 20,
     };
     attributes.hard_link_count = 1;
-    attributes.allocated_size = 7;
     attributes.settable.content_changed_at = Timestamp(8);
     attributes.attribute_changed_at = Timestamp(9);
     attributes.settable.created_at = Timestamp(10);
@@ -381,7 +379,6 @@ fn stored_attributes_are_the_fingerprint_then_each_field_in_little_endian() {
     expected.extend_from_slice(&501u32.to_le_bytes());
     expected.extend_from_slice(&20u32.to_le_bytes());
     expected.extend_from_slice(&6u64.to_le_bytes());
-    expected.extend_from_slice(&7u64.to_le_bytes());
     expected.extend_from_slice(&(-3i64).to_le_bytes());
     expected.extend_from_slice(&8i64.to_le_bytes());
     expected.extend_from_slice(&9i64.to_le_bytes());
@@ -430,6 +427,6 @@ fn decoding_rejects_unknown_file_types_and_mode_bits() {
     ));
     assert_eq!(
         StoredAttributes::from(&root_created_at(0)).as_bytes().len(),
-        79
+        71
     );
 }

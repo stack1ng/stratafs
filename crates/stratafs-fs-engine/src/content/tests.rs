@@ -91,7 +91,6 @@ fn file_of_size(engine: &InMemoryEngine, inode: Inode, size: u64) {
         },
         kind: FileType::File,
         hard_link_count: 1,
-        allocated_size: 0,
         attribute_changed_at: Timestamp(0),
         parent: Inode::ROOT,
         change_version: 0,
@@ -467,7 +466,6 @@ fn a_write_stores_one_extent_and_records_the_change() {
         vec![(0..5, Bytes::from_static(b"hello"))]
     );
     assert_eq!(attributes.settable.size, 5);
-    assert_eq!(attributes.allocated_size, 5);
     assert_eq!(attributes.settable.content_changed_at, Timestamp(5));
     assert_eq!(attributes.attribute_changed_at, Timestamp(5));
     assert_eq!(attributes.change_version, 1);
@@ -489,7 +487,6 @@ fn a_write_past_the_end_leaves_a_hole_and_grows_the_file() {
         ]
     );
     assert_eq!(attributes.settable.size, 13);
-    assert_eq!(attributes.allocated_size, 6);
 }
 
 #[test]
@@ -508,7 +505,6 @@ fn a_write_inside_one_extent_keeps_both_of_its_sides() {
         ]
     );
     assert_eq!(attributes.settable.size, 10);
-    assert_eq!(attributes.allocated_size, 10);
 }
 
 #[test]
@@ -526,7 +522,6 @@ fn a_write_over_the_end_of_an_extent_keeps_its_start() {
         ]
     );
     assert_eq!(attributes.settable.size, 12);
-    assert_eq!(attributes.allocated_size, 12);
 }
 
 #[test]
@@ -544,7 +539,6 @@ fn a_write_over_the_start_of_an_extent_keeps_its_end() {
         ]
     );
     assert_eq!(attributes.settable.size, 14);
-    assert_eq!(attributes.allocated_size, 12);
 }
 
 #[test]
@@ -559,7 +553,6 @@ fn a_write_over_a_whole_extent_replaces_it() {
         vec![(0..10, Bytes::from_static(b"abcdefghij"))]
     );
     assert_eq!(attributes.settable.size, 10);
-    assert_eq!(attributes.allocated_size, 10);
 }
 
 #[test]
@@ -580,7 +573,6 @@ fn a_write_across_extents_trims_the_outer_ones_and_removes_the_inner_ones() {
         ]
     );
     assert_eq!(attributes.settable.size, 30);
-    assert_eq!(attributes.allocated_size, 30);
 }
 
 #[test]
@@ -600,7 +592,6 @@ fn a_write_between_extents_leaves_them_untouched() {
         ]
     );
     assert_eq!(attributes.settable.size, 15);
-    assert_eq!(attributes.allocated_size, 15);
 }
 
 #[test]
