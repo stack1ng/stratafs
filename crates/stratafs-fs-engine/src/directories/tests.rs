@@ -441,6 +441,42 @@ fn hard_unlink_refuses_directories_missing_names_and_unexpected_inodes() {
     hard_unlink(&engine, Inode::ROOT, b"a", Some(a)).unwrap();
 }
 
+fn set_hard_link_count(engine: &InMemoryEngine, inode: Inode, hard_link_count: u32) {
+    let mut attributes = getattr(engine, inode).unwrap();
+    attributes.hard_link_count = hard_link_count;
+    block_on(engine.transact(|mut txn| {
+        let attributes = attributes.clone();
+        Box::pin(async move { txn.write_attributes(inode, &attributes).await })
+    }))
+    .unwrap();
+}
+
+#[test]
+fn hard_unlinking_a_name_its_inode_does_not_count_is_corrupt() {
+    let engine = new_test_engine();
+    let a = file(&engine, Inode::ROOT, b"a");
+    set_hard_link_count(&engine, a, 0);
+    assert!(matches!(
+        hard_unlink(&engine, Inode::ROOT, b"a", None),
+        Err(HardUnlinkError::InputOutputError(IoFailure::Corrupt(
+            CorruptValue::UncountedHardLink
+        )))
+    ));
+}
+
+#[test]
+fn rmdir_under_a_parent_that_does_not_count_the_directory_is_corrupt() {
+    let engine = new_test_engine();
+    directory(&engine, Inode::ROOT, b"d");
+    set_hard_link_count(&engine, Inode::ROOT, 0);
+    assert!(matches!(
+        rmdir(&engine, Inode::ROOT, b"d"),
+        Err(RmdirError::InputOutputError(IoFailure::Corrupt(
+            CorruptValue::UncountedHardLink
+        )))
+    ));
+}
+
 #[test]
 fn rmdir_removes_an_empty_directory_and_its_hard_link_to_the_parent() {
     let engine = new_test_engine();

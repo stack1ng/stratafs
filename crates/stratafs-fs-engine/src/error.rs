@@ -39,6 +39,8 @@ pub enum CorruptValue {
     MissingSymbolicLinkTarget,
     #[error("an extent's stored range is not a valid range")]
     InvalidExtent,
+    #[error("a hard link exists that its inode's stored hard link count does not count")]
+    UncountedHardLink,
 }
 
 impl From<ViewError> for CorruptValue {

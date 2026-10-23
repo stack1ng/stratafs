@@ -371,7 +371,12 @@ where
             item.record_change(now);
             match item.kind {
                 FileType::Directory => item.hard_link_count = 0,
-                FileType::File | FileType::SymbolicLink => item.hard_link_count -= 1,
+                FileType::File | FileType::SymbolicLink => {
+                    item.hard_link_count = item
+                        .hard_link_count
+                        .checked_sub(1)
+                        .ok_or(IoFailure::Corrupt(CorruptValue::UncountedHardLink))?
+                }
             }
             if item.hard_link_count == 0 {
                 self.delete_inode(inode)
@@ -634,7 +639,10 @@ where
             let now = self.now();
             self.release_name(dir, entry.position, entry.inode, &mut item, now)
                 .await?;
-            directory.hard_link_count -= 1;
+            directory.hard_link_count = directory
+                .hard_link_count
+                .checked_sub(1)
+                .ok_or(IoFailure::Corrupt(CorruptValue::UncountedHardLink))?;
             self.write_entry_change(dir, &mut directory, now).await?;
             Ok(EntryChange {
                 inode: entry.inode,
