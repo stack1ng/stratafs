@@ -474,9 +474,6 @@ where
                 change_version: 0,
             };
             update(&mut attributes.settable);
-            if attributes.settable.size != size {
-                todo!("resizing a file's content")
-            }
             if let NewItem::SymbolicLink(target) = item {
                 let key = Bytes::from(FsKey::new_symbolic_link_target(inode));
                 let value = self
