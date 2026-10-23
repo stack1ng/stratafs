@@ -4,28 +4,170 @@
 // The long return types come from that form.
 #![allow(clippy::manual_async_fn, clippy::type_complexity)]
 
+use std::ops::Bound;
+
 use bytes::{Buf, Bytes};
-use futures_util::future::join;
-use stratafs_store::content::ContentStore;
+use futures_util::FutureExt;
+use futures_util::future::{join, join3};
+use stratafs_store::content::{ContentHash, ContentStore};
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
 use crate::attributes::{Attributes, FileType};
-use crate::content::error::ReadSymbolicLinkError;
+use crate::content::error::{ReadError, ReadSymbolicLinkError};
 use crate::error::{CorruptValue, IoFailure};
-use crate::key::FsKey;
+use crate::key::{FsKey, content_extent_end};
 use crate::spillable::{SpillableContent, SpillableValue};
 use crate::{FsTransaction, Inode};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtentValue {
+    start: u64,
+    offset: u64,
+    content: SpillableValue,
+}
+
+impl ExtentValue {
+    fn from_stored(stored: Bytes) -> Result<Self, CorruptValue> {
+        let (start, rest) = stored
+            .split_first_chunk()
+            .ok_or(CorruptValue::WrongLength)?;
+        let (offset, content) = rest.split_first_chunk().ok_or(CorruptValue::WrongLength)?;
+        Ok(ExtentValue {
+            start: u64::from_le_bytes(*start),
+            offset: u64::from_le_bytes(*offset),
+            content: SpillableValue::from_stored(stored.slice_ref(content))?,
+        })
+    }
+
+    fn to_stored(&self) -> impl Buf + Send {
+        Bytes::from([self.start.to_le_bytes(), self.offset.to_le_bytes()].concat())
+            .chain(self.content.to_stored())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentLoadPlan {
+    offset: u64,
+    size: u64,
+    pieces: Vec<ContentPiece>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentPiece {
+    Inline {
+        start: u64,
+        content: Bytes,
+    },
+    Stored {
+        start: u64,
+        hash: ContentHash,
+        offset: u64,
+        length: u64,
+    },
+}
 
 impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
-    pub async fn read(
+    pub fn read(
         &self,
         inode: Inode,
         offset: u64,
         size: u64,
-    ) -> Result<impl Buf + Send, IoFailure<T::Failure, C::Failure>> {
-        Ok::<Bytes, _>(todo!())
+    ) -> impl Future<Output = Result<ContentLoadPlan, ReadError<T::Failure, C::Failure>>> + Send
+    {
+        async move {
+            let requested_end = offset.saturating_add(size);
+            let directly_in_bounds_future = self.metadata.get_range(
+                (
+                    Bound::Excluded(Bytes::from(FsKey::new_extent(inode, offset))),
+                    Bound::Included(Bytes::from(FsKey::new_extent(inode, requested_end))),
+                ),
+                usize::try_from(size).unwrap_or(usize::MAX),
+            );
+            let indirectly_in_bounds_future = self
+                .metadata
+                .get_range(
+                    (
+                        Bound::Excluded(Bytes::from(FsKey::new_extent(inode, requested_end))),
+                        Bound::Unbounded,
+                    ),
+                    1,
+                )
+                .map(|found| found.map(|extents| extents.into_iter().next()));
+
+            let (attributes, directly_in_bounds, indirectly_in_bounds) = join3(
+                self.getattr(inode),
+                directly_in_bounds_future,
+                indirectly_in_bounds_future,
+            )
+            .await;
+            let attributes = attributes?.ok_or(ReadError::StaleFileHandle)?;
+            match attributes.kind {
+                FileType::File => {}
+                FileType::Directory => return Err(ReadError::IsADirectory),
+                FileType::SymbolicLink => return Err(ReadError::InvalidInput),
+            }
+            let size = size.min(attributes.settable.size.saturating_sub(offset));
+            let read_end = offset + size;
+            let pieces = directly_in_bounds
+                .map_err(IoFailure::Metadata)?
+                .into_iter()
+                .chain(indirectly_in_bounds.map_err(IoFailure::Metadata)?)
+                .map(
+                    |(key, value)| -> Result<Option<ContentPiece>, IoFailure<T::Failure, C::Failure>> {
+                        let end = content_extent_end(&key).map_err(IoFailure::Corrupt)?;
+                        let extent = ExtentValue::from_stored(value).map_err(IoFailure::Corrupt)?;
+                        if extent.start >= end {
+                            return Err(IoFailure::Corrupt(CorruptValue::InvalidExtent));
+                        }
+                        let view_start = extent.start.max(offset);
+                        let view_end = end.min(read_end);
+                        if view_start >= view_end {
+                            return Ok(None);
+                        }
+                        let view_offset = extent
+                            .offset
+                            .checked_add(view_start - extent.start)
+                            .ok_or(IoFailure::Corrupt(CorruptValue::InvalidExtent))?;
+                        let view_size = view_end - view_start;
+                        let view_end_in_content = view_offset
+                            .checked_add(view_size)
+                            .ok_or(IoFailure::Corrupt(CorruptValue::InvalidExtent))?;
+                        Ok(Some(match extent.content {
+                            SpillableValue::Inline(content) => {
+                                let visible = usize::try_from(view_offset)
+                                    .ok()
+                                    .zip(usize::try_from(view_end_in_content).ok())
+                                    .and_then(|(start, end)| content.get(start..end))
+                                    .ok_or(IoFailure::Corrupt(CorruptValue::InvalidExtent))?;
+                                ContentPiece::Inline {
+                                    start: view_start,
+                                    content: content.slice_ref(visible),
+                                }
+                            }
+                            SpillableValue::Overflow { hash, length } => {
+                                if view_end_in_content > length {
+                                    return Err(IoFailure::Corrupt(CorruptValue::InvalidExtent));
+                                }
+                                ContentPiece::Stored {
+                                    start: view_start,
+                                    hash,
+                                    offset: view_offset,
+                                    length: view_size,
+                                }
+                            }
+                        }))
+                    },
+                )
+                .filter_map(Result::transpose)
+                .collect::<Result<Vec<ContentPiece>, IoFailure<T::Failure, C::Failure>>>()?;
+            Ok(ContentLoadPlan {
+                offset,
+                size,
+                pieces,
+            })
+        }
     }
 
     pub fn read_symbolic_link(
@@ -79,3 +221,6 @@ impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, 
 }
 
 pub mod error;
+
+#[cfg(test)]
+mod tests;

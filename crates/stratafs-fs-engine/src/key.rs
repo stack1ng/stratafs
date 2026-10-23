@@ -21,6 +21,7 @@ pub(crate) enum KeyKind<'a> {
     DirectoryEntry(u64),
     HardLink { dir: Inode, position: u64 },
     SymbolicLinkTarget,
+    ContentExtent { end: u64 },
 }
 
 const INODE_AND_KIND_LENGTH: usize = size_of::<u64>() + 1;
@@ -58,6 +59,13 @@ impl<'a> FsKey<'a> {
         FsKey {
             inode,
             kind: KeyKind::SymbolicLinkTarget,
+        }
+    }
+
+    pub(crate) fn new_extent(inode: Inode, end: u64) -> Self {
+        FsKey {
+            inode,
+            kind: KeyKind::ContentExtent { end },
         }
     }
 }
@@ -148,6 +156,17 @@ pub(crate) fn directory_entry_position(key: &[u8]) -> Result<u64, CorruptValue> 
             kind: KeyKind::DirectoryEntry(position),
             ..
         }) => Ok(position),
+        Ok(_) => Err(CorruptValue::UnexpectedKey),
+        Err(error) => Err(CorruptValue::UndecodableKey(error)),
+    }
+}
+
+pub(crate) fn content_extent_end(key: &[u8]) -> Result<u64, CorruptValue> {
+    match storekey::decode_borrow::<FsKey>(key) {
+        Ok(FsKey {
+            kind: KeyKind::ContentExtent { end },
+            ..
+        }) => Ok(end),
         Ok(_) => Err(CorruptValue::UnexpectedKey),
         Err(error) => Err(CorruptValue::UndecodableKey(error)),
     }

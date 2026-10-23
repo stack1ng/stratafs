@@ -37,6 +37,8 @@ pub enum CorruptValue {
     MissingParent,
     #[error("a symlink has no stored target")]
     MissingSymbolicLinkTarget,
+    #[error("an extent's stored range is not a valid range")]
+    InvalidExtent,
 }
 
 impl From<ViewError> for CorruptValue {

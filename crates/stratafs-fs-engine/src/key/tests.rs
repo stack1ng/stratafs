@@ -117,6 +117,9 @@ fn every_kind_of_key_sorts_together_under_its_inode_in_declaration_order() {
         Bytes::from(FsKey::new_hard_link(Inode(256), Inode(0), 0)),
         Bytes::from(FsKey::new_hard_link(Inode(256), Inode(7), 3)),
         Bytes::from(FsKey::new_symbolic_link_target(Inode(256))),
+        Bytes::from(FsKey::new_extent(Inode(256), 1)),
+        Bytes::from(FsKey::new_extent(Inode(256), 0x0100)),
+        Bytes::from(FsKey::new_extent(Inode(256), u64::MAX)),
         Bytes::from(FsKey::new_attributes(Inode(257))),
     ];
     let mut sorted = ordered.to_vec();
