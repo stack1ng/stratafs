@@ -4,7 +4,7 @@
 // The long return types come from that form.
 #![allow(clippy::manual_async_fn, clippy::type_complexity)]
 
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 
 use bytes::{Buf, Bytes};
 use futures_util::FutureExt;
@@ -13,20 +13,22 @@ use stratafs_store::content::{ContentHash, ContentStore};
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
 use crate::attributes::{Attributes, FileType};
-use crate::content::error::{ReadError, ReadSymbolicLinkError};
-use crate::error::{CorruptValue, IoFailure};
+use crate::content::error::{ReadError, ReadSymbolicLinkError, WriteError};
+use crate::error::{CorruptValue, IoFailure, refused_or_failed};
 use crate::key::{FsKey, content_extent_end};
 use crate::spillable::{SpillableContent, SpillableValue};
-use crate::{FsTransaction, Inode};
+use crate::{FsConfig, FsTransaction, Inode, Timestamp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtentValue {
     start: u64,
-    offset: u64,
+    content_offset: u64,
     content: SpillableValue,
 }
 
 impl ExtentValue {
+    const STORED_PREFIX_LENGTH: usize = size_of::<u64>() + size_of::<u64>();
+
     fn from_stored(stored: Bytes) -> Result<Self, CorruptValue> {
         let (start, rest) = stored
             .split_first_chunk()
@@ -34,14 +36,45 @@ impl ExtentValue {
         let (offset, content) = rest.split_first_chunk().ok_or(CorruptValue::WrongLength)?;
         Ok(ExtentValue {
             start: u64::from_le_bytes(*start),
-            offset: u64::from_le_bytes(*offset),
+            content_offset: u64::from_le_bytes(*offset),
             content: SpillableValue::from_stored(stored.slice_ref(content))?,
         })
     }
 
     fn to_stored(&self) -> impl Buf + Send {
-        Bytes::from([self.start.to_le_bytes(), self.offset.to_le_bytes()].concat())
+        Bytes::from([self.start.to_le_bytes(), self.content_offset.to_le_bytes()].concat())
             .chain(self.content.to_stored())
+    }
+
+    fn slice(&self, range: Range<u64>) -> Result<ExtentValue, CorruptValue> {
+        let content_offset = self
+            .content_offset
+            .checked_add(range.start - self.start)
+            .ok_or(CorruptValue::InvalidExtent)?;
+        match &self.content {
+            SpillableValue::Inline(content) => {
+                let visible = content_offset
+                    .checked_add(range.end - range.start)
+                    .and_then(|content_end| {
+                        Some((
+                            usize::try_from(content_offset).ok()?,
+                            usize::try_from(content_end).ok()?,
+                        ))
+                    })
+                    .and_then(|(start, end)| content.get(start..end))
+                    .ok_or(CorruptValue::InvalidExtent)?;
+                Ok(ExtentValue {
+                    start: range.start,
+                    content_offset: 0,
+                    content: SpillableValue::Inline(content.slice_ref(visible)),
+                })
+            }
+            SpillableValue::Overflow { .. } => Ok(ExtentValue {
+                start: range.start,
+                content_offset,
+                content: self.content.clone(),
+            }),
+        }
     }
 }
 
@@ -66,8 +99,13 @@ enum ContentPiece {
     },
 }
 
-impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
-    FsTransaction<'_, '_, T, C, A, N, S>
+impl<T, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S>
+where
+    T: ReadKeyValueTransaction,
+    C: ContentStore,
+    A: Sync,
+    N: Sync,
+    S: Sync,
 {
     // overlapping_extents returns all extents that overlap at all with the range: [start, end)
     fn overlapping_extents(
@@ -90,7 +128,7 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
                 .get_range(
                     (
                         Bound::Excluded(Bytes::from(FsKey::new_extent(inode, end))),
-                        Bound::Unbounded,
+                        Bound::Included(Bytes::from(FsKey::new_extent(inode, u64::MAX))),
                     ),
                     1,
                 )
@@ -147,7 +185,7 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
                             return Ok(None);
                         }
                         let view_offset = extent
-                            .offset
+                            .content_offset
                             .checked_add(view_start - extent.start)
                             .ok_or(IoFailure::Corrupt(CorruptValue::InvalidExtent))?;
                         let view_size = view_end - view_start;
@@ -229,14 +267,111 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
     }
 }
 
-impl<T: KeyValueTransaction, C: ContentStore, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
-    pub async fn write(
+impl<T, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S>
+where
+    T: KeyValueTransaction,
+    C: ContentStore,
+    A: Sync,
+    N: Fn() -> Timestamp + Sync,
+    S: FsConfig,
+{
+    pub fn write(
         &mut self,
         inode: Inode,
         offset: u64,
         data: impl Buf + Send,
-    ) -> Result<Attributes, IoFailure<T::Failure, C::Failure>> {
-        todo!()
+    ) -> impl Future<Output = Result<Attributes, WriteError<T::Failure, T::Rejection, C::Failure>>> + Send
+    {
+        async move {
+            let write_start = offset;
+            let write_length = data.remaining();
+            let write_end = offset
+                .checked_add(write_length as u64)
+                .ok_or(WriteError::FileTooLarge)?;
+            let (attributes, overlap) = join(
+                self.getattr(inode),
+                self.overlapping_extents(inode, offset, write_end),
+            )
+            .await;
+            let mut attributes = attributes?.ok_or(WriteError::StaleFileHandle)?;
+            match attributes.kind {
+                FileType::File => {}
+                FileType::Directory => return Err(WriteError::IsADirectory),
+                FileType::SymbolicLink => return Err(WriteError::InvalidInput),
+            }
+            if write_length == 0 {
+                return Ok(attributes);
+            }
+            // clear out any overlaps before we write
+            let mut overwritten: u64 = 0;
+            for (end, extent) in overlap? {
+                overwritten += end.min(write_end) - extent.start.max(write_start);
+                let kept_before = (extent.start < write_start).then_some(extent.start..write_start);
+                let kept_after = (write_end < end).then_some(write_end..end);
+
+                // handle preserving any part of the extent that extends out to the left of what we are writing
+                if let Some(kept_before) = kept_before {
+                    self.metadata
+                        .set(
+                            Bytes::from(FsKey::new_extent(inode, kept_before.end)),
+                            extent
+                                .slice(kept_before)
+                                .map_err(IoFailure::Corrupt)?
+                                .to_stored(),
+                        )
+                        .await
+                        .map_err(refused_or_failed)?
+                }
+
+                // handle preserving any part of the extent that extends out to the right of what we are writing
+                match kept_after {
+                    Some(kept_after) => self
+                        .metadata
+                        .set(
+                            Bytes::from(FsKey::new_extent(inode, end)),
+                            extent
+                                .slice(kept_after)
+                                .map_err(IoFailure::Corrupt)?
+                                .to_stored(),
+                        )
+                        .await
+                        .map_err(refused_or_failed)?,
+                    None => self
+                        .metadata
+                        .clear(Bytes::from(FsKey::new_extent(inode, end)))
+                        .await
+                        .map_err(IoFailure::Metadata)?,
+                }
+            }
+
+            // write the range
+            let key = Bytes::from(FsKey::new_extent(inode, write_end));
+            let content = self
+                .make_spillable(&key, ExtentValue::STORED_PREFIX_LENGTH, data)
+                .await
+                .map_err(IoFailure::ContentWrite)?;
+            self.metadata
+                .set(
+                    key,
+                    ExtentValue {
+                        start: write_start,
+                        content_offset: 0,
+                        content,
+                    }
+                    .to_stored(),
+                )
+                .await
+                .map_err(refused_or_failed)?;
+
+            let now = self.now();
+            attributes.settable.size = attributes.settable.size.max(write_end);
+            attributes.allocated_size =
+                attributes.allocated_size.saturating_sub(overwritten) + write_length as u64;
+            attributes.settable.content_changed_at = now;
+            attributes.record_change(now);
+            self.write_attributes(inode, &attributes).await?;
+            Ok(attributes)
+        }
     }
 }
 

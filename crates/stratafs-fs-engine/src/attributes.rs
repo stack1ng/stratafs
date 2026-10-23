@@ -360,7 +360,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 | (SetXattrMode::Replace, true) => {}
             }
             let value = self
-                .make_spillable(&key, value)
+                .make_spillable(&key, 0, value)
                 .await
                 .map_err(IoFailure::ContentWrite)?;
             self.metadata

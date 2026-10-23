@@ -475,7 +475,7 @@ where
             if let NewItem::SymbolicLink(target) = item {
                 let key = Bytes::from(FsKey::new_symbolic_link_target(inode));
                 let value = self
-                    .make_spillable(&key, target)
+                    .make_spillable(&key, 0, target)
                     .await
                     .map_err(IoFailure::ContentWrite)?;
                 self.metadata

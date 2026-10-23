@@ -7,10 +7,10 @@ use crate::test_support::{InMemoryEngine, OneKibInline, new_test_engine};
 
 const KEY: &[u8] = b"key";
 
-fn make_spillable(engine: &InMemoryEngine, content: Bytes) -> SpillableValue {
+fn make_spillable(engine: &InMemoryEngine, prefix_length: usize, content: Bytes) -> SpillableValue {
     block_on(engine.transact(|txn| {
         let content = content.clone();
-        Box::pin(async move { txn.make_spillable(KEY, content).await })
+        Box::pin(async move { txn.make_spillable(KEY, prefix_length, content).await })
     }))
     .unwrap()
 }
@@ -32,7 +32,7 @@ fn small_content_stays_inline() {
     let engine = new_test_engine();
     let content = content_of_length(10);
     assert_eq!(
-        make_spillable(&engine, content.clone()),
+        make_spillable(&engine, 0, content.clone()),
         SpillableValue::Inline(content.clone())
     );
     assert_eq!(
@@ -48,7 +48,7 @@ fn content_filling_the_largest_inline_entry_exactly_stays_inline() {
         OneKibInline::LARGEST_INLINE_ENTRY - KEY.len() - SpillableValue::TAG_LENGTH,
     );
     assert_eq!(
-        make_spillable(&engine, content.clone()),
+        make_spillable(&engine, 0, content.clone()),
         SpillableValue::Inline(content.clone())
     );
     assert_eq!(
@@ -65,7 +65,7 @@ fn content_one_byte_over_the_largest_inline_entry_spills_to_the_content_store() 
     );
     let hash = ContentHash::of(&content);
     assert_eq!(
-        make_spillable(&engine, content.clone()),
+        make_spillable(&engine, 0, content.clone()),
         SpillableValue::Overflow {
             hash,
             length: content.len() as u64,
@@ -148,5 +148,26 @@ fn decoding_rejects_corrupt_values() {
     assert!(matches!(
         SpillableValue::from_stored(Bytes::from(one_byte_too_long)),
         Err(CorruptValue::WrongLength)
+    ));
+}
+
+#[test]
+fn the_prefix_counts_toward_the_largest_inline_entry() {
+    let engine = new_test_engine();
+    let prefix_length = 16;
+    let fits = content_of_length(
+        OneKibInline::LARGEST_INLINE_ENTRY - KEY.len() - prefix_length - SpillableValue::TAG_LENGTH,
+    );
+    assert_eq!(
+        make_spillable(&engine, prefix_length, fits.clone()),
+        SpillableValue::Inline(fits)
+    );
+    let one_over = content_of_length(
+        OneKibInline::LARGEST_INLINE_ENTRY - KEY.len() - prefix_length - SpillableValue::TAG_LENGTH
+            + 1,
+    );
+    assert!(matches!(
+        make_spillable(&engine, prefix_length, one_over),
+        SpillableValue::Overflow { .. }
     ));
 }

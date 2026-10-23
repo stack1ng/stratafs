@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use futures_lite::future::block_on;
 use stratafs_opendal::OpendalError;
 use stratafs_redb::RedbFailure;
@@ -6,7 +8,7 @@ use super::*;
 use crate::Timestamp;
 use crate::attributes::{Mode, Ownership, SettableAttributes};
 use crate::directories::NewItem;
-use crate::test_support::{InMemoryEngine, aborted, new_test_engine};
+use crate::test_support::{InMemoryEngine, OneKibInline, aborted, new_test_engine, set_clock};
 
 fn stored(extent: &ExtentValue) -> Bytes {
     let mut stored = extent.to_stored();
@@ -17,7 +19,7 @@ fn stored(extent: &ExtentValue) -> Bytes {
 fn an_extent_is_stored_as_its_start_and_offset_then_its_spillable_value() {
     let extent = ExtentValue {
         start: 0x0102,
-        offset: 0x0304,
+        content_offset: 0x0304,
         content: SpillableValue::Inline(Bytes::from_static(b"abc")),
     };
     let mut expected = Vec::new();
@@ -33,12 +35,12 @@ fn stored_extents_decode_to_the_extent_that_was_stored() {
     for extent in [
         ExtentValue {
             start: 0,
-            offset: 0,
+            content_offset: 0,
             content: SpillableValue::Inline(Bytes::from_static(b"inline")),
         },
         ExtentValue {
             start: 4096,
-            offset: 40,
+            content_offset: 40,
             content: SpillableValue::Overflow {
                 hash: ContentHash::of(b"blob"),
                 length: 1 << 20,
@@ -109,7 +111,7 @@ fn three_extents(engine: &InMemoryEngine, inode: Inode) -> ContentHash {
         10,
         &ExtentValue {
             start: 0,
-            offset: 0,
+            content_offset: 0,
             content: SpillableValue::Inline(Bytes::from_static(b"0123456789")),
         },
     );
@@ -119,7 +121,7 @@ fn three_extents(engine: &InMemoryEngine, inode: Inode) -> ContentHash {
         30,
         &ExtentValue {
             start: 10,
-            offset: 5,
+            content_offset: 5,
             content: SpillableValue::Overflow {
                 hash: blob,
                 length: 100,
@@ -132,7 +134,7 @@ fn three_extents(engine: &InMemoryEngine, inode: Inode) -> ContentHash {
         40,
         &ExtentValue {
             start: 30,
-            offset: 0,
+            content_offset: 0,
             content: SpillableValue::Inline(Bytes::from_static(b"abcdefghij")),
         },
     );
@@ -281,7 +283,7 @@ fn a_view_outside_the_stored_bytes_is_an_invalid_extent() {
         10,
         &ExtentValue {
             start: 0,
-            offset: 5,
+            content_offset: 5,
             content: SpillableValue::Inline(Bytes::from_static(b"short")),
         },
     );
@@ -328,7 +330,7 @@ fn overlapping_extents_skips_an_extent_that_starts_after_a_hole() {
         10,
         &ExtentValue {
             start: 0,
-            offset: 0,
+            content_offset: 0,
             content: SpillableValue::Inline(Bytes::from_static(b"0123456789")),
         },
     );
@@ -338,10 +340,437 @@ fn overlapping_extents_skips_an_extent_that_starts_after_a_hole() {
         30,
         &ExtentValue {
             start: 20,
-            offset: 0,
+            content_offset: 0,
             content: SpillableValue::Inline(Bytes::from_static(b"abcdefghij")),
         },
     );
     assert_eq!(overlapping(&engine, inode, 12, 15), vec![]);
     assert_eq!(overlapping(&engine, inode, 12, 25), vec![(20, 30)]);
+}
+
+#[test]
+fn slicing_an_inline_extent_shares_its_bytes_and_starts_at_offset_zero() {
+    let content = Bytes::from_static(b"__0123456789");
+    let extent = ExtentValue {
+        start: 100,
+        content_offset: 2,
+        content: SpillableValue::Inline(content.clone()),
+    };
+    let slice = extent.slice(103..107).unwrap();
+    assert_eq!(slice.start, 103);
+    assert_eq!(slice.content_offset, 0);
+    let SpillableValue::Inline(sliced) = &slice.content else {
+        panic!("an inline extent sliced into an overflow extent");
+    };
+    assert_eq!(sliced, &Bytes::from_static(b"3456"));
+    assert_eq!(sliced.as_ptr(), content[5..].as_ptr());
+}
+
+#[test]
+fn slicing_an_overflow_extent_moves_its_offset_into_the_same_blob() {
+    let content = SpillableValue::Overflow {
+        hash: ContentHash::of(b"blob"),
+        length: 100,
+    };
+    let extent = ExtentValue {
+        start: 100,
+        content_offset: 10,
+        content: content.clone(),
+    };
+    assert_eq!(
+        extent.slice(130..150).unwrap(),
+        ExtentValue {
+            start: 130,
+            content_offset: 40,
+            content,
+        }
+    );
+}
+
+#[test]
+fn slicing_past_the_inline_bytes_is_an_invalid_extent() {
+    let extent = ExtentValue {
+        start: 0,
+        content_offset: 0,
+        content: SpillableValue::Inline(Bytes::from_static(b"short")),
+    };
+    assert!(matches!(
+        extent.slice(2..10),
+        Err(CorruptValue::InvalidExtent)
+    ));
+}
+
+type Write = WriteError<RedbFailure, Infallible, OpendalError>;
+
+fn write(
+    engine: &InMemoryEngine,
+    inode: Inode,
+    offset: u64,
+    data: &[u8],
+) -> Result<Attributes, Write> {
+    let data = Bytes::copy_from_slice(data);
+    block_on(engine.transact(|mut txn| {
+        let data = data.clone();
+        Box::pin(async move { txn.write(inode, offset, data).await })
+    }))
+    .map_err(aborted)
+}
+
+fn getattr(engine: &InMemoryEngine, inode: Inode) -> Option<Attributes> {
+    block_on(engine.read_transact(|txn| Box::pin(async move { txn.getattr(inode).await })))
+        .map_err(aborted)
+        .unwrap()
+}
+
+fn stored_extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(u64, ExtentValue)> {
+    block_on(engine.read_transact(|txn| {
+        Box::pin(async move { txn.overlapping_extents(inode, 0, u64::MAX).await })
+    }))
+    .map_err(aborted)
+    .unwrap()
+}
+
+fn extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(Range<u64>, Bytes)> {
+    stored_extents(engine, inode)
+        .into_iter()
+        .map(|(end, extent)| {
+            let length = end - extent.start;
+            let content = match extent.content {
+                SpillableValue::Inline(content) => content.slice(
+                    usize::try_from(extent.content_offset).unwrap()
+                        ..usize::try_from(extent.content_offset + length).unwrap(),
+                ),
+                SpillableValue::Overflow { hash, .. } => {
+                    let mut content =
+                        block_on(engine.content.get(&hash, extent.content_offset, length)).unwrap();
+                    content.copy_to_bytes(content.remaining())
+                }
+            };
+            (extent.start..end, content)
+        })
+        .collect()
+}
+
+fn content_of_length(length: usize) -> Bytes {
+    Bytes::from((0..length).map(|index| index as u8).collect::<Vec<_>>())
+}
+
+#[test]
+fn a_write_stores_one_extent_and_records_the_change() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    set_clock(5);
+    let attributes = write(&engine, inode, 0, b"hello").unwrap();
+    assert_eq!(
+        extents(&engine, inode),
+        vec![(0..5, Bytes::from_static(b"hello"))]
+    );
+    assert_eq!(attributes.settable.size, 5);
+    assert_eq!(attributes.allocated_size, 5);
+    assert_eq!(attributes.settable.content_changed_at, Timestamp(5));
+    assert_eq!(attributes.attribute_changed_at, Timestamp(5));
+    assert_eq!(attributes.change_version, 1);
+    assert_eq!(getattr(&engine, inode), Some(attributes));
+}
+
+#[test]
+fn a_write_past_the_end_leaves_a_hole_and_grows_the_file() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"abc").unwrap();
+    let attributes = write(&engine, inode, 10, b"xyz").unwrap();
+    assert_eq!(
+        extents(&engine, inode),
+        vec![
+            (0..3, Bytes::from_static(b"abc")),
+            (10..13, Bytes::from_static(b"xyz")),
+        ]
+    );
+    assert_eq!(attributes.settable.size, 13);
+    assert_eq!(attributes.allocated_size, 6);
+}
+
+#[test]
+fn a_write_inside_one_extent_keeps_both_of_its_sides() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"0123456789").unwrap();
+    let attributes = write(&engine, inode, 4, b"ab").unwrap();
+    assert_eq!(
+        extents(&engine, inode),
+        vec![
+            (0..4, Bytes::from_static(b"0123")),
+            (4..6, Bytes::from_static(b"ab")),
+            (6..10, Bytes::from_static(b"6789")),
+        ]
+    );
+    assert_eq!(attributes.settable.size, 10);
+    assert_eq!(attributes.allocated_size, 10);
+}
+
+#[test]
+fn a_write_over_the_end_of_an_extent_keeps_its_start() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"0123456789").unwrap();
+    let attributes = write(&engine, inode, 8, b"abcd").unwrap();
+    assert_eq!(
+        extents(&engine, inode),
+        vec![
+            (0..8, Bytes::from_static(b"01234567")),
+            (8..12, Bytes::from_static(b"abcd")),
+        ]
+    );
+    assert_eq!(attributes.settable.size, 12);
+    assert_eq!(attributes.allocated_size, 12);
+}
+
+#[test]
+fn a_write_over_the_start_of_an_extent_keeps_its_end() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 4, b"0123456789").unwrap();
+    let attributes = write(&engine, inode, 2, b"abcd").unwrap();
+    assert_eq!(
+        extents(&engine, inode),
+        vec![
+            (2..6, Bytes::from_static(b"abcd")),
+            (6..14, Bytes::from_static(b"23456789")),
+        ]
+    );
+    assert_eq!(attributes.settable.size, 14);
+    assert_eq!(attributes.allocated_size, 12);
+}
+
+#[test]
+fn a_write_over_a_whole_extent_replaces_it() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"0123456789").unwrap();
+    let attributes = write(&engine, inode, 0, b"abcdefghij").unwrap();
+    assert_eq!(
+        extents(&engine, inode),
+        vec![(0..10, Bytes::from_static(b"abcdefghij"))]
+    );
+    assert_eq!(attributes.settable.size, 10);
+    assert_eq!(attributes.allocated_size, 10);
+}
+
+#[test]
+fn a_write_across_extents_trims_the_outer_ones_and_removes_the_inner_ones() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"0123456789").unwrap();
+    write(&engine, inode, 10, b"abcdefghij").unwrap();
+    write(&engine, inode, 20, b"ABCDEFGHIJ").unwrap();
+    let attributes = write(&engine, inode, 5, b"xxxxxxxxxxxxxxxxxxxx").unwrap();
+    assert_eq!(
+        extents(&engine, inode),
+        vec![
+            (0..5, Bytes::from_static(b"01234")),
+            (5..25, Bytes::from_static(b"xxxxxxxxxxxxxxxxxxxx")),
+            (25..30, Bytes::from_static(b"FGHIJ")),
+        ]
+    );
+    assert_eq!(attributes.settable.size, 30);
+    assert_eq!(attributes.allocated_size, 30);
+}
+
+#[test]
+fn a_write_between_extents_leaves_them_untouched() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"01234").unwrap();
+    write(&engine, inode, 10, b"56789").unwrap();
+    let attributes = write(&engine, inode, 5, b"abcde").unwrap();
+    assert_eq!(
+        extents(&engine, inode),
+        vec![
+            (0..5, Bytes::from_static(b"01234")),
+            (5..10, Bytes::from_static(b"abcde")),
+            (10..15, Bytes::from_static(b"56789")),
+        ]
+    );
+    assert_eq!(attributes.settable.size, 15);
+    assert_eq!(attributes.allocated_size, 15);
+}
+
+#[test]
+fn a_file_never_sees_the_extents_of_the_next_file() {
+    let engine = new_test_engine();
+    file_of_size(&engine, Inode(7), 0);
+    file_of_size(&engine, Inode(8), 0);
+    write(&engine, Inode(8), 0, b"next").unwrap();
+    write(&engine, Inode(7), 0, b"this").unwrap();
+    assert_eq!(
+        extents(&engine, Inode(7)),
+        vec![(0..4, Bytes::from_static(b"this"))]
+    );
+    assert_eq!(
+        read(&engine, Inode(7), 0, 10),
+        (
+            4,
+            vec![ContentPiece::Inline {
+                start: 0,
+                content: Bytes::from_static(b"this")
+            }]
+        )
+    );
+}
+
+#[test]
+fn a_write_stays_inline_while_its_extent_fits_the_largest_inline_entry() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let key_length = Bytes::from(FsKey::new_extent(inode, 0)).len();
+    let empty_extent_length = stored(&ExtentValue {
+        start: 0,
+        content_offset: 0,
+        content: SpillableValue::Inline(Bytes::new()),
+    })
+    .len();
+    let largest_inline = OneKibInline::LARGEST_INLINE_ENTRY - key_length - empty_extent_length;
+    let fits = content_of_length(largest_inline);
+    write(&engine, inode, 0, &fits).unwrap();
+    assert_eq!(
+        stored_extents(&engine, inode),
+        vec![(
+            largest_inline as u64,
+            ExtentValue {
+                start: 0,
+                content_offset: 0,
+                content: SpillableValue::Inline(fits),
+            }
+        )]
+    );
+    let spills = content_of_length(largest_inline + 1);
+    write(&engine, inode, 0, &spills).unwrap();
+    assert_eq!(
+        stored_extents(&engine, inode),
+        vec![(
+            spills.len() as u64,
+            ExtentValue {
+                start: 0,
+                content_offset: 0,
+                content: SpillableValue::Overflow {
+                    hash: ContentHash::of(&spills),
+                    length: spills.len() as u64,
+                },
+            }
+        )]
+    );
+}
+
+#[test]
+fn overwriting_part_of_a_spilled_extent_keeps_pointing_into_its_blob() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let content = content_of_length(2000);
+    write(&engine, inode, 0, &content).unwrap();
+    write(&engine, inode, 100, b"ab").unwrap();
+    let blob = SpillableValue::Overflow {
+        hash: ContentHash::of(&content),
+        length: 2000,
+    };
+    assert_eq!(
+        stored_extents(&engine, inode),
+        vec![
+            (
+                100,
+                ExtentValue {
+                    start: 0,
+                    content_offset: 0,
+                    content: blob.clone(),
+                }
+            ),
+            (
+                102,
+                ExtentValue {
+                    start: 100,
+                    content_offset: 0,
+                    content: SpillableValue::Inline(Bytes::from_static(b"ab")),
+                }
+            ),
+            (
+                2000,
+                ExtentValue {
+                    start: 102,
+                    content_offset: 102,
+                    content: blob,
+                }
+            ),
+        ]
+    );
+    let mut expected = content.to_vec();
+    expected[100..102].copy_from_slice(b"ab");
+    assert_eq!(
+        extents(&engine, inode)
+            .into_iter()
+            .flat_map(|(_, content)| content)
+            .collect::<Vec<u8>>(),
+        expected
+    );
+}
+
+#[test]
+fn an_empty_write_changes_nothing() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 10);
+    set_clock(5);
+    let before = getattr(&engine, inode).unwrap();
+    assert_eq!(write(&engine, inode, 100, b"").unwrap(), before);
+    assert_eq!(getattr(&engine, inode), Some(before));
+    assert_eq!(extents(&engine, inode), vec![]);
+}
+
+#[test]
+fn write_needs_an_existing_regular_file() {
+    let engine = new_test_engine();
+    let link = block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            txn.create(
+                Inode::ROOT,
+                b"link",
+                NewItem::SymbolicLink(Bytes::from_static(b"target")),
+                |_| {},
+            )
+            .await
+        })
+    }))
+    .unwrap()
+    .inode;
+    assert!(matches!(
+        write(&engine, Inode(7), 0, b"a"),
+        Err(WriteError::StaleFileHandle)
+    ));
+    assert!(matches!(
+        write(&engine, Inode::ROOT, 0, b"a"),
+        Err(WriteError::IsADirectory)
+    ));
+    assert!(matches!(
+        write(&engine, link, 0, b"a"),
+        Err(WriteError::InvalidInput)
+    ));
+}
+
+#[test]
+fn a_write_ending_past_the_largest_offset_is_too_large() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    assert!(matches!(
+        write(&engine, inode, u64::MAX, b"a"),
+        Err(WriteError::FileTooLarge)
+    ));
 }

@@ -118,11 +118,14 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     pub(crate) fn make_spillable(
         &self,
         key: &[u8],
+        prefix_length: usize,
         mut content: impl Buf + Send,
     ) -> impl Future<Output = Result<SpillableValue, C::Failure>> + Send {
         async move {
             let length = content.remaining();
-            if key.len() + SpillableValue::TAG_LENGTH + length <= S::LARGEST_INLINE_ENTRY {
+            if key.len() + prefix_length + SpillableValue::TAG_LENGTH + length
+                <= S::LARGEST_INLINE_ENTRY
+            {
                 return Ok(SpillableValue::Inline(content.copy_to_bytes(length)));
             }
             let hash = self.content.put(content).await?;
