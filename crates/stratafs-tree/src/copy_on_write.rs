@@ -147,7 +147,7 @@ where
             let plan: [Option<LayerMutationPlanAction<C::Range>>; 2] = match node_size {
                 size if size > C::NODE_CAPACITY => {
                     // handle splitting a node
-                    let split_at: usize = entries_to_write.midpoint_by_size();
+                    let split_at: usize = entries_to_write.n_midpoints_by_size(1)[0];
 
                     let mut right_half = entries_to_write.split_off(split_at);
                     let separator = separator_for_parent(writing_over_kind, &mut right_half)
@@ -271,7 +271,7 @@ where
                     match size_of::<NodeHeader>() + combined_entries.stored_length() {
                         // redistribute between the 2 nodes
                         size if size > C::NODE_CAPACITY => {
-                            let split_at = combined_entries.midpoint_by_size();
+                            let split_at = combined_entries.n_midpoints_by_size(1)[0];
                             let mut right_half = combined_entries.split_off(split_at);
                             let separator =
                                 separator_for_parent(writing_over_kind, &mut right_half)

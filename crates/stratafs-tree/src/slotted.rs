@@ -120,29 +120,36 @@ where
         Ok(Err(low))
     }
 
-    // find the index where the entries before it (each one's slot + data) add up closest to half
-    // of all entries' size (stored_length() without the trailing count).
-    // The starts already store those running totals, so it can use binary search on them
-    // to find the first index that reaches half, then compare it with the index before it.
-    pub(crate) fn midpoint_by_size(&self) -> usize {
+    // find the n indices that split the entries into n + 1 runs, each where the entries before it
+    // (each one's slot + data) add up closest to its share of all entries' size
+    // (stored_length() without the trailing count).
+    // The starts already store those running totals, so each can use binary search on them
+    // to find the first index that reaches its share, then compare it with the index before it.
+    pub(crate) fn n_midpoints_by_size(&self, n: usize) -> Vec<usize> {
         let (data, starts) = self.parts();
         let total = data.len() + starts.len() * Self::ADDRESS_LENGTH;
         let front_size = |index: usize| {
             starts.get(index).map_or(data.len(), R::decode) + index * Self::ADDRESS_LENGTH
         };
-        let (mut low, mut high) = (0, starts.len());
-        while low < high {
-            let middle = low + (high - low) / 2;
-            if 2 * front_size(middle) < total {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        let below = low.saturating_sub(1);
-        let overshoot = 2 * front_size(low) - total;
-        let undershoot = total - 2 * front_size(below);
-        if undershoot < overshoot { below } else { low }
+        let runs = n + 1;
+        (1..=n)
+            .map(|midpoint| {
+                let share = midpoint * total;
+                let (mut low, mut high) = (0, starts.len());
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    if runs * front_size(middle) < share {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                let below = low.saturating_sub(1);
+                let overshoot = runs * front_size(low) - share;
+                let undershoot = share - runs * front_size(below);
+                if undershoot < overshoot { below } else { low }
+            })
+            .collect()
     }
 
     fn parts(&self) -> (&[u8], &[R::Stored]) {

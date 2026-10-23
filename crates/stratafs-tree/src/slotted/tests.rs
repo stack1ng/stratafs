@@ -385,19 +385,32 @@ fn binary_search_on_an_empty_list_inserts_at_the_start() {
 #[test]
 fn the_midpoint_is_the_index_where_the_front_is_closest_to_half_the_size() {
     assert_eq!(
-        list_of::<u16>(&[b"aaaa", b"b", b"c", b"dddd"]).midpoint_by_size(),
-        2
+        list_of::<u16>(&[b"aaaa", b"b", b"c", b"dddd"]).n_midpoints_by_size(1),
+        vec![2]
     );
     assert_eq!(
-        list_of::<u16>(&[b"aaaaaaaa", b"b", b"c"]).midpoint_by_size(),
-        1
+        list_of::<u16>(&[b"aaaaaaaa", b"b", b"c"]).n_midpoints_by_size(1),
+        vec![1]
     );
     assert_eq!(
-        list_of::<u16>(&[b"b", b"c", b"aaaaaaaa"]).midpoint_by_size(),
-        2
+        list_of::<u16>(&[b"b", b"c", b"aaaaaaaa"]).n_midpoints_by_size(1),
+        vec![2]
     );
-    assert_eq!(list_of::<u16>(&[b"a"]).midpoint_by_size(), 1);
-    assert_eq!(list_of::<u16>(&[]).midpoint_by_size(), 0);
+    assert_eq!(list_of::<u16>(&[b"a"]).n_midpoints_by_size(1), vec![1]);
+    assert_eq!(list_of::<u16>(&[]).n_midpoints_by_size(1), vec![0]);
+}
+
+#[test]
+fn n_midpoints_are_the_indices_where_the_front_is_closest_to_each_share_of_the_size() {
+    assert_eq!(
+        list_of::<u16>(&[b"aa", b"bb", b"cc", b"dd", b"ee", b"ff"]).n_midpoints_by_size(2),
+        vec![2, 4]
+    );
+    assert_eq!(
+        list_of::<u16>(&[b"aaaaaaaaaa", b"b", b"c", b"d", b"e"]).n_midpoints_by_size(2),
+        vec![1, 2]
+    );
+    assert_eq!(list_of::<u16>(&[b"a"]).n_midpoints_by_size(0), vec![]);
 }
 
 fn midpoint_matches_the_index_closest_to_half_the_size<R: AddressableRange>(
@@ -417,7 +430,7 @@ fn midpoint_matches_the_index_closest_to_half_the_size<R: AddressableRange>(
             )
         })
         .unwrap();
-    prop_assert_eq!(list.midpoint_by_size(), expected);
+    prop_assert_eq!(list.n_midpoints_by_size(1), vec![expected]);
     Ok(())
 }
 
