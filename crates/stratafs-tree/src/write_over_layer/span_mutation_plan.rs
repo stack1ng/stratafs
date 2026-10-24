@@ -169,11 +169,9 @@ where
 
 fn separator_for_parent<R: AddressableRange>(
     kind: NodeKind,
-    right_half: &mut SlottedList<BytesMut, [u8], u32>,
+    chunk: &mut SlottedList<BytesMut, [u8], u32>,
 ) -> Result<Box<[u8]>, CorruptValue> {
-    let first_entry = right_half
-        .get(0)
-        .expect("a split leaves both halves with entries")?;
+    let first_entry = chunk.get(0).expect("packing never makes an empty chunk")?;
     match kind {
         NodeKind::Leaf => {
             let (key, _) = LeafEntry::<R>::ref_from_bytes(first_entry)
@@ -187,7 +185,7 @@ fn separator_for_parent<R: AddressableRange>(
             let (child, separator) = (first_entry.child, Box::from(&first_entry.key));
             let leftmost_length = InternalEntry::size_for_metadata(LEFTMOST_SEPARATOR.len())
                 .expect("an internal entry fits in memory");
-            InternalEntry::mut_from_bytes(right_half.replace_zeroed(0, leftmost_length))
+            InternalEntry::mut_from_bytes(chunk.replace_zeroed(0, leftmost_length))
                 .expect("the replaced space is sized for a leftmost entry")
                 .child = child;
             Ok(separator)

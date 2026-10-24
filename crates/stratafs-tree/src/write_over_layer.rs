@@ -91,11 +91,14 @@ where
     }
 
     // fit_layer handles actually fitting the given entries to the given nodes.
-    // It packs entries left to right, dropping nodes that dont end up being used,
-    // and creating new ones if we overflow the given set of nodes. Then, if the tail (rightmost)
-    // node ends up being underfull, it merges with a neighbor. When writing nodes into the tree,
-    // it makes sure to write over a new node if the node's epoch is older than the volume's,
-    // otherwise it mutates in place. It returns the desired state of the parent layer.
+    // First, any span too small to fill a node pulls in its lighter neighbor, and spans that end up
+    // sharing a node are joined. Then each span's entries are packed into nodes that each meet the
+    // minimum, reusing the span's nodes, creating new ones if they overflow, and deleting the ones
+    // left over. An internal span left with a single entry is the only node on its layer,
+    // so it is deleted and its child is promoted into the parent layer.
+    // When writing nodes into the tree, it makes sure to write over a new node if the node's epoch
+    // is older than the volume's, otherwise it mutates in place. It returns the desired state of
+    // the parent layer, which at the root is the volume header.
     async fn fit_layer(
         &mut self,
         volume: VolumeHeader,

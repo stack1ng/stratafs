@@ -250,7 +250,7 @@ pub(super) fn resolve_node_relative_first_separator<B: AsRef<[u8]>, R: Addressab
             let mut entries = entries.into_typed::<InternalEntry>();
             let child = entries
                 .get(0)
-                .expect("an internal node being merged has a child")?
+                .ok_or(CorruptValue::EmptyInternalNode)??
                 .child;
             entries.replace_entry(0, child, separator);
             Ok(entries.into_untyped())
