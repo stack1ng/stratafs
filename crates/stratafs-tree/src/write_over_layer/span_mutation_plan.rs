@@ -72,7 +72,7 @@ where
                     mutations: smallvec![LayerNodeMutation::Update {
                         node: root,
                         separator: span_lower_bound,
-                        entries: span.entries,
+                        entries: SlottedList::empty(),
                     }],
                 });
             }
@@ -130,18 +130,18 @@ where
             SmallVec::with_capacity(chunks.len());
         let mut nodes = span.nodes.into_iter();
         for mut chunk in chunks.into_iter().rev() {
-            let first_key = separator_for_parent(kind, &mut chunk).map_err(TreeFailure::Corrupt)?;
+            let first_key =
+                separator_for_parent::<C::Range>(kind, &mut chunk).map_err(TreeFailure::Corrupt)?;
             let separator = first_separator.take().unwrap_or(first_key);
+            let mut entries = SlottedList::<BytesMut, [u8], C::Range>::empty();
+            entries.extend_from_list(&chunk);
             mutations.push(match nodes.next() {
                 Some(node) => LayerNodeMutation::Update {
                     node,
                     separator,
-                    entries: chunk,
+                    entries,
                 },
-                None => LayerNodeMutation::Create {
-                    separator,
-                    entries: chunk,
-                },
+                None => LayerNodeMutation::Create { separator, entries },
             });
         }
         // any remaining nodes dont have any entries, and should therefore be deleted
@@ -152,11 +152,11 @@ where
 
     pub(super) fn node_size(
         kind: NodeKind,
-        entries: &SlottedList<BytesMut, [u8], C::Range>,
+        entries: &SlottedList<BytesMut, [u8], u32>,
         range: Range<usize>,
     ) -> usize {
-        C::EMPTY_NODE_SIZE + entries.size_before(range.end)
-            - entries.size_before(range.start)
+        C::EMPTY_NODE_SIZE + entries.data_before(range.end) - entries.data_before(range.start)
+            + range.len() * size_of::<<C::Range as AddressableRange>::Stored>()
             - match kind {
                 NodeKind::Leaf => 0,
                 NodeKind::Internal => entries
@@ -169,7 +169,7 @@ where
 
 fn separator_for_parent<R: AddressableRange>(
     kind: NodeKind,
-    right_half: &mut SlottedList<BytesMut, [u8], R>,
+    right_half: &mut SlottedList<BytesMut, [u8], u32>,
 ) -> Result<Box<[u8]>, CorruptValue> {
     let first_entry = right_half
         .get(0)

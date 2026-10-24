@@ -101,6 +101,19 @@ fn leaf_entries_written_into_a_list_hold_their_keys_and_values() {
 }
 
 #[test]
+fn leaf_entries_written_into_a_wider_list_keep_the_node_format() {
+    let mut node_list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
+    node_list.insert_entry(0, b"key", &b"value"[..]);
+    let mut span_list = SlottedList::<BytesMut, LeafEntry<u16>, u32>::empty();
+    span_list.insert_entry(0, b"other", &b"value"[..]);
+    span_list.replace_entry(0, b"key", &b"value"[..]);
+    assert_eq!(
+        span_list.get(0).unwrap().unwrap().as_bytes(),
+        node_list.get(0).unwrap().unwrap().as_bytes()
+    );
+}
+
+#[test]
 fn a_leaf_entry_value_in_parts_is_written_whole() {
     let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
     list.insert_entry(0, b"key", (&b"val"[..]).chain(&b"ue"[..]));

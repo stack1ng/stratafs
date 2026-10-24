@@ -102,7 +102,7 @@ where
                         node.steps[..node.steps.len() - 1].iter().cloned().collect();
                     let parent_entries = resolve_node_relative_first_separator(
                         NodeKind::Internal,
-                        SlottedList::from(step.entries.clone().into_untyped()),
+                        &step.entries.clone().into_untyped(),
                         &parent_steps,
                     )?;
                     last_parent_offset = parent_span.entries.len();
@@ -134,7 +134,7 @@ where
         // - collect its new parent entries, one (separator, id) per Update and Create, in order;
         // - a Delete adds nothing;
         // - a Promote adds (separator, child) without writing anything.
-        let mut replacements: SmallVec<[SlottedList<BytesMut, [u8], C::Range>; 1]> =
+        let mut replacements: SmallVec<[SlottedList<BytesMut, [u8], u32>; 1]> =
             SmallVec::with_capacity(group.len());
         for plan in group {
             replacements.push(self.execute_span_mutation_plan(volume, kind, plan).await?);
@@ -175,7 +175,7 @@ where
         Option<LayerSpan<C::Range>>,
         StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
     > {
-        let mut roots = SlottedList::<BytesMut, [u8], C::Range>::empty();
+        let mut roots = SlottedList::<BytesMut, [u8], u32>::empty();
         for plan in group {
             roots.extend_from_list(&self.execute_span_mutation_plan(volume, kind, plan).await?);
         }
@@ -221,10 +221,10 @@ where
         kind: NodeKind,
         plan: SpanMutationPlan<C::Range>,
     ) -> Result<
-        SlottedList<BytesMut, [u8], C::Range>,
+        SlottedList<BytesMut, [u8], u32>,
         StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
     > {
-        let mut parent_entries = SlottedList::<BytesMut, InternalEntry, C::Range>::empty();
+        let mut parent_entries = SlottedList::<BytesMut, InternalEntry, u32>::empty();
         for mutation in plan.mutations {
             match mutation {
                 Create { separator, entries } => {

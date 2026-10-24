@@ -148,6 +148,28 @@ fn extend_from_list_copies_the_other_lists_entries_onto_the_end() {
 }
 
 #[test]
+fn extend_from_list_copies_between_address_widths() {
+    let mut wide = list_of::<u32>(&[b"ab"]);
+    wide.extend_from_list(&list_of::<u8>(&[b"cde", b"f"]));
+    assert_eq!(
+        &wide.clone().into_inner()[..],
+        stored::<u32>(b"abcdef", &[0, 2, 5])
+    );
+    let mut narrow = list_of::<u8>(&[]);
+    narrow.extend_from_list_starting_at(&wide, 1);
+    assert_eq!(&narrow.into_inner()[..], stored::<u8>(b"cdef", &[0, 3]));
+}
+
+#[test]
+fn extend_from_list_into_a_narrower_list_panics_past_its_range() {
+    let mut narrow = list_of::<u8>(&[&[0; 200]]);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        narrow.extend_from_list(&list_of::<u32>(&[&[0; 100]]));
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
 fn extend_from_list_with_an_empty_side() {
     let mut list = list_of::<u16>(&[b"ab", b"cde"]);
     list.extend_from_list(&list_of::<u16>(&[]));
@@ -406,6 +428,14 @@ fn the_size_before_an_index_is_the_data_and_slots_of_the_entries_before_it() {
     assert_eq!(list.size_before(0), 0);
     assert_eq!(list.size_before(1), 4);
     assert_eq!(list.size_before(2), 7);
+}
+
+#[test]
+fn the_data_before_an_index_is_the_data_of_the_entries_before_it() {
+    let list = list_of::<u32>(&[b"aa", b"b"]);
+    assert_eq!(list.data_before(0), 0);
+    assert_eq!(list.data_before(1), 2);
+    assert_eq!(list.data_before(2), 3);
 }
 
 #[test]

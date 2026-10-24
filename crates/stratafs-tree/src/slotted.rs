@@ -159,8 +159,12 @@ where
     }
 
     pub(crate) fn size_before(&self, index: usize) -> usize {
+        self.data_before(index) + index * Self::ADDRESS_LENGTH
+    }
+
+    pub(crate) fn data_before(&self, index: usize) -> usize {
         let (data, starts) = self.parts();
-        starts.get(index).map_or(data.len(), R::decode) + index * Self::ADDRESS_LENGTH
+        starts.get(index).map_or(data.len(), R::decode)
     }
 
     fn parts(&self) -> (&[u8], &[R::Stored]) {
@@ -264,19 +268,22 @@ where
 
     // extend_from_list has the same semantics as Vec::extend_from_slice: it copies the other list's entries
     // onto the end of this list, and leaves the other list unchanged.
-    pub(crate) fn extend_from_list<B: AsRef<[u8]>>(&mut self, other: &SlottedList<B, T, R>) {
+    pub(crate) fn extend_from_list<B: AsRef<[u8]>, O: AddressableRange>(
+        &mut self,
+        other: &SlottedList<B, T, O>,
+    ) {
         self.extend_from_list_starting_at(other, 0);
     }
 
-    pub(crate) fn extend_from_list_starting_at<B: AsRef<[u8]>>(
+    pub(crate) fn extend_from_list_starting_at<B: AsRef<[u8]>, O: AddressableRange>(
         &mut self,
-        other: &SlottedList<B, T, R>,
+        other: &SlottedList<B, T, O>,
         index: usize,
     ) {
         let (data_length, count) = self.lengths();
         let (other_data, other_starts) = other.parts();
         let other_starts = &other_starts[index..];
-        let skipped = other_starts.first().map_or(other_data.len(), R::decode);
+        let skipped = other_starts.first().map_or(other_data.len(), O::decode);
         let other_data = &other_data[skipped..];
         assert!(
             data_length + other_data.len() <= R::MAX && count + other_starts.len() <= R::MAX,
@@ -293,7 +300,7 @@ where
         self.bytes[data_length..data_length + other_data.len()].copy_from_slice(other_data);
         self.set_count(count + other_starts.len());
         for (slot, start) in self.starts_mut()[count..].iter_mut().zip(other_starts) {
-            *slot = address::<R>(R::decode(start) - skipped + data_length);
+            *slot = address::<R>(O::decode(start) - skipped + data_length);
         }
     }
 

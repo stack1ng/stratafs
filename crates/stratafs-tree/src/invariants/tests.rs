@@ -129,11 +129,13 @@ fn layer(
     nodes: Vec<LayerNode<u16>>,
     entries: SlottedList<BytesMut, [u8], u16>,
 ) -> Layer<u16> {
+    let mut span_entries = SlottedList::<BytesMut, [u8], u32>::empty();
+    span_entries.extend_from_list(&entries);
     Layer {
         kind,
         spans: smallvec![LayerSpan {
             nodes: SmallVec::from_vec(nodes),
-            entries,
+            entries: span_entries,
         }],
     }
 }

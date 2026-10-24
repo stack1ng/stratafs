@@ -53,9 +53,9 @@ impl<R: AddressableRange> LeafEntry<R> {
     }
 }
 
-impl<R: AddressableRange> SlottedList<BytesMut, LeafEntry<R>, R> {
+impl<K: AddressableRange, R: AddressableRange> SlottedList<BytesMut, LeafEntry<K>, R> {
     pub(crate) fn insert_entry(&mut self, index: usize, key: &[u8], value: impl Buf) {
-        let key_length = R::encode(key.len()).expect(
+        let key_length = K::encode(key.len()).expect(
             "callers only write keys that fit in a node, and a node fits the addressable range",
         );
         self.insert_zeroed(index, key.len() + value.remaining())
@@ -63,7 +63,7 @@ impl<R: AddressableRange> SlottedList<BytesMut, LeafEntry<R>, R> {
     }
 
     pub(crate) fn replace_entry(&mut self, index: usize, key: &[u8], value: impl Buf) {
-        let key_length = R::encode(key.len()).expect(
+        let key_length = K::encode(key.len()).expect(
             "callers only write keys that fit in a node, and a node fits the addressable range",
         );
         self.replace_zeroed(index, key.len() + value.remaining())

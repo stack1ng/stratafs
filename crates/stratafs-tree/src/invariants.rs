@@ -23,8 +23,8 @@ pub(crate) fn plan_has_at_most_one_action_per_node<R: AddressableRange>(
         .all(|(index, id): (usize, NodeId)| observed().skip(index + 1).all(|other| other != id))
 }
 
-pub(crate) fn leaf_keys_ascend<B: AsRef<[u8]>, R: AddressableRange>(
-    entries: &SlottedList<B, LeafEntry<R>, R>,
+pub(crate) fn leaf_keys_ascend<B: AsRef<[u8]>, K: AddressableRange, R: AddressableRange>(
+    entries: &SlottedList<B, LeafEntry<K>, R>,
 ) -> bool {
     let mut previous: Option<&[u8]> = None;
     for index in 0..entries.len() {
@@ -126,7 +126,7 @@ fn span_entries_ascend_within_bounds<R: AddressableRange>(
     let bytes = &span.entries.get_ref()[..];
     match kind {
         NodeKind::Leaf => {
-            let Ok(entries) = SlottedList::<&[u8], LeafEntry<R>, R>::new(bytes) else {
+            let Ok(entries) = SlottedList::<&[u8], LeafEntry<R>, u32>::new(bytes) else {
                 return false;
             };
             let key = |index: usize| {
@@ -140,7 +140,7 @@ fn span_entries_ascend_within_bounds<R: AddressableRange>(
                 && keys_within_bounds(span, key(0), entries.len().checked_sub(1).and_then(key))
         }
         NodeKind::Internal => {
-            let Ok(entries) = SlottedList::<&[u8], InternalEntry, R>::new(bytes) else {
+            let Ok(entries) = SlottedList::<&[u8], InternalEntry, u32>::new(bytes) else {
                 return false;
             };
             let key = |index: usize| {

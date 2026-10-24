@@ -151,12 +151,9 @@ where
                 (Some(left), _) => (Side::Left, left),
                 (None, Some(right)) => (Side::Right, right),
             };
-            let mut neighbor_entries = resolve_node_relative_first_separator(
-                kind,
-                SlottedList::from(entries),
-                &node.steps,
-            )
-            .map_err(TreeFailure::Corrupt)?;
+            let mut neighbor_entries =
+                resolve_node_relative_first_separator(kind, &entries, &node.steps)
+                    .map_err(TreeFailure::Corrupt)?;
             match merge_side {
                 Side::Left => {
                     left_pull_entry_counts.insert(0, neighbor_entries.len());
@@ -239,16 +236,18 @@ fn join_overlapping<R: AddressableRange>(
 // into a globally sortable subset of the layer's entry domain.
 // Internal node entry lists always have the 0th separator set to "" as a catchall, so we simply correct for this
 // by reading the node's lower bound (through ancestry, NOT with more store reads) and using that as the inferred proper narrow separator
-pub(super) fn resolve_node_relative_first_separator<R: AddressableRange>(
+pub(super) fn resolve_node_relative_first_separator<B: AsRef<[u8]>, R: AddressableRange>(
     kind: NodeKind,
-    node_relative_entries: SlottedList<BytesMut, [u8], R>,
+    node_relative_entries: &SlottedList<B, [u8], R>,
     node_ancestry: &DescentSteps<R>,
-) -> Result<SlottedList<BytesMut, [u8], R>, CorruptValue> {
+) -> Result<SlottedList<BytesMut, [u8], u32>, CorruptValue> {
+    let mut entries = SlottedList::<BytesMut, [u8], u32>::empty();
+    entries.extend_from_list(node_relative_entries);
     match kind {
-        NodeKind::Leaf => Ok(node_relative_entries),
+        NodeKind::Leaf => Ok(entries),
         NodeKind::Internal => {
             let separator = node_lower_bound(node_ancestry)?;
-            let mut entries = node_relative_entries.into_typed::<InternalEntry>();
+            let mut entries = entries.into_typed::<InternalEntry>();
             let child = entries
                 .get(0)
                 .expect("an internal node being merged has a child")?

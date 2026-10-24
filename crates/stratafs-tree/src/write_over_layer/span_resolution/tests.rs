@@ -15,8 +15,8 @@ fn node(id: u128) -> LayerNode<u16> {
     }
 }
 
-fn leaves(keys: &[&[u8]]) -> SlottedList<BytesMut, [u8], u16> {
-    let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u16>::empty();
+fn leaves(keys: &[&[u8]]) -> SlottedList<BytesMut, [u8], u32> {
+    let mut list = SlottedList::<BytesMut, LeafEntry<u16>, u32>::empty();
     for (index, key) in keys.iter().enumerate() {
         list.insert_entry(index, key, &b"value"[..]);
     }

@@ -28,7 +28,7 @@ pub(crate) struct LayerNode<R> {
 // that the sorted entries should be assigned into.
 pub(crate) struct LayerSpan<R> {
     pub(crate) nodes: SmallVec<[LayerNode<R>; 2]>,
-    pub(crate) entries: SlottedList<BytesMut, [u8], R>,
+    pub(crate) entries: SlottedList<BytesMut, [u8], u32>,
 }
 
 impl<R> LayerSpan<R> {
