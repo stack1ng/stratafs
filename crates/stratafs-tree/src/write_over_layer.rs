@@ -2,7 +2,6 @@ use bytes::BytesMut;
 use smallvec::{SmallVec, smallvec};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
-use vec1::smallvec_v1::SmallVec1;
 
 use crate::descent::DescentSteps;
 use crate::error::TreeFailure;
@@ -28,16 +27,16 @@ pub(crate) struct LayerNode<R> {
 // LayerSpan represents a set of nodes that should be treated as contiguous,
 // that the sorted entries should be assigned into.
 pub(crate) struct LayerSpan<R> {
-    pub(crate) nodes: SmallVec1<[LayerNode<R>; 2]>,
+    pub(crate) nodes: SmallVec<[LayerNode<R>; 2]>,
     pub(crate) entries: SlottedList<BytesMut, [u8], R>,
 }
 
 impl<R> LayerSpan<R> {
     pub(crate) fn is_root(&self) -> bool {
-        let is_root = self.nodes.first().steps.is_empty();
+        let is_root = self.nodes.first().is_none_or(|node| node.steps.is_empty());
         debug_assert!(
-            !is_root || self.nodes.len() == 1,
-            "the root layer holds exactly one node"
+            !is_root || self.nodes.len() <= 1,
+            "the root layer holds at most one node"
         );
         is_root
     }
@@ -62,6 +61,11 @@ enum LayerNodeMutation<R> {
     Delete {
         node: LayerNode<R>,
     },
+    // if an internal layer is left with a single entry, it gets "promoted" into the parent layer
+    Promote {
+        separator: Box<[u8]>,
+        child: NodeId,
+    },
 }
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
@@ -79,7 +83,11 @@ where
     ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
     {
         debug_assert!(invariants::layer_is_well_formed(&layer));
-        todo!()
+        let mut layer = layer;
+        while !layer.spans.is_empty() {
+            layer = self.fit_layer(volume, layer, packing).await?;
+        }
+        Ok(())
     }
 
     // fit_layer handles actually fitting the given entries to the given nodes.

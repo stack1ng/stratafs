@@ -78,8 +78,8 @@ where
             })
         };
         Some(SpanNeighbors {
-            left: neighbor(span.nodes.first(), Side::Left)?,
-            right: neighbor(span.nodes.last(), Side::Right)?,
+            left: neighbor(span.nodes.first()?, Side::Left)?,
+            right: neighbor(span.nodes.last()?, Side::Right)?,
         })
     }
 

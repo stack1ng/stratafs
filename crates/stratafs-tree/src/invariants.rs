@@ -163,14 +163,12 @@ fn keys_within_bounds<R: AddressableRange>(
     let lower = span
         .nodes
         .first()
-        .steps
-        .last()
+        .and_then(|node| node.steps.last())
         .and_then(|step| separator_at(step, step.position));
     let upper = span
         .nodes
         .last()
-        .steps
-        .last()
+        .and_then(|node| node.steps.last())
         .and_then(|step| separator_at(step, step.position + 1));
     first.zip(lower).is_none_or(|(first, lower)| first >= lower)
         && last.zip(upper).is_none_or(|(last, upper)| last < upper)

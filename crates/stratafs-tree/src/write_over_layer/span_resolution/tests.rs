@@ -1,4 +1,3 @@
-use vec1::smallvec_v1::SmallVec1;
 use zerocopy::little_endian::{U64, U128};
 
 use super::*;
@@ -32,7 +31,7 @@ fn pulled(
 ) -> PulledSpan<u16> {
     PulledSpan {
         span: LayerSpan {
-            nodes: SmallVec1::try_from_vec(ids.iter().map(|&id| node(id)).collect()).unwrap(),
+            nodes: ids.iter().map(|&id| node(id)).collect(),
             entries: leaves(keys),
         },
         left_pull_entry_counts: left_pulls.iter().copied().collect(),

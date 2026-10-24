@@ -21,26 +21,24 @@ pub(super) struct SpanMutationPlan<R> {
 }
 
 impl<R> SpanMutationPlan<R> {
-    pub(super) fn first_existing_node(&self) -> &LayerNode<R> {
-        self.mutations
-            .iter()
-            .find_map(existing_node)
-            .expect("a plan always changes at least one existing node")
+    pub(super) fn first_existing_node(&self) -> Option<&LayerNode<R>> {
+        self.mutations.iter().find_map(existing_node)
     }
 
-    pub(super) fn last_existing_node(&self) -> &LayerNode<R> {
-        self.mutations
-            .iter()
-            .rev()
-            .find_map(existing_node)
-            .expect("a plan always changes at least one existing node")
+    pub(super) fn last_existing_node(&self) -> Option<&LayerNode<R>> {
+        self.mutations.iter().rev().find_map(existing_node)
+    }
+
+    pub(super) fn is_root(&self) -> bool {
+        self.first_existing_node()
+            .is_none_or(|node| node.steps.is_empty())
     }
 }
 
 fn existing_node<R>(mutation: &LayerNodeMutation<R>) -> Option<&LayerNode<R>> {
     match mutation {
         LayerNodeMutation::Update { node, .. } | LayerNodeMutation::Delete { node } => Some(node),
-        LayerNodeMutation::Create { .. } => None,
+        LayerNodeMutation::Create { .. } | LayerNodeMutation::Promote { .. } => None,
     }
 }
 
@@ -59,44 +57,67 @@ where
     ) -> Result<SpanMutationPlan<C::Range>, TreeFailure<T::Failure, S::Rejection>> {
         let span = span.into_span();
         let is_root = span.is_root();
-        if span.entries.len() == 0 {
-            if is_root {
+        let span_lower_bound: Box<[u8]> = Box::from(match span.nodes.first() {
+            Some(node) => node_lower_bound(&node.steps).map_err(TreeFailure::Corrupt)?,
+            None => LEFTMOST_SEPARATOR,
+        });
+        match (kind, span.entries.len()) {
+            (NodeKind::Leaf, 0) if is_root => {
                 let root = span
                     .nodes
                     .into_iter()
                     .next()
-                    .expect("a span always has a node");
+                    .expect("an emptied root keeps its node");
                 return Ok(SpanMutationPlan {
                     mutations: smallvec![LayerNodeMutation::Update {
                         node: root,
-                        separator: Box::from(LEFTMOST_SEPARATOR),
+                        separator: span_lower_bound,
                         entries: span.entries,
                     }],
                 });
             }
-            return Ok(SpanMutationPlan {
-                mutations: span
-                    .nodes
-                    .into_iter()
-                    .map(|node| LayerNodeMutation::Delete { node })
-                    .collect(),
-            });
+            (_, 0) => {
+                return Ok(SpanMutationPlan {
+                    mutations: span
+                        .nodes
+                        .into_iter()
+                        .map(|node| LayerNodeMutation::Delete { node })
+                        .collect(),
+                });
+            }
+            (NodeKind::Internal, 1) => {
+                let child = span
+                    .entries
+                    .into_typed::<InternalEntry>()
+                    .get(0)
+                    .expect("the span holds one entry")
+                    .map_err(TreeFailure::Corrupt)?
+                    .child;
+                let mut mutations: SmallVec<[_; 3]> = smallvec![LayerNodeMutation::Promote {
+                    separator: span_lower_bound,
+                    child,
+                }];
+                mutations.extend(
+                    span.nodes
+                        .into_iter()
+                        .map(|node| LayerNodeMutation::Delete { node }),
+                );
+                return Ok(SpanMutationPlan { mutations });
+            }
+            _ => {}
         }
 
         // PHASE 1: Determine how many nodes we need to evenly distribute the entries without under/overflowing
-        let min_node_size = if is_root { 0 } else { C::MERGE_BELOW_SIZE };
         let optimal_boundaries_plan = packing.boundaries(
             span.entries.len(),
             |range| Self::node_size(kind, &span.entries, range),
-            min_node_size,
+            C::MERGE_BELOW_SIZE,
             C::NODE_CAPACITY,
         );
 
         // PHASE 2: create a plan about what we are going to do to the nodes in this layer,
         // according to the optimal boundaries we just computed
-        let mut span_lower_bound = Some(Box::from(
-            node_lower_bound(&span.nodes.first().steps).map_err(TreeFailure::Corrupt)?,
-        ));
+        let mut first_separator = Some(span_lower_bound);
         let mut entries = span.entries;
         let mut chunks: SmallVec<[_; 3]> = optimal_boundaries_plan
             [1..optimal_boundaries_plan.len() - 1]
@@ -110,7 +131,7 @@ where
         let mut nodes = span.nodes.into_iter();
         for mut chunk in chunks.into_iter().rev() {
             let first_key = separator_for_parent(kind, &mut chunk).map_err(TreeFailure::Corrupt)?;
-            let separator = span_lower_bound.take().unwrap_or(first_key);
+            let separator = first_separator.take().unwrap_or(first_key);
             mutations.push(match nodes.next() {
                 Some(node) => LayerNodeMutation::Update {
                     node,

@@ -1,6 +1,5 @@
 use bytes::BytesMut;
-use smallvec::smallvec;
-use vec1::smallvec_v1::SmallVec1;
+use smallvec::{SmallVec, smallvec};
 use zerocopy::little_endian::{U64, U128};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -133,7 +132,7 @@ fn layer(
     Layer {
         kind,
         spans: smallvec![LayerSpan {
-            nodes: SmallVec1::try_from_vec(nodes).unwrap(),
+            nodes: SmallVec::from_vec(nodes),
             entries,
         }],
     }

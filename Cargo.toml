@@ -36,7 +36,6 @@ stratafs-serialized = { path = "crates/stratafs-serialized" }
 stratafs-store = { path = "crates/stratafs-store" }
 storekey = "0.11"
 thiserror = "2.0"
-vec1 = { version = "1.12", features = ["smallvec-v1"] }
 xxhash-rust = { version = "0.8", features = ["const_xxh32"] }
 zerocopy = { version = "0.8", features = ["alloc", "derive"] }
 

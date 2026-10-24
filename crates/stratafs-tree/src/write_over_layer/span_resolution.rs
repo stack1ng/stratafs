@@ -212,8 +212,7 @@ fn join_overlapping<R: AddressableRange>(
     let dropped_entries: usize = previous_right_pulls[gap_from_previous..].iter().sum();
     joined
         .nodes
-        .truncate(previous_original_end + gap_from_previous)
-        .expect("the previous span keeps its own nodes");
+        .truncate(previous_original_end + gap_from_previous);
     joined
         .entries
         .truncate(joined.entries.len() - dropped_entries);
