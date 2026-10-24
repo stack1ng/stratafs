@@ -2,8 +2,8 @@ use vec1::smallvec_v1::SmallVec1;
 use zerocopy::little_endian::{U64, U128};
 
 use super::*;
-use crate::header::VolumeEpoch;
-use crate::node::ObservedNode;
+use crate::header::{NodeId, VolumeEpoch};
+use crate::node::{LeafEntry, ObservedNode};
 use crate::write_over_layer::LayerNode;
 
 fn node(id: u128) -> LayerNode<u16> {

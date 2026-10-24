@@ -17,6 +17,7 @@ use packing::PackingStrategy;
 pub(crate) mod packing;
 mod span_mutation_plan;
 mod span_neighbors;
+mod span_resolution;
 
 pub(crate) struct LayerNode<R> {
     pub(crate) node: ObservedNode,
