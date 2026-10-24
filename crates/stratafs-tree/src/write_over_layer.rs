@@ -12,7 +12,9 @@ use crate::node::{NodeKind, ObservedNode};
 use crate::slotted::SlottedList;
 use crate::tree::TreeConfig;
 use crate::volume::TreeTransaction;
+use packing::PackingStrategy;
 
+pub(crate) mod packing;
 mod span_mutation_plan;
 mod span_neighbors;
 
@@ -71,6 +73,7 @@ where
         &mut self,
         volume: VolumeHeader,
         layer: Layer<C::Range>,
+        packing: PackingStrategy,
     ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
     {
         debug_assert!(invariants::layer_is_well_formed(&layer));
@@ -83,9 +86,11 @@ where
     // node ends up being underfull, it merges with a neighbor. When writing nodes into the tree,
     // it makes sure to write over a new node if the node's epoch is older than the volume's,
     // otherwise it mutates in place. It returns the desired state of the parent layer.
-    async fn fit_layer(&mut self, layer: Layer<C::Range>) {
+    async fn fit_layer(&mut self, layer: Layer<C::Range>, packing: PackingStrategy) {
         for span in layer.spans {
-            let plan = self.create_span_mutation_plan(layer.kind, span).await;
+            let plan = self
+                .create_span_mutation_plan(layer.kind, span, packing)
+                .await;
         }
     }
 }

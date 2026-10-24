@@ -1,15 +1,19 @@
+use std::ops::Range;
+
 use bytes::BytesMut;
 use futures_util::future::join;
 use smallvec::{SmallVec, smallvec};
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction};
 use zerocopy::{FromBytes, KnownLayout};
 
+use super::packing::PackingStrategy;
 use super::span_neighbors::{Neighbor, Side};
 use super::{LayerNodeMutation, LayerSpan};
 use crate::descent::DescentSteps;
 use crate::error::TreeFailure;
+use crate::header::NodeId;
 use crate::invariants;
-use crate::node::{InternalEntry, LEFTMOST_SEPARATOR, LeafEntry, NodeHeader, NodeKind};
+use crate::node::{InternalEntry, LEFTMOST_SEPARATOR, LeafEntry, NodeKind};
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
 use crate::tree::{TreeConfig, TreeConfigLimits};
@@ -26,6 +30,7 @@ where
         &self,
         kind: NodeKind,
         mut span: LayerSpan<C::Range>,
+        packing: PackingStrategy,
     ) -> Result<SmallVec<[LayerNodeMutation<C::Range>; 3]>, TreeFailure<T::Failure, S::Rejection>>
     {
         debug_assert!(invariants::span_is_well_formed(kind, &span));
@@ -48,104 +53,92 @@ where
         }
 
         // PHASE 1: Determine how many nodes we need to evenly distribute the entries without under/overflowing
-        let entries_size =
-            size_of::<NodeHeader>() + span.entries.stored_length() - C::EMPTY_NODE_SIZE;
-
-        // get a lower bound estimate of the number of nodes we would need to accomodate all entries
-        let estimated_needed_node_count =
-            entries_size.div_ceil(C::NODE_CAPACITY - C::EMPTY_NODE_SIZE);
-
-        let mut needed_node_count = estimated_needed_node_count;
-        // adjust until we reach a set of midpoints that fits
+        let min_node_size = if is_root { 0 } else { C::MERGE_BELOW_SIZE };
         let optimal_boundaries_plan = loop {
-            let boundaries: Vec<usize> = std::iter::once(0)
-                .chain(span.entries.n_midpoints_by_size(needed_node_count - 1))
-                .chain([span.entries.len()])
-                .collect();
+            let node_size = |range: Range<usize>| {
+                C::EMPTY_NODE_SIZE + span.entries.size_before(range.end)
+                    - span.entries.size_before(range.start)
+                    - match kind {
+                        NodeKind::Leaf => 0,
+                        NodeKind::Internal => span
+                            .entries
+                            .get(range.start)
+                            .and_then(Result::ok)
+                            .map_or(0, |entry| entry.len().saturating_sub(size_of::<NodeId>())),
+                    }
+            };
+            let boundaries = packing.boundaries(
+                span.entries.len(),
+                node_size,
+                min_node_size,
+                C::NODE_CAPACITY,
+            );
 
-            enum ChunkMisfit {
-                Overflowing,
-                Underfull,
+            // check to see if we need to merge with a neighbor to the span
+            let packed_into_one_underfull_node =
+                boundaries.len() == 2 && node_size(0..span.entries.len()) < min_node_size;
+            if !packed_into_one_underfull_node {
+                break boundaries;
             }
 
-            let misfit = boundaries.windows(2).find_map(|chunk| {
-                match C::EMPTY_NODE_SIZE + span.entries.size_before(chunk[1])
-                    - span.entries.size_before(chunk[0])
-                {
-                    size if size > C::NODE_CAPACITY => Some(ChunkMisfit::Overflowing),
-                    size if size < C::MERGE_BELOW_SIZE => Some(ChunkMisfit::Underfull),
-                    _ => None,
+            // check both neighbors as candidates to merge with.
+            // Only fetch cousins if we have no immediate neighbors,
+            // since it is much slower
+            let candidates = {
+                let neighbors = self
+                    .find_span_neighbors(&span)
+                    .expect("only the root has no neighbors");
+                match (neighbors.left, neighbors.right) {
+                    // both neighbors are immediate, meaning they have the same read cost, so do them in parallel
+                    (Neighbor::Immediate(left), Neighbor::Immediate(right)) => {
+                        let (left, right) = join(left, right).await;
+                        [Some(left?), Some(right?)]
+                    }
+
+                    // only one neighbor is immediate, only read it since its cheaper than reading the extended neighbor
+                    (Neighbor::Immediate(left), Neighbor::MaybeExtended(_)) => {
+                        [Some(left.await?), None]
+                    }
+                    (Neighbor::MaybeExtended(_), Neighbor::Immediate(right)) => {
+                        [None, Some(right.await?)]
+                    }
+
+                    // both neighbors are extended, for the same reason as the first case, read both in parallel
+                    (Neighbor::MaybeExtended(left), Neighbor::MaybeExtended(right)) => {
+                        let (left, right) = join(left, right).await;
+                        [left?, right?]
+                    }
                 }
-            });
-            match misfit {
-                None => break boundaries,
-                Some(ChunkMisfit::Overflowing) => needed_node_count += 1,
-                Some(ChunkMisfit::Underfull) => {
-                    // check both neighbors as candidates to merge with.
-                    // Only fetch cousins if we have no immediate neighbors,
-                    // since it is much slower
-                    if is_root {
-                        break boundaries;
-                    }
-                    let candidates = {
-                        let neighbors = self
-                            .find_span_neighbors(&span)
-                            .expect("only the root has no neighbors");
-                        match (neighbors.left, neighbors.right) {
-                            // both neighbors are immediate, meaning they have the same read cost, so do them in parallel
-                            (Neighbor::Immediate(left), Neighbor::Immediate(right)) => {
-                                let (left, right) = join(left, right).await;
-                                [Some(left?), Some(right?)]
-                            }
-
-                            // only one neighbor is immediate, only read it since its cheaper than reading the extended neighbor
-                            (Neighbor::Immediate(left), Neighbor::MaybeExtended(_)) => {
-                                [Some(left.await?), None]
-                            }
-                            (Neighbor::MaybeExtended(_), Neighbor::Immediate(right)) => {
-                                [None, Some(right.await?)]
-                            }
-
-                            // both neighbors are extended, for the same reason as the first case, read both in parallel
-                            (Neighbor::MaybeExtended(left), Neighbor::MaybeExtended(right)) => {
-                                let (left, right) = join(left, right).await;
-                                [left?, right?]
-                            }
-                        }
-                    };
-                    let [left, right] = candidates;
-                    let (merge_side, (node, entries)) = match (left, right) {
-                        (None, None) => {
-                            // being here means the span covers its layer's entire domain, so it fits in one node,
-                            // and the layers above it collapse during the ascent until that node is the root,
-                            // where being underfull is accepted.
-                            break boundaries;
-                        }
-                        (Some(left), Some(right))
-                            if right.1.stored_length() < left.1.stored_length() =>
-                        {
-                            (Side::Right, right)
-                        }
-                        (Some(left), _) => (Side::Left, left),
-                        (None, Some(right)) => (Side::Right, right),
-                    };
-                    let mut neighbor_entries = resolve_node_relative_first_separator(
-                        kind,
-                        SlottedList::from(entries),
-                        &node.steps,
-                    )
-                    .map_err(TreeFailure::Corrupt)?;
-                    match merge_side {
-                        Side::Left => {
-                            neighbor_entries.extend_from_list(&span.entries);
-                            span.entries = neighbor_entries;
-                            span.nodes.insert(0, node);
-                        }
-                        Side::Right => {
-                            span.entries.extend_from_list(&neighbor_entries);
-                            span.nodes.push(node);
-                        }
-                    }
+            };
+            let [left, right] = candidates;
+            let (merge_side, (node, entries)) = match (left, right) {
+                (None, None) => {
+                    // being here means the span covers its layer's entire domain, so it fits in one node,
+                    // and the layers above it collapse during the ascent until that node is the root,
+                    // where being underfull is accepted.
+                    break boundaries;
+                }
+                (Some(left), Some(right)) if right.1.stored_length() < left.1.stored_length() => {
+                    (Side::Right, right)
+                }
+                (Some(left), _) => (Side::Left, left),
+                (None, Some(right)) => (Side::Right, right),
+            };
+            let mut neighbor_entries = resolve_node_relative_first_separator(
+                kind,
+                SlottedList::from(entries),
+                &node.steps,
+            )
+            .map_err(TreeFailure::Corrupt)?;
+            match merge_side {
+                Side::Left => {
+                    neighbor_entries.extend_from_list(&span.entries);
+                    span.entries = neighbor_entries;
+                    span.nodes.insert(0, node);
+                }
+                Side::Right => {
+                    span.entries.extend_from_list(&neighbor_entries);
+                    span.nodes.push(node);
                 }
             }
         };
