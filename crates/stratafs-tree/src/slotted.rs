@@ -265,8 +265,19 @@ where
     // extend_from_list has the same semantics as Vec::extend_from_slice: it copies the other list's entries
     // onto the end of this list, and leaves the other list unchanged.
     pub(crate) fn extend_from_list<B: AsRef<[u8]>>(&mut self, other: &SlottedList<B, T, R>) {
+        self.extend_from_list_starting_at(other, 0);
+    }
+
+    pub(crate) fn extend_from_list_starting_at<B: AsRef<[u8]>>(
+        &mut self,
+        other: &SlottedList<B, T, R>,
+        index: usize,
+    ) {
         let (data_length, count) = self.lengths();
         let (other_data, other_starts) = other.parts();
+        let other_starts = &other_starts[index..];
+        let skipped = other_starts.first().map_or(other_data.len(), R::decode);
+        let other_data = &other_data[skipped..];
         assert!(
             data_length + other_data.len() <= R::MAX && count + other_starts.len() <= R::MAX,
             "a slotted list holds at most {max} entries and {max} bytes of entry data",
@@ -282,8 +293,22 @@ where
         self.bytes[data_length..data_length + other_data.len()].copy_from_slice(other_data);
         self.set_count(count + other_starts.len());
         for (slot, start) in self.starts_mut()[count..].iter_mut().zip(other_starts) {
-            *slot = address::<R>(R::decode(start) + data_length);
+            *slot = address::<R>(R::decode(start) - skipped + data_length);
         }
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        let (data_length, count) = self.lengths();
+        if len >= count {
+            return;
+        }
+        let at = self
+            .entry_range(len)
+            .map_or(data_length, |entry| entry.start);
+        self.bytes
+            .copy_within(data_length..data_length + len * Self::ADDRESS_LENGTH, at);
+        self.bytes.truncate(at + (len + 1) * Self::ADDRESS_LENGTH);
+        self.set_count(len);
     }
 
     // split_off has the same semantics as Vec::split_off: this list keeps the entries [0, index),

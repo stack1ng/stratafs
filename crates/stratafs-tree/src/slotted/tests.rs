@@ -666,3 +666,28 @@ proptest! {
         midpoint_matches_the_index_closest_to_half_the_size::<u16>(entries)?;
     }
 }
+
+#[test]
+fn truncate_keeps_the_front_entries() {
+    let mut list = list_of::<u16>(&[b"aa", b"b", b"cccc"]);
+    list.truncate(2);
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get(0).unwrap().unwrap(), b"aa");
+    assert_eq!(list.get(1).unwrap().unwrap(), b"b");
+    list.truncate(5);
+    assert_eq!(list.len(), 2);
+    list.truncate(0);
+    assert_eq!(list.len(), 0);
+}
+
+#[test]
+fn extending_from_an_index_appends_only_the_entries_from_there() {
+    let mut list = list_of::<u16>(&[b"aa"]);
+    list.extend_from_list_starting_at(&list_of::<u16>(&[b"b", b"cc", b"ddd"]), 1);
+    assert_eq!(list.len(), 3);
+    assert_eq!(list.get(0).unwrap().unwrap(), b"aa");
+    assert_eq!(list.get(1).unwrap().unwrap(), b"cc");
+    assert_eq!(list.get(2).unwrap().unwrap(), b"ddd");
+    list.extend_from_list_starting_at(&list_of::<u16>(&[b"e"]), 1);
+    assert_eq!(list.len(), 3);
+}

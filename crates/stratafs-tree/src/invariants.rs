@@ -59,11 +59,15 @@ pub(crate) fn separator_keys_ascend<B: AsRef<[u8]>, R: AddressableRange>(
 }
 
 pub(crate) fn layer_is_well_formed<R: AddressableRange>(layer: &Layer<R>) -> bool {
-    nodes_are_ordered(layer.spans.iter().flat_map(|span| span.nodes.iter()))
+    spans_are_ordered(&layer.spans)
         && layer
             .spans
             .iter()
             .all(|span| span_entries_ascend_within_bounds(layer.kind, span))
+}
+
+pub(crate) fn spans_are_ordered<R: AddressableRange>(spans: &[LayerSpan<R>]) -> bool {
+    nodes_are_ordered(spans.iter().flat_map(|span| span.nodes.iter()))
 }
 
 pub(crate) fn span_is_well_formed<R: AddressableRange>(

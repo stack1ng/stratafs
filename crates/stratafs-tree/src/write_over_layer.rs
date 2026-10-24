@@ -86,11 +86,17 @@ where
     // node ends up being underfull, it merges with a neighbor. When writing nodes into the tree,
     // it makes sure to write over a new node if the node's epoch is older than the volume's,
     // otherwise it mutates in place. It returns the desired state of the parent layer.
-    async fn fit_layer(&mut self, layer: Layer<C::Range>, packing: PackingStrategy) {
-        for span in layer.spans {
-            let plan = self
-                .create_span_mutation_plan(layer.kind, span, packing)
-                .await;
+    async fn fit_layer(
+        &mut self,
+        layer: Layer<C::Range>,
+        packing: PackingStrategy,
+    ) -> Result<(), TreeFailure<T::Failure, S::Rejection>> {
+        let independent_spans = self
+            .resolve_independent_spans(layer.kind, layer.spans)
+            .await?;
+        for span in independent_spans {
+            let plan = self.create_span_mutation_plan(layer.kind, span, packing)?;
         }
+        Ok(())
     }
 }
