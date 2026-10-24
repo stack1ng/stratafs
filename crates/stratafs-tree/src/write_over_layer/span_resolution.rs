@@ -240,7 +240,7 @@ fn join_overlapping<R: AddressableRange>(
 // into a globally sortable subset of the layer's entry domain.
 // Internal node entry lists always have the 0th separator set to "" as a catchall, so we simply correct for this
 // by reading the node's lower bound (through ancestry, NOT with more store reads) and using that as the inferred proper narrow separator
-fn resolve_node_relative_first_separator<R: AddressableRange>(
+pub(super) fn resolve_node_relative_first_separator<R: AddressableRange>(
     kind: NodeKind,
     node_relative_entries: SlottedList<BytesMut, [u8], R>,
     node_ancestry: &DescentSteps<R>,
@@ -248,16 +248,7 @@ fn resolve_node_relative_first_separator<R: AddressableRange>(
     match kind {
         NodeKind::Leaf => Ok(node_relative_entries),
         NodeKind::Internal => {
-            let separator = match node_ancestry.iter().rev().find(|step| step.position > 0) {
-                Some(step) => {
-                    &step
-                        .entries
-                        .get(step.position)
-                        .expect("a step's position is within its parent")?
-                        .key
-                }
-                None => LEFTMOST_SEPARATOR,
-            };
+            let separator = node_lower_bound(node_ancestry)?;
             let mut entries = node_relative_entries.into_typed::<InternalEntry>();
             let child = entries
                 .get(0)
@@ -266,6 +257,19 @@ fn resolve_node_relative_first_separator<R: AddressableRange>(
             entries.replace_entry(0, child, separator);
             Ok(entries.into_untyped())
         }
+    }
+}
+
+pub(super) fn node_lower_bound<R: AddressableRange>(
+    node_ancestry: &DescentSteps<R>,
+) -> Result<&[u8], CorruptValue> {
+    match node_ancestry.iter().rev().find(|step| step.position > 0) {
+        Some(step) => Ok(&step
+            .entries
+            .get(step.position)
+            .expect("a step's position is within its parent")?
+            .key),
+        None => Ok(LEFTMOST_SEPARATOR),
     }
 }
 

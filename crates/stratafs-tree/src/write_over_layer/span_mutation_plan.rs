@@ -5,9 +5,9 @@ use smallvec::{SmallVec, smallvec};
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction};
 use zerocopy::{FromBytes, KnownLayout};
 
-use super::LayerNodeMutation;
 use super::packing::PackingStrategy;
-use super::span_resolution::IndependentResolvedSpan;
+use super::span_resolution::{IndependentResolvedSpan, node_lower_bound};
+use super::{LayerNode, LayerNodeMutation};
 use crate::error::TreeFailure;
 use crate::header::NodeId;
 use crate::node::{InternalEntry, LEFTMOST_SEPARATOR, LeafEntry, NodeKind};
@@ -15,6 +15,34 @@ use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
 use crate::tree::{TreeConfig, TreeConfigLimits};
 use crate::volume::TreeTransaction;
+
+pub(super) struct SpanMutationPlan<R> {
+    pub(super) mutations: SmallVec<[LayerNodeMutation<R>; 3]>,
+}
+
+impl<R> SpanMutationPlan<R> {
+    pub(super) fn first_existing_node(&self) -> &LayerNode<R> {
+        self.mutations
+            .iter()
+            .find_map(existing_node)
+            .expect("a plan always changes at least one existing node")
+    }
+
+    pub(super) fn last_existing_node(&self) -> &LayerNode<R> {
+        self.mutations
+            .iter()
+            .rev()
+            .find_map(existing_node)
+            .expect("a plan always changes at least one existing node")
+    }
+}
+
+fn existing_node<R>(mutation: &LayerNodeMutation<R>) -> Option<&LayerNode<R>> {
+    match mutation {
+        LayerNodeMutation::Update { node, .. } | LayerNodeMutation::Delete { node } => Some(node),
+        LayerNodeMutation::Create { .. } => None,
+    }
+}
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
@@ -28,25 +56,31 @@ where
         kind: NodeKind,
         span: IndependentResolvedSpan<C::Range>,
         packing: PackingStrategy,
-    ) -> Result<SmallVec<[LayerNodeMutation<C::Range>; 3]>, TreeFailure<T::Failure, S::Rejection>>
-    {
+    ) -> Result<SpanMutationPlan<C::Range>, TreeFailure<T::Failure, S::Rejection>> {
         let span = span.into_span();
         let is_root = span.is_root();
         if span.entries.len() == 0 {
             if is_root {
-                return Ok(smallvec![LayerNodeMutation::Update {
-                    node: span.nodes.first().node,
-                    separator: Box::from(LEFTMOST_SEPARATOR),
-                    entries: span.entries,
-                }]);
-            }
-            let mut delete_all_plan: SmallVec<[LayerNodeMutation<C::Range>; 3]> = SmallVec::new();
-            for leftover in span.nodes.iter() {
-                delete_all_plan.push(LayerNodeMutation::Delete {
-                    node: leftover.node,
+                let root = span
+                    .nodes
+                    .into_iter()
+                    .next()
+                    .expect("a span always has a node");
+                return Ok(SpanMutationPlan {
+                    mutations: smallvec![LayerNodeMutation::Update {
+                        node: root,
+                        separator: Box::from(LEFTMOST_SEPARATOR),
+                        entries: span.entries,
+                    }],
                 });
             }
-            return Ok(delete_all_plan);
+            return Ok(SpanMutationPlan {
+                mutations: span
+                    .nodes
+                    .into_iter()
+                    .map(|node| LayerNodeMutation::Delete { node })
+                    .collect(),
+            });
         }
 
         // PHASE 1: Determine how many nodes we need to evenly distribute the entries without under/overflowing
@@ -60,6 +94,9 @@ where
 
         // PHASE 2: create a plan about what we are going to do to the nodes in this layer,
         // according to the optimal boundaries we just computed
+        let mut span_lower_bound = Some(Box::from(
+            node_lower_bound(&span.nodes.first().steps).map_err(TreeFailure::Corrupt)?,
+        ));
         let mut entries = span.entries;
         let mut chunks: SmallVec<[_; 3]> = optimal_boundaries_plan
             [1..optimal_boundaries_plan.len() - 1]
@@ -68,31 +105,28 @@ where
             .map(|&boundary| entries.split_off(boundary))
             .collect();
         chunks.push(entries);
-        let chunk_count = chunks.len();
-        let mut plan: SmallVec<[LayerNodeMutation<C::Range>; 3]> =
-            SmallVec::with_capacity(chunk_count);
-        for (i, mut chunk) in chunks.into_iter().rev().enumerate() {
-            let separator = separator_for_parent(kind, &mut chunk).map_err(TreeFailure::Corrupt)?;
-            match span.nodes.get(i) {
-                Some(l) => plan.push(LayerNodeMutation::Update {
-                    node: l.node,
+        let mut mutations: SmallVec<[LayerNodeMutation<C::Range>; 3]> =
+            SmallVec::with_capacity(chunks.len());
+        let mut nodes = span.nodes.into_iter();
+        for mut chunk in chunks.into_iter().rev() {
+            let first_key = separator_for_parent(kind, &mut chunk).map_err(TreeFailure::Corrupt)?;
+            let separator = span_lower_bound.take().unwrap_or(first_key);
+            mutations.push(match nodes.next() {
+                Some(node) => LayerNodeMutation::Update {
+                    node,
                     separator,
                     entries: chunk,
-                }),
-                None => plan.push(LayerNodeMutation::Create {
+                },
+                None => LayerNodeMutation::Create {
                     separator,
                     entries: chunk,
-                }),
-            }
-        }
-        // any remaining nodes dont have any entries, and should therefore be deleted
-        for leftover in span.nodes.iter().skip(chunk_count) {
-            plan.push(LayerNodeMutation::Delete {
-                node: leftover.node,
+                },
             });
         }
+        // any remaining nodes dont have any entries, and should therefore be deleted
+        mutations.extend(nodes.map(|node| LayerNodeMutation::Delete { node }));
 
-        Ok(plan)
+        Ok(SpanMutationPlan { mutations })
     }
 
     pub(super) fn node_size(

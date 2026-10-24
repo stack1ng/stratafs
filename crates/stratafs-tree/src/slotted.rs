@@ -297,6 +297,17 @@ where
         }
     }
 
+    pub(crate) fn splice<B: AsRef<[u8]>>(
+        &mut self,
+        range: Range<usize>,
+        replacement: &SlottedList<B, T, R>,
+    ) {
+        let tail = self.split_off(range.end);
+        self.truncate(range.start);
+        self.extend_from_list(replacement);
+        self.extend_from_list(&tail);
+    }
+
     pub(crate) fn truncate(&mut self, len: usize) {
         let (data_length, count) = self.lengths();
         if len >= count {

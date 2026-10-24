@@ -691,3 +691,21 @@ fn extending_from_an_index_appends_only_the_entries_from_there() {
     list.extend_from_list_starting_at(&list_of::<u16>(&[b"e"]), 1);
     assert_eq!(list.len(), 3);
 }
+
+#[test]
+fn splice_replaces_a_range_of_entries() {
+    let mut list = list_of::<u16>(&[b"a", b"bb", b"c", b"dd"]);
+    list.splice(1..3, &list_of::<u16>(&[b"x", b"yyy", b"z"]));
+    assert_eq!(
+        entries(&list),
+        [
+            b"a".to_vec(),
+            b"x".to_vec(),
+            b"yyy".to_vec(),
+            b"z".to_vec(),
+            b"dd".to_vec()
+        ]
+    );
+    list.splice(0..5, &list_of::<u16>(&[]));
+    assert!(entries(&list).is_empty());
+}

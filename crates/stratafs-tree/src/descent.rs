@@ -13,7 +13,7 @@ use crate::tree::TreeConfig;
 use crate::volume::TreeTransaction;
 
 const MAX_DEPTH: usize = 64;
-const INLINE_DEPTH: usize = 8;
+const INLINE_DEPTH: usize = 4;
 
 pub(crate) struct DescentStep<R, T: ?Sized, P> {
     pub(crate) node: ObservedNode,

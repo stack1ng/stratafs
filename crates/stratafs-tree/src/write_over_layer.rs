@@ -15,6 +15,7 @@ use crate::volume::TreeTransaction;
 use packing::PackingStrategy;
 
 pub(crate) mod packing;
+mod span_mutation_execution;
 mod span_mutation_plan;
 mod span_neighbors;
 mod span_resolution;
@@ -54,12 +55,12 @@ enum LayerNodeMutation<R> {
         entries: SlottedList<BytesMut, [u8], R>,
     },
     Update {
-        node: ObservedNode,
+        node: LayerNode<R>,
         separator: Box<[u8]>,
         entries: SlottedList<BytesMut, [u8], R>,
     },
     Delete {
-        node: ObservedNode,
+        node: LayerNode<R>,
     },
 }
 
@@ -89,15 +90,29 @@ where
     // otherwise it mutates in place. It returns the desired state of the parent layer.
     async fn fit_layer(
         &mut self,
+        volume: VolumeHeader,
         layer: Layer<C::Range>,
         packing: PackingStrategy,
-    ) -> Result<(), TreeFailure<T::Failure, S::Rejection>> {
+    ) -> Result<
+        Layer<C::Range>,
+        StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
+    > {
         let independent_spans = self
             .resolve_independent_spans(layer.kind, layer.spans)
+            .await
+            .map_err(StoreError::Failed)?;
+
+        let plans = independent_spans
+            .into_iter()
+            .map(|span| self.create_span_mutation_plan(layer.kind, span, packing))
+            .collect::<Result<SmallVec<[_; 1]>, _>>()
+            .map_err(StoreError::Failed)?;
+        let spans = self
+            .execute_span_mutation_plans(volume, layer.kind, plans)
             .await?;
-        for span in independent_spans {
-            let plan = self.create_span_mutation_plan(layer.kind, span, packing)?;
-        }
-        Ok(())
+        Ok(Layer {
+            kind: NodeKind::Internal,
+            spans,
+        })
     }
 }
