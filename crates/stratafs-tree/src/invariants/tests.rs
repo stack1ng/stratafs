@@ -1,4 +1,6 @@
 use bytes::BytesMut;
+use smallvec::smallvec;
+use vec1::smallvec_v1::SmallVec1;
 use zerocopy::little_endian::{U64, U128};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -106,4 +108,99 @@ fn a_plan_must_observe_each_node_once() {
         update(1),
         replace(1)
     ]));
+}
+
+fn step(separators: &[&[u8]], position: usize) -> DescentStep<u16, InternalEntry, usize> {
+    DescentStep {
+        node: observed(100),
+        entries: SlottedList::new(separator_list(separators).into_inner().freeze()).unwrap(),
+        position,
+    }
+}
+
+fn node_at(position: usize) -> LayerNode<u16> {
+    LayerNode {
+        node: observed(position as u128),
+        steps: smallvec![step(&[b"", b"m", b"t"], position)],
+    }
+}
+
+fn layer(
+    kind: NodeKind,
+    nodes: Vec<LayerNode<u16>>,
+    entries: SlottedList<BytesMut, [u8], u16>,
+) -> Layer<u16> {
+    Layer {
+        kind,
+        spans: smallvec![LayerSpan {
+            nodes: SmallVec1::try_from_vec(nodes).unwrap(),
+            entries,
+        }],
+    }
+}
+
+fn leaf_layer(nodes: Vec<LayerNode<u16>>, keys: &[&[u8]]) -> Layer<u16> {
+    layer(NodeKind::Leaf, nodes, leaf_list(keys).into_untyped())
+}
+
+#[test]
+fn a_layer_of_ordered_nodes_on_their_own_paths_is_well_formed() {
+    assert!(layer_is_well_formed(&leaf_layer(
+        vec![node_at(0), node_at(2)],
+        &[b"a", b"u"]
+    )));
+    assert!(layer_is_well_formed(&leaf_layer(
+        vec![node_at(1)],
+        &[b"m", b"n"]
+    )));
+    assert!(layer_is_well_formed(&layer(
+        NodeKind::Internal,
+        vec![node_at(1)],
+        separator_list(&[b"m", b"n"]).into_untyped()
+    )));
+}
+
+#[test]
+fn layer_nodes_must_strictly_ascend() {
+    assert!(!layer_is_well_formed(&leaf_layer(
+        vec![node_at(2), node_at(0)],
+        &[b"a", b"u"]
+    )));
+    assert!(!layer_is_well_formed(&leaf_layer(
+        vec![node_at(1), node_at(1)],
+        &[b"m"]
+    )));
+}
+
+#[test]
+fn a_layer_node_must_be_the_child_its_steps_lead_to() {
+    let mut node = node_at(1);
+    node.node = observed(7);
+    assert!(!layer_is_well_formed(&leaf_layer(vec![node], &[b"m"])));
+}
+
+#[test]
+fn layer_entries_must_ascend_within_the_spans_bounds() {
+    assert!(!layer_is_well_formed(&leaf_layer(
+        vec![node_at(1)],
+        &[b"n", b"m"]
+    )));
+    assert!(!layer_is_well_formed(&leaf_layer(
+        vec![node_at(1)],
+        &[b"a"]
+    )));
+    assert!(!layer_is_well_formed(&leaf_layer(
+        vec![node_at(1)],
+        &[b"t"]
+    )));
+    assert!(!layer_is_well_formed(&layer(
+        NodeKind::Internal,
+        vec![node_at(1)],
+        separator_list(&[b"m", b"u"]).into_untyped()
+    )));
+    assert!(!layer_is_well_formed(&layer(
+        NodeKind::Internal,
+        vec![node_at(1)],
+        separator_list(&[b"", b"n"]).into_untyped()
+    )));
 }

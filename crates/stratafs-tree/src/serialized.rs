@@ -22,6 +22,10 @@ pub enum CorruptValue {
     KeyBeforeFirstSeparator,
     #[error("the path from the root is deeper than any valid tree")]
     TreeTooDeep,
+    #[error("a leaf sits above the depth of the other leaves")]
+    UnevenLeafDepth,
+    #[error("an internal node has no children")]
+    EmptyInternalNode,
 }
 
 impl From<ViewError> for CorruptValue {

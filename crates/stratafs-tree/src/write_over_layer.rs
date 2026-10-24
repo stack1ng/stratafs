@@ -1,29 +1,63 @@
 use bytes::BytesMut;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
+use vec1::smallvec_v1::SmallVec1;
 
 use crate::descent::DescentSteps;
 use crate::error::TreeFailure;
-use crate::header::VolumeHeader;
-use crate::node::{NodeHeader, NodeKind, ObservedNode};
+use crate::header::{NodeId, VolumeHeader};
+use crate::invariants;
+use crate::node::{NodeKind, ObservedNode};
 use crate::slotted::SlottedList;
-use crate::tree::{TreeConfig, TreeConfigLimits};
+use crate::tree::TreeConfig;
 use crate::volume::TreeTransaction;
+
+mod span_mutation_plan;
+mod span_neighbors;
 
 pub(crate) struct LayerNode<R> {
     pub(crate) node: ObservedNode,
     pub(crate) steps: DescentSteps<R>,
 }
 
+// LayerSpan represents a set of nodes that should be treated as contiguous,
+// that the sorted entries should be assigned into.
 pub(crate) struct LayerSpan<R> {
-    pub(crate) nodes: SmallVec<[LayerNode<R>; 2]>,
+    pub(crate) nodes: SmallVec1<[LayerNode<R>; 2]>,
     pub(crate) entries: SlottedList<BytesMut, [u8], R>,
+}
+
+impl<R> LayerSpan<R> {
+    pub(crate) fn is_root(&self) -> bool {
+        let is_root = self.nodes.first().steps.is_empty();
+        debug_assert!(
+            !is_root || self.nodes.len() == 1,
+            "the root layer holds exactly one node"
+        );
+        is_root
+    }
 }
 
 pub(crate) struct Layer<R> {
     pub(crate) kind: NodeKind,
     pub(crate) spans: SmallVec<[LayerSpan<R>; 1]>,
+}
+
+// LayerNodeMutation is one planned change to a node in a layer
+enum LayerNodeMutation<R> {
+    Create {
+        separator: Box<[u8]>,
+        entries: SlottedList<BytesMut, [u8], R>,
+    },
+    Update {
+        node: ObservedNode,
+        separator: Box<[u8]>,
+        entries: SlottedList<BytesMut, [u8], R>,
+    },
+    Delete {
+        node: ObservedNode,
+    },
 }
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
@@ -39,6 +73,7 @@ where
         layer: Layer<C::Range>,
     ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
     {
+        debug_assert!(invariants::layer_is_well_formed(&layer));
         todo!()
     }
 
@@ -49,12 +84,8 @@ where
     // it makes sure to write over a new node if the node's epoch is older than the volume's,
     // otherwise it mutates in place. It returns the desired state of the parent layer.
     async fn fit_layer(&mut self, layer: Layer<C::Range>) {
-        for span in &layer.spans {
-            // PHASE 1: Determine how many nodes we need to evenly distribute the entries without under/overflowing
-            let entries_size =
-                size_of::<NodeHeader>() + span.entries.stored_length() - C::EMPTY_NODE_SIZE;
-            let estimated_needed_node_count =
-                entries_size.div_ceil(C::NODE_CAPACITY - C::EMPTY_NODE_SIZE);
+        for span in layer.spans {
+            let plan = self.create_span_mutation_plan(layer.kind, span).await;
         }
     }
 }

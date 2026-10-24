@@ -21,6 +21,16 @@ pub(crate) struct DescentStep<R, T: ?Sized, P> {
     pub(crate) position: P,
 }
 
+impl<R, T: ?Sized, P: Clone> Clone for DescentStep<R, T, P> {
+    fn clone(&self) -> Self {
+        Self {
+            node: self.node,
+            entries: self.entries.clone(),
+            position: self.position.clone(),
+        }
+    }
+}
+
 pub(crate) type DescentSteps<R> = SmallVec<[DescentStep<R, InternalEntry, usize>; INLINE_DEPTH]>;
 
 pub(crate) struct DescentPath<R: AddressableRange> {

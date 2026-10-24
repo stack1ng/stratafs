@@ -15,6 +15,7 @@ storekey.workspace = true
 stratafs-serialized.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
+vec1.workspace = true
 xxhash-rust.workspace = true
 zerocopy.workspace = true
 

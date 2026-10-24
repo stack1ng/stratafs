@@ -401,6 +401,14 @@ fn the_midpoint_is_the_index_where_the_front_is_closest_to_half_the_size() {
 }
 
 #[test]
+fn the_size_before_an_index_is_the_data_and_slots_of_the_entries_before_it() {
+    let list = list_of::<u16>(&[b"aa", b"b"]);
+    assert_eq!(list.size_before(0), 0);
+    assert_eq!(list.size_before(1), 4);
+    assert_eq!(list.size_before(2), 7);
+}
+
+#[test]
 fn n_midpoints_are_the_indices_where_the_front_is_closest_to_each_share_of_the_size() {
     assert_eq!(
         list_of::<u16>(&[b"aa", b"bb", b"cc", b"dd", b"ee", b"ff"]).n_midpoints_by_size(2),

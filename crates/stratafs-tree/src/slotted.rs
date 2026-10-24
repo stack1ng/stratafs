@@ -66,6 +66,16 @@ pub(crate) struct SlottedList<B, T: ?Sized, R> {
     address: PhantomData<R>,
 }
 
+impl<B: Clone, T: ?Sized, R> Clone for SlottedList<B, T, R> {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+            entry: PhantomData,
+            address: PhantomData,
+        }
+    }
+}
+
 impl<B, T, R> SlottedList<B, T, R>
 where
     B: AsRef<[u8]>,
@@ -126,30 +136,31 @@ where
     // The starts already store those running totals, so each can use binary search on them
     // to find the first index that reaches its share, then compare it with the index before it.
     pub(crate) fn n_midpoints_by_size(&self, n: usize) -> Vec<usize> {
-        let (data, starts) = self.parts();
-        let total = data.len() + starts.len() * Self::ADDRESS_LENGTH;
-        let front_size = |index: usize| {
-            starts.get(index).map_or(data.len(), R::decode) + index * Self::ADDRESS_LENGTH
-        };
+        let total = self.size_before(self.len());
         let runs = n + 1;
         (1..=n)
             .map(|midpoint| {
                 let share = midpoint * total;
-                let (mut low, mut high) = (0, starts.len());
+                let (mut low, mut high) = (0, self.len());
                 while low < high {
                     let middle = low + (high - low) / 2;
-                    if runs * front_size(middle) < share {
+                    if runs * self.size_before(middle) < share {
                         low = middle + 1;
                     } else {
                         high = middle;
                     }
                 }
                 let below = low.saturating_sub(1);
-                let overshoot = runs * front_size(low) - share;
-                let undershoot = share - runs * front_size(below);
+                let overshoot = runs * self.size_before(low) - share;
+                let undershoot = share - runs * self.size_before(below);
                 if undershoot < overshoot { below } else { low }
             })
             .collect()
+    }
+
+    pub(crate) fn size_before(&self, index: usize) -> usize {
+        let (data, starts) = self.parts();
+        starts.get(index).map_or(data.len(), R::decode) + index * Self::ADDRESS_LENGTH
     }
 
     fn parts(&self) -> (&[u8], &[R::Stored]) {
