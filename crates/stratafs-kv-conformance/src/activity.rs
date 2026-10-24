@@ -27,6 +27,7 @@ pub enum SimulatedOperation {
     Read(Vec<SimulatedRead>),
     Set(Bytes, Bytes),
     Clear(Bytes),
+    ClearRange(Bound<Bytes>, Bound<Bytes>),
     Panic,
     Abort,
 }
@@ -122,6 +123,7 @@ fn operation() -> impl Strategy<Value = SimulatedOperation> {
         6 => vec(read(), 1..=3).prop_map(SimulatedOperation::Read),
         6 => (key(), value()).prop_map(|(key, value)| SimulatedOperation::Set(key, value)),
         6 => key().prop_map(SimulatedOperation::Clear),
+        2 => valid_range().prop_map(|(start, end)| SimulatedOperation::ClearRange(start, end)),
         1 => Just(SimulatedOperation::Panic),
         1 => Just(SimulatedOperation::Abort),
     ]
@@ -130,13 +132,16 @@ fn operation() -> impl Strategy<Value = SimulatedOperation> {
 fn read() -> impl Strategy<Value = SimulatedRead> {
     prop_oneof![
         4 => key().prop_map(SimulatedRead::Get),
-        4 => (bound(), bound(), limit())
-            .prop_filter("valid range", |(start, end, _)| {
-                is_valid_range::<Bytes>(&(start.as_ref(), end.as_ref()))
-            })
-            .prop_map(|(start, end, limit)| SimulatedRead::GetRange(start, end, limit)),
+        4 => (valid_range(), limit())
+            .prop_map(|((start, end), limit)| SimulatedRead::GetRange(start, end, limit)),
         1 => key().prop_map(SimulatedRead::Observe),
     ]
+}
+
+fn valid_range() -> impl Strategy<Value = (Bound<Bytes>, Bound<Bytes>)> {
+    (bound(), bound()).prop_filter("valid range", |(start, end)| {
+        is_valid_range::<Bytes>(&(start.as_ref(), end.as_ref()))
+    })
 }
 
 fn bound() -> impl Strategy<Value = Bound<Bytes>> {

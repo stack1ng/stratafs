@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::ops::Bound;
+use std::ops::{Bound, RangeBounds};
 
 use bytes::Bytes;
 use stateright::semantics::SequentialSpec;
@@ -103,6 +103,14 @@ impl BTreeModel {
                         }
                         SimulatedOperation::Clear(key) => {
                             after.values.remove(key);
+                        }
+                        SimulatedOperation::ClearRange(start, end) => {
+                            after.values.retain(|key, _| {
+                                !RangeBounds::<Bytes>::contains(
+                                    &(start.as_ref(), end.as_ref()),
+                                    key,
+                                )
+                            });
                         }
                         SimulatedOperation::Panic => return Outcome::Panicked,
                         SimulatedOperation::Abort => return Outcome::Aborted,

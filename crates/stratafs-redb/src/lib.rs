@@ -300,4 +300,21 @@ impl KeyValueTransaction for RedbTransaction<'_, Table<'_, &'static [u8], &'stat
         }
         Ok(())
     }
+
+    async fn clear_range(
+        &mut self,
+        range: impl RangeBounds<Bytes> + Send,
+    ) -> Result<(), Self::Failure> {
+        assert_valid_range(&range);
+        let bounds = (
+            range.start_bound().map(|key| &key[..]),
+            range.end_bound().map(|key| &key[..]),
+        );
+        let written = &mut *self.written;
+        self.table.retain_in::<&[u8], _>(bounds, |key, _| {
+            written.push(Bytes::copy_from_slice(key));
+            false
+        })?;
+        Ok(())
+    }
 }

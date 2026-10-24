@@ -120,7 +120,16 @@ pub trait KeyValueTransaction: ReadKeyValueTransaction {
         value: impl Buf + Send,
     ) -> impl Future<Output = Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>>> + Send;
 
-    fn clear(&mut self, key: Bytes) -> impl Future<Output = Result<(), Self::Failure>> + Send;
+    fn clear(&mut self, key: Bytes) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        async move { self.clear_range(&key..=&key).await }
+    }
+
+    // clear_range removes every key in a range.
+    // If an inverted (end < start) or fully excluded (start == end == Bound::Excluded) range is provided, the call panics.
+    fn clear_range(
+        &mut self,
+        range: impl RangeBounds<Bytes> + Send,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }
 
 pub trait ReadKeyValueTransaction: Send + Sync {

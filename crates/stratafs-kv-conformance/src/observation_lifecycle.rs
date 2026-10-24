@@ -1,3 +1,4 @@
+use std::ops::Bound;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,14 @@ pub(crate) enum KeyChange {
     Committed,
     CancelledAtSuspension(usize),
     RewritesSameValue,
+    ClearedByRange,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum KeyWrite {
+    Changes,
+    RewritesSameValue,
+    ClearsByRange,
 }
 
 enum ObserverCommit {
@@ -85,19 +94,29 @@ where
 pub(crate) async fn change_key<S: KeyValueStore>(
     store: &S,
     log: Arc<Mutex<Vec<ObservationEvent>>>,
-    rewrites_same_value: bool,
+    write: KeyWrite,
 ) -> Result<(), TransactError<S::Rejection, S::Failure, WorkFailure<S::Rejection, S::Failure>>> {
     store
         .transact(|mut transaction| {
             let log = log.clone();
             Box::pin(async move {
                 let key = Bytes::from_static(OBSERVED_KEY);
-                if !rewrites_same_value {
-                    transaction.set(key, Bytes::from_static(b"changed")).await?;
-                } else if let Some(value) = transaction.get(key.clone()).await? {
-                    transaction.set(key, value).await?;
-                } else {
-                    transaction.clear(key).await?;
+                match write {
+                    KeyWrite::Changes => {
+                        transaction.set(key, Bytes::from_static(b"changed")).await?;
+                    }
+                    KeyWrite::RewritesSameValue => match transaction.get(key.clone()).await? {
+                        Some(value) => transaction.set(key, value).await?,
+                        None => transaction.clear(key).await?,
+                    },
+                    KeyWrite::ClearsByRange => {
+                        transaction
+                            .clear_range((
+                                Bound::Excluded(Bytes::from_static(b"o")),
+                                Bound::Included(key),
+                            ))
+                            .await?;
+                    }
                 }
                 log.lock().unwrap().push(ObservationEvent::ChangerWorkEnded);
                 Ok(())
@@ -209,22 +228,39 @@ pub(crate) async fn run_observation_scenario<P: Replay, S: KeyValueStore + 'stat
             attempt
         }
     });
+    if let KeyChange::ClearedByRange = key_change {
+        store
+            .transact(|mut transaction| {
+                let key = key.clone();
+                Box::pin(async move { transaction.set(key, Bytes::from_static(b"before")).await })
+            })
+            .await
+            .expect("setting the observed key before the scenario failed");
+    }
     let changing = match key_change {
         KeyChange::Unchanged => None,
         KeyChange::Committed
         | KeyChange::RewritesSameValue
+        | KeyChange::ClearedByRange
         | KeyChange::CancelledAtSuspension(_) => Some(spawn_with_handle(&replay, {
             let (store, log) = (store.clone(), log.clone());
             async move {
-                let rewrites_same_value = matches!(key_change, KeyChange::RewritesSameValue);
-                let change = change_key(&*store, log, rewrites_same_value);
+                let write = match key_change {
+                    KeyChange::RewritesSameValue => KeyWrite::RewritesSameValue,
+                    KeyChange::ClearedByRange => KeyWrite::ClearsByRange,
+                    KeyChange::Unchanged
+                    | KeyChange::Committed
+                    | KeyChange::CancelledAtSuspension(_) => KeyWrite::Changes,
+                };
+                let change = change_key(&*store, log, write);
                 let result = match key_change {
                     KeyChange::CancelledAtSuspension(n) => {
                         cancel_at_nth_suspension(change, n).await
                     }
-                    KeyChange::Unchanged | KeyChange::Committed | KeyChange::RewritesSameValue => {
-                        Some(change.await)
-                    }
+                    KeyChange::Unchanged
+                    | KeyChange::Committed
+                    | KeyChange::RewritesSameValue
+                    | KeyChange::ClearedByRange => Some(change.await),
                 };
                 if let Some(result) = result {
                     result.expect("the changing transaction failed");

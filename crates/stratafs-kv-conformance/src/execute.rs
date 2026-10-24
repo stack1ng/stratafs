@@ -108,6 +108,9 @@ pub(crate) async fn execute<S: KeyValueStore>(
                                     SimulatedOperation::Clear(key) => {
                                         transaction.clear(key).await?
                                     }
+                                    SimulatedOperation::ClearRange(start, end) => {
+                                        transaction.clear_range((start, end)).await?
+                                    }
                                     SimulatedOperation::Panic => {
                                         resume_unwind(Box::new("simulated panic inside work"))
                                     }

@@ -17,13 +17,13 @@ use futures_util::FutureExt;
 use proptest::prelude::any;
 use proptest::proptest;
 use stratafs_store::forkable::ForkableKeyValueStore;
-use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
+use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
 
 use crate::activity::{simulated_client_activity, simulated_client_transactions, simulated_stop};
 use crate::durability::{CrashableStorage, simulate_and_reopen};
 use crate::forking::simulate_and_fork;
 use crate::observation_lifecycle::{
-    KeyChange, Observations, ObserverOutcome, ObservingTransaction, change_key,
+    KeyChange, KeyWrite, Observations, ObserverOutcome, ObservingTransaction, change_key,
     count_suspensions_on_a_fresh_store, observe, run_observation_scenario,
 };
 use crate::runtime::ReplayingRuntime;
@@ -79,6 +79,14 @@ pub fn panics_on_invalid_ranges<S: KeyValueStore>(new_store: impl Fn() -> S) {
             write.is_err(),
             "get_range accepted {range:?} in a write transaction"
         );
+        let clear = block_on(
+            AssertUnwindSafe(store.transact(|mut transaction| {
+                let range = range.clone();
+                Box::pin(async move { transaction.clear_range(range).await })
+            }))
+            .catch_unwind(),
+        );
+        assert!(clear.is_err(), "clear_range accepted {range:?}");
     }
 }
 
@@ -91,12 +99,13 @@ pub fn observation_lifecycle<R: ReplayingRuntime, S: KeyValueStore + 'static>(
     let new_store = Arc::new(new_store);
     let change_suspensions =
         count_suspensions_on_a_fresh_store(&runtime, &new_store, |store| async move {
-            let _ = change_key(&*store, Arc::default(), false).await;
+            let _ = change_key(&*store, Arc::default(), KeyWrite::Changes).await;
         });
     let key_changes: Vec<KeyChange> = [
         KeyChange::Unchanged,
         KeyChange::Committed,
         KeyChange::RewritesSameValue,
+        KeyChange::ClearedByRange,
     ]
     .into_iter()
     .chain((0..change_suspensions).map(KeyChange::CancelledAtSuspension))
