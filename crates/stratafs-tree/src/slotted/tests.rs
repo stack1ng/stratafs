@@ -448,7 +448,10 @@ fn n_midpoints_are_the_indices_where_the_front_is_closest_to_each_share_of_the_s
         list_of::<u16>(&[b"aaaaaaaaaa", b"b", b"c", b"d", b"e"]).n_midpoints_by_size(2),
         vec![1, 2]
     );
-    assert_eq!(list_of::<u16>(&[b"a"]).n_midpoints_by_size(0), vec![]);
+    assert_eq!(
+        list_of::<u16>(&[b"a"]).n_midpoints_by_size(0),
+        Vec::<usize>::new()
+    );
 }
 
 fn midpoint_matches_the_index_closest_to_half_the_size<R: AddressableRange>(
