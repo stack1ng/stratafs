@@ -9,9 +9,11 @@ rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+# The objc2 crates come from main, pinned, since only it has the macOS 27 SDK bindings (FSVolumeHandler).
+# Move back to crates.io once a release includes them.
 bitflags = "2.13"
 blake3 = "1.8"
-block2 = "0.6"
+block2 = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
 blocking = "1.7"
 bytes = "1.12"
 cfg_aliases = "0.2"
@@ -24,9 +26,9 @@ futures-lite = "2.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hex = "0.4"
 libc = "0.2"
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-fs-kit = "0.3"
+objc2 = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
+objc2-foundation = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
+objc2-fs-kit = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
 opendal = { version = "0.59.4", default-features = false }
 proptest = { version = "1.5", default-features = false, features = ["std"] }
 rangemap = "1.8"
@@ -36,6 +38,7 @@ shuttle = "0.9.7"
 smallvec = { version = "1.16", features = ["union"] }
 stateright = "0.31"
 stratafs-content-conformance = { path = "crates/stratafs-content-conformance" }
+stratafs-fs-engine = { path = "crates/stratafs-fs-engine" }
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
 stratafs-opendal = { path = "crates/stratafs-opendal" }

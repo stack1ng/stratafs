@@ -3,6 +3,27 @@ use stratafs_store::content::GetRejection;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::SetRejection;
 
+// PosixError is the POSIX error an engine error stands for, by its POSIX name. POSIX fixes the names
+// but not their numbers, which differ between platforms, so each adapter turns these into its own.
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PosixError {
+    EEXIST,
+    EFBIG,
+    EINVAL,
+    EIO,
+    EISDIR,
+    EMLINK,
+    ENAMETOOLONG,
+    ENOATTR,
+    ENOENT,
+    ENOSPC,
+    ENOTDIR,
+    ENOTEMPTY,
+    EPERM,
+    ESTALE,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IoFailure<M, C> {
     #[error(transparent)]
@@ -13,6 +34,12 @@ pub enum IoFailure<M, C> {
     ContentWrite(C),
     #[error(transparent)]
     Corrupt(CorruptValue),
+}
+
+impl<M, C> From<&IoFailure<M, C>> for PosixError {
+    fn from(_: &IoFailure<M, C>) -> Self {
+        PosixError::EIO
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

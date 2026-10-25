@@ -1,13 +1,10 @@
 use std::ptr;
 
-use block2::DynBlock;
+use block2::SendableBlock;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol};
+use objc2::runtime::NSObjectProtocol;
 use objc2::{AllocAnyThread, define_class};
-use objc2_foundation::{
-    NSDictionary, NSError, NSInteger, NSLocalizedDescriptionKey, NSObject, NSPOSIXErrorDomain,
-    NSString,
-};
+use objc2_foundation::{NSError, NSObject, NSString};
 use objc2_fs_kit::{
     FSContainerIdentifier, FSContainerStatus, FSFileSystemBase, FSGenericURLResource,
     FSProbeResult, FSResource, FSTaskOptions, FSUnaryFileSystem, FSUnaryFileSystemOperations,
@@ -15,7 +12,7 @@ use objc2_fs_kit::{
 };
 
 use super::volume::StrataVolume;
-use super::{LoadError, identity, open_volume};
+use super::{LoadError, identity, open_volume, posix_error};
 use crate::volume_url::VolumeUrl;
 
 define_class!(
@@ -33,7 +30,7 @@ define_class!(
         fn probe_resource(
             &self,
             resource: &FSResource,
-            reply: &DynBlock<dyn Fn(*mut FSProbeResult, *mut NSError)>,
+            reply: &SendableBlock<'static, fn(*mut FSProbeResult, *mut NSError)>,
         ) {
             let volume_id = url_of(resource).and_then(|url| {
                 url.parse::<VolumeUrl<bytes::Bytes>>()
@@ -53,7 +50,7 @@ define_class!(
                     Err(_) => FSProbeResult::notRecognizedProbeResult(),
                 }
             };
-            reply.call((Retained::as_ptr(&result).cast_mut(), ptr::null_mut()));
+            reply.call(Retained::as_ptr(&result).cast_mut(), ptr::null_mut());
         }
 
         // loadResource opens the volume the mount URL names, and replies with it.
@@ -62,20 +59,20 @@ define_class!(
             &self,
             resource: &FSResource,
             _options: &FSTaskOptions,
-            reply: &DynBlock<dyn Fn(*mut FSVolume, *mut NSError)>,
+            reply: &SendableBlock<'static, fn(*mut FSVolume, *mut NSError)>,
         ) {
             match url_of(resource).and_then(|url| open_volume(&url)) {
                 Ok(opened) => {
                     let volume = Retained::into_super(StrataVolume::new(opened));
                     // SAFETY: setting the container status to ready is what FSKit expects before the reply.
                     unsafe { self.setContainerStatus(&FSContainerStatus::ready()) };
-                    reply.call((Retained::as_ptr(&volume).cast_mut(), ptr::null_mut()));
+                    reply.call(Retained::as_ptr(&volume).cast_mut(), ptr::null_mut());
                 }
                 Err(error) => {
-                    reply.call((
+                    reply.call(
                         ptr::null_mut(),
                         Retained::as_ptr(&ns_error(&error)).cast_mut(),
-                    ));
+                    );
                 }
             }
         }
@@ -85,10 +82,10 @@ define_class!(
             &self,
             _resource: &FSResource,
             _options: &FSTaskOptions,
-            reply: &DynBlock<dyn Fn(*mut NSError)>,
+            reply: &SendableBlock<'static, fn(*mut NSError)>,
         ) {
             // we implement "unload" behavior in the idiomatic rust way through a Drop trait on the engine.
-            reply.call((ptr::null_mut(),));
+            reply.call(ptr::null_mut());
         }
     }
 );
@@ -105,19 +102,9 @@ fn url_of(resource: &FSResource) -> Result<String, LoadError> {
 }
 
 fn ns_error(error: &LoadError) -> Retained<NSError> {
-    let code = match error {
+    let errno = match error {
         LoadError::NoUrl | LoadError::InvalidUrl(_) => libc::EINVAL,
         LoadError::OpenFailed(_) => libc::EIO,
     };
-    let description = NSString::from_str(&error.to_string());
-    let description: &AnyObject = &description;
-    // SAFETY: the domain and key are Foundation's own constants.
-    unsafe {
-        let user_info = NSDictionary::from_slices(&[NSLocalizedDescriptionKey], &[description]);
-        NSError::errorWithDomain_code_userInfo(
-            NSPOSIXErrorDomain,
-            code as NSInteger,
-            Some(&user_info),
-        )
-    }
+    posix_error(errno, &error.to_string())
 }

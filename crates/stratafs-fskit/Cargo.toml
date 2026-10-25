@@ -11,10 +11,13 @@ extension = [
     "dep:blake3",
     "dep:block2",
     "dep:futures-lite",
+    "dep:futures-util",
     "dep:libc",
     "dep:objc2",
     "dep:objc2-foundation",
     "dep:objc2-fs-kit",
+    "dep:stratafs-fs-engine",
+    "dep:stratafs-store",
     "dep:uuid",
 ]
 
@@ -23,15 +26,22 @@ blake3 = { workspace = true, optional = true }
 block2 = { workspace = true, optional = true }
 bytes.workspace = true
 futures-lite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 hex.workspace = true
 libc = { workspace = true, optional = true }
 objc2 = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 objc2-fs-kit = { workspace = true, optional = true }
+stratafs-fs-engine = { workspace = true, optional = true }
+stratafs-store = { workspace = true, optional = true }
 thiserror.workspace = true
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
+opendal = { workspace = true, features = ["services-memory"] }
+redb = "4.4.0"
+stratafs-opendal.workspace = true
+stratafs-redb.workspace = true
 stratafs-tree.workspace = true
 
 # The workspace forbids unsafe code. The FSKit extension calls into Objective-C, which needs it,
