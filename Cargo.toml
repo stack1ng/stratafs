@@ -37,6 +37,7 @@ stratafs-range-bounds-map = { path = "crates/stratafs-range-bounds-map" }
 stratafs-redb = { path = "crates/stratafs-redb" }
 stratafs-serialized = { path = "crates/stratafs-serialized" }
 stratafs-store = { path = "crates/stratafs-store" }
+stratafs-tree = { path = "crates/stratafs-tree" }
 storekey = "0.11"
 thiserror = "2.0"
 weak-table = "0.4"

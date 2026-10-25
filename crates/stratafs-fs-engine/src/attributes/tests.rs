@@ -2,13 +2,12 @@ use std::convert::Infallible;
 
 use futures_lite::future::block_on;
 use stratafs_opendal::OpendalError;
-use stratafs_redb::RedbFailure;
 use stratafs_serialized::FINGERPRINT_LENGTH;
 use stratafs_store::content::ContentHash;
 use zerocopy::IntoBytes;
 
 use super::*;
-use crate::test_support::{InMemoryEngine, aborted, new_test_engine, set_clock};
+use crate::test_support::{InMemoryEngine, MetadataFailure, aborted, new_test_engine, set_clock};
 
 fn getattr(engine: &InMemoryEngine, inode: Inode) -> Option<Attributes> {
     block_on(engine.read_transact(|txn| Box::pin(async move { txn.getattr(inode).await })))
@@ -20,7 +19,7 @@ fn setattr(
     engine: &InMemoryEngine,
     inode: Inode,
     update: impl Fn(&mut SettableAttributes) + Send + Sync,
-) -> Result<Attributes, SetattrError<RedbFailure, Infallible, OpendalError>> {
+) -> Result<Attributes, SetattrError<MetadataFailure, Infallible, OpendalError>> {
     let update = &update;
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
@@ -35,7 +34,7 @@ fn getxattr(
     engine: &InMemoryEngine,
     inode: Inode,
     name: &[u8],
-) -> Result<Option<Bytes>, GetxattrError<RedbFailure, OpendalError>> {
+) -> Result<Option<Bytes>, GetxattrError<MetadataFailure, OpendalError>> {
     block_on(engine.read_transact(|txn| {
         Box::pin(async move {
             let value = txn.getxattr(inode, name).await?;
@@ -48,7 +47,7 @@ fn getxattr(
 fn listxattr(
     engine: &InMemoryEngine,
     inode: Inode,
-) -> Result<Vec<Bytes>, ListxattrError<RedbFailure, OpendalError>> {
+) -> Result<Vec<Bytes>, ListxattrError<MetadataFailure, OpendalError>> {
     block_on(engine.read_transact(|txn| Box::pin(async move { txn.listxattr(inode).await })))
         .map_err(aborted)
 }
@@ -59,7 +58,7 @@ fn setxattr(
     name: &[u8],
     value: &[u8],
     mode: SetXattrMode,
-) -> Result<(), SetxattrError<RedbFailure, Infallible, OpendalError>> {
+) -> Result<(), SetxattrError<MetadataFailure, Infallible, OpendalError>> {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
             let result = txn.setxattr(inode, name, value, mode).await;
@@ -73,7 +72,7 @@ fn removexattr(
     engine: &InMemoryEngine,
     inode: Inode,
     name: &[u8],
-) -> Result<(), RemovexattrError<RedbFailure, Infallible, OpendalError>> {
+) -> Result<(), RemovexattrError<MetadataFailure, Infallible, OpendalError>> {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
             let result = txn.removexattr(inode, name).await;

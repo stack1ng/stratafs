@@ -3,14 +3,15 @@ use std::convert::Infallible;
 use futures_lite::future::block_on;
 use futures_util::future::try_join_all;
 use stratafs_opendal::OpendalError;
-use stratafs_redb::RedbFailure;
 
 use super::*;
 use crate::Timestamp;
 use crate::attributes::error::SetattrError;
 use crate::attributes::{Mode, Ownership, SettableAttributes};
 use crate::directories::NewItem;
-use crate::test_support::{InMemoryEngine, OneKibInline, aborted, new_test_engine, set_clock};
+use crate::test_support::{
+    InMemoryEngine, MetadataFailure, OneKibInline, aborted, new_test_engine, set_clock,
+};
 
 fn stored(extent: &ExtentValue) -> Bytes {
     let mut stored = extent.to_stored();
@@ -151,7 +152,7 @@ fn plan(
     inode: Inode,
     offset: u64,
     size: u64,
-) -> Result<ContentLoadPlan, ReadError<RedbFailure, OpendalError>> {
+) -> Result<ContentLoadPlan, ReadError<MetadataFailure, OpendalError>> {
     block_on(
         engine.read_transact(|txn| Box::pin(async move { txn.read(inode, offset, size).await })),
     )
@@ -407,7 +408,7 @@ fn slicing_past_the_inline_bytes_is_an_invalid_extent() {
     ));
 }
 
-type Write = WriteError<RedbFailure, Infallible, OpendalError>;
+type Write = WriteError<MetadataFailure, Infallible, OpendalError>;
 
 fn write(
     engine: &InMemoryEngine,
@@ -779,7 +780,7 @@ fn a_write_ending_past_the_largest_offset_is_too_large() {
     ));
 }
 
-type Setattr = SetattrError<RedbFailure, Infallible, OpendalError>;
+type Setattr = SetattrError<MetadataFailure, Infallible, OpendalError>;
 
 fn setattr(
     engine: &InMemoryEngine,

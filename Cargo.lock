@@ -1390,6 +1390,7 @@ dependencies = [
  "stratafs-redb",
  "stratafs-serialized",
  "stratafs-store",
+ "stratafs-tree",
  "thiserror",
  "xxhash-rust",
  "zerocopy",

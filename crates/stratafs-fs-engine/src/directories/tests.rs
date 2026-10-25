@@ -3,18 +3,17 @@ use std::convert::Infallible;
 
 use futures_lite::future::block_on;
 use stratafs_opendal::OpendalError;
-use stratafs_redb::RedbFailure;
 
 use super::*;
 use crate::attributes::SetXattrMode;
 use crate::content::error::ReadSymbolicLinkError;
-use crate::test_support::{InMemoryEngine, aborted, new_test_engine, set_clock};
+use crate::test_support::{InMemoryEngine, MetadataFailure, aborted, new_test_engine, set_clock};
 
-type Create = CreateError<RedbFailure, Infallible, OpendalError>;
-type HardLink = HardLinkError<RedbFailure, Infallible, OpendalError>;
-type HardUnlink = HardUnlinkError<RedbFailure, Infallible, OpendalError>;
-type Rmdir = RmdirError<RedbFailure, Infallible, OpendalError>;
-type Rename = RenameError<RedbFailure, Infallible, OpendalError>;
+type Create = CreateError<MetadataFailure, Infallible, OpendalError>;
+type HardLink = HardLinkError<MetadataFailure, Infallible, OpendalError>;
+type HardUnlink = HardUnlinkError<MetadataFailure, Infallible, OpendalError>;
+type Rmdir = RmdirError<MetadataFailure, Infallible, OpendalError>;
+type Rename = RenameError<MetadataFailure, Infallible, OpendalError>;
 
 fn create(
     engine: &InMemoryEngine,
@@ -50,7 +49,7 @@ fn lookup(
     engine: &InMemoryEngine,
     dir: Inode,
     name: &[u8],
-) -> Result<Option<(Inode, Attributes)>, LookupError<RedbFailure, OpendalError>> {
+) -> Result<Option<(Inode, Attributes)>, LookupError<MetadataFailure, OpendalError>> {
     block_on(engine.read_transact(|txn| Box::pin(async move { txn.lookup(dir, name).await })))
         .map_err(aborted)
 }
@@ -64,7 +63,7 @@ fn readdir(
     dir: Inode,
     after: u64,
     limit: usize,
-) -> Result<Vec<DirectoryEntry>, ReaddirError<RedbFailure, OpendalError>> {
+) -> Result<Vec<DirectoryEntry>, ReaddirError<MetadataFailure, OpendalError>> {
     block_on(
         engine.read_transact(|txn| Box::pin(async move { txn.readdir(dir, after, limit).await })),
     )
@@ -139,7 +138,7 @@ fn rename(
 fn read_symbolic_link(
     engine: &InMemoryEngine,
     inode: Inode,
-) -> Result<Bytes, ReadSymbolicLinkError<RedbFailure, OpendalError>> {
+) -> Result<Bytes, ReadSymbolicLinkError<MetadataFailure, OpendalError>> {
     block_on(engine.read_transact(|txn| {
         Box::pin(async move {
             let mut target = txn.read_symbolic_link(inode).await?;
@@ -150,15 +149,25 @@ fn read_symbolic_link(
 }
 
 fn stored_keys_of(engine: &InMemoryEngine, inode: Inode) -> usize {
-    block_on(engine.read_transact(|txn| {
-        Box::pin(async move {
-            txn.metadata
-                .get_range(every_key_of(inode), usize::MAX)
-                .await
-                .map(|entries| entries.count())
-        })
-    }))
+    block_on(
+        engine.read_transact(|txn| {
+            Box::pin(async move { count_keys_of(&*txn.metadata, inode).await })
+        }),
+    )
     .unwrap()
+}
+
+// count_keys_of is generic so Send is proven against the trait, not each store's own future (see lib.rs).
+fn count_keys_of<T: ReadKeyValueTransaction>(
+    metadata: &T,
+    inode: Inode,
+) -> impl Future<Output = Result<usize, T::Failure>> + Send {
+    async move {
+        metadata
+            .get_range(every_key_of(inode), usize::MAX)
+            .await
+            .map(|entries| entries.count())
+    }
 }
 
 const MISSING: Inode = Inode(5000);
@@ -818,7 +827,7 @@ fn a_full_collision_range_is_storage_full() {
                     FileType::Directory,
                 )?;
             }
-            Ok::<_, StoreError<Infallible, RedbFailure>>(((), txn))
+            Ok::<_, StoreError<Infallible, MetadataFailure>>(((), txn))
         })
     }))
     .unwrap();
