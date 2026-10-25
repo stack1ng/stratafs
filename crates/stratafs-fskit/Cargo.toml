@@ -7,15 +7,34 @@ license.workspace = true
 
 [features]
 # extension is the FSKit extension side, for the extension binary only.
-extension = []
+extension = [
+    "dep:blake3",
+    "dep:block2",
+    "dep:futures-lite",
+    "dep:libc",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-fs-kit",
+    "dep:uuid",
+]
 
 [dependencies]
+blake3 = { workspace = true, optional = true }
+block2 = { workspace = true, optional = true }
 bytes.workspace = true
+futures-lite = { workspace = true, optional = true }
 hex.workspace = true
+libc = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+objc2-fs-kit = { workspace = true, optional = true }
 thiserror.workspace = true
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 stratafs-tree.workspace = true
 
-[lints]
-workspace = true
+# The workspace forbids unsafe code. The FSKit extension calls into Objective-C, which needs it,
+# so this crate denies it instead, and only the extension module allows it.
+[lints.rust]
+unsafe_code = "deny"

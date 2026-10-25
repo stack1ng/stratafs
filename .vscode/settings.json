@@ -4,6 +4,7 @@
     "editor.defaultFormatter": "rust-lang.rust-analyzer"
   },
   "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.cargo.features": "all",
   "rust-analyzer.testExplorer": true,
   "[toml]": {
     "editor.defaultFormatter": "tamasfe.even-better-toml"

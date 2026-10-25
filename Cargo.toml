@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 bitflags = "2.13"
 blake3 = "1.8"
+block2 = "0.6"
 blocking = "1.7"
 bytes = "1.12"
 cfg_aliases = "0.2"
@@ -22,6 +23,10 @@ futures-core = "0.3.34"
 futures-lite = "2.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hex = "0.4"
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-fs-kit = "0.3"
 opendal = { version = "0.59.4", default-features = false }
 proptest = { version = "1.5", default-features = false, features = ["std"] }
 rangemap = "1.8"
@@ -41,6 +46,7 @@ stratafs-store = { path = "crates/stratafs-store" }
 stratafs-tree = { path = "crates/stratafs-tree" }
 storekey = "0.11"
 thiserror = "2.0"
+uuid = "1"
 weak-table = "0.4"
 xxhash-rust = { version = "0.8", features = ["const_xxh32"] }
 zerocopy = { version = "0.8", features = ["alloc", "derive"] }
