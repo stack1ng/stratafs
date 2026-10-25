@@ -93,7 +93,7 @@ impl Attributes {
 }
 
 serialized_value! {
-    struct StoredAttributes {
+    pub(crate) struct StoredAttributes {
         kind: u8,
         mode: U16,
         hard_link_count: U32,
