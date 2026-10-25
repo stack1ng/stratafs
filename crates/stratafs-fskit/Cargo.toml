@@ -1,0 +1,21 @@
+[package]
+name = "stratafs-fskit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# extension is the FSKit extension side, for the extension binary only.
+extension = []
+
+[dependencies]
+bytes.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+stratafs-tree.workspace = true
+
+[lints]
+workspace = true

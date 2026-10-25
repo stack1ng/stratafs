@@ -1397,6 +1397,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-fskit"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "stratafs-tree",
+ "thiserror",
+]
+
+[[package]]
 name = "stratafs-keyed-notify"
 version = "0.1.0"
 dependencies = [
