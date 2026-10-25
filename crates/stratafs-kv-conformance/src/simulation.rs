@@ -343,7 +343,7 @@ async fn measure_suspensions<S: KeyValueStore>(
             for (key, value) in entries {
                 transaction.set(key, value).await?;
             }
-            Ok(())
+            Ok(((), transaction))
         })
     })
     .await

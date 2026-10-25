@@ -39,6 +39,12 @@ pub struct TreeTransaction<'txn, T, S, A, C> {
     >,
 }
 
+// FlushingWork is the error of a transaction's work followed by its flush.
+enum FlushingWork<E, F, R> {
+    Work(E),
+    Flush(TreeFailure<F, R>),
+}
+
 impl<S, A, C> TreeVolume<S, A, C> {
     fn transaction<'txn, T>(
         &'txn self,
@@ -138,14 +144,36 @@ where
         &'store self,
         mut work: impl for<'txn> FnMut(
             TransactionHandle<'txn, 'store, Self::Transaction<'txn>>,
-        ) -> BoxFuture<'txn, Result<T, E>>
-        + Send,
+        ) -> BoxFuture<
+            'txn,
+            Result<(T, TransactionHandle<'txn, 'store, Self::Transaction<'txn>>), E>,
+        > + Send,
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
         self.shared
             .store
-            .transact(|inner| work(TransactionHandle::new(self.transaction(inner))))
+            .transact(|inner| {
+                let working = work(TransactionHandle::new(self.transaction(inner)));
+                Box::pin(async move {
+                    let (result, mut transaction) = working.await.map_err(FlushingWork::Work)?;
+                    transaction
+                        .flush()
+                        .await
+                        .map_err(|error| FlushingWork::Flush(refused_write_as_failure(error)))?;
+                    let inner = transaction.into_inner().inner.into_inner();
+                    Ok((result, TransactionHandle::new(inner)))
+                })
+            })
             .await
-            .map_err(store_failure_as_tree_failure)
+            .map_err(|error| match error {
+                TransactError::Rejected(rejection) => TransactError::Rejected(rejection),
+                TransactError::Failed(failure) => {
+                    TransactError::Failed(TreeFailure::Store(failure))
+                }
+                TransactError::Aborted(FlushingWork::Work(error)) => TransactError::Aborted(error),
+                TransactError::Aborted(FlushingWork::Flush(failure)) => {
+                    TransactError::Failed(failure)
+                }
+            })
     }
 
     async fn read_transact<'store, T: Send, E: Send>(

@@ -22,8 +22,13 @@ fn setattr(
     update: impl Fn(&mut SettableAttributes) + Send + Sync,
 ) -> Result<Attributes, SetattrError<RedbFailure, Infallible, OpendalError>> {
     let update = &update;
-    block_on(engine.transact(|mut txn| Box::pin(async move { txn.setattr(inode, update).await })))
-        .map_err(aborted)
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.setattr(inode, update).await;
+            result.map(|result| (result, txn))
+        })
+    }))
+    .map_err(aborted)
 }
 
 fn getxattr(
@@ -55,11 +60,12 @@ fn setxattr(
     value: &[u8],
     mode: SetXattrMode,
 ) -> Result<(), SetxattrError<RedbFailure, Infallible, OpendalError>> {
-    block_on(
-        engine.transact(|mut txn| {
-            Box::pin(async move { txn.setxattr(inode, name, value, mode).await })
-        }),
-    )
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.setxattr(inode, name, value, mode).await;
+            result.map(|result| (result, txn))
+        })
+    }))
     .map_err(aborted)
 }
 
@@ -68,13 +74,21 @@ fn removexattr(
     inode: Inode,
     name: &[u8],
 ) -> Result<(), RemovexattrError<RedbFailure, Infallible, OpendalError>> {
-    block_on(engine.transact(|mut txn| Box::pin(async move { txn.removexattr(inode, name).await })))
-        .map_err(aborted)
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.removexattr(inode, name).await;
+            result.map(|result| (result, txn))
+        })
+    }))
+    .map_err(aborted)
 }
 
 fn insert_inode(engine: &InMemoryEngine, inode: Inode, attributes: &Attributes) {
     block_on(engine.transact(|mut txn| {
-        Box::pin(async move { txn.write_attributes(inode, attributes).await })
+        Box::pin(async move {
+            let result = txn.write_attributes(inode, attributes).await;
+            result.map(|result| (result, txn))
+        })
     }))
     .unwrap();
 }
@@ -124,9 +138,12 @@ fn creating_the_root_again_leaves_an_existing_root_alone() {
     })
     .unwrap();
     set_clock(9);
-    block_on(
-        engine.transact(|mut txn| Box::pin(async move { txn.create_root_if_missing().await })),
-    )
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.create_root_if_missing().await;
+            result.map(|result| (result, txn))
+        })
+    }))
     .unwrap();
     assert_eq!(getattr(&engine, Inode::ROOT).unwrap(), changed);
 }

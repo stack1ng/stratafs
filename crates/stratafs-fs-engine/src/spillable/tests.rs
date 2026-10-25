@@ -10,7 +10,10 @@ const KEY: &[u8] = b"key";
 fn make_spillable(engine: &InMemoryEngine, prefix_length: usize, content: Bytes) -> SpillableValue {
     block_on(engine.transact(|txn| {
         let content = content.clone();
-        Box::pin(async move { txn.make_spillable(KEY, prefix_length, content).await })
+        Box::pin(async move {
+            let result = txn.make_spillable(KEY, prefix_length, content).await;
+            result.map(|result| (result, txn))
+        })
     }))
     .unwrap()
 }

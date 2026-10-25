@@ -68,9 +68,11 @@ fn decoding_rejects_a_header_that_is_too_short_or_a_corrupt_spillable_value() {
 fn write_extent(engine: &InMemoryEngine, inode: Inode, end: u64, extent: &ExtentValue) {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
-            txn.metadata
+            let result = txn
+                .metadata
                 .set(FsKey::new_extent(inode, end).into(), extent.to_stored())
-                .await
+                .await;
+            result.map(|result| (result, txn))
         })
     }))
     .unwrap();
@@ -97,7 +99,10 @@ fn file_of_size(engine: &InMemoryEngine, inode: Inode, size: u64) {
     };
     block_on(engine.transact(|mut txn| {
         let attributes = attributes.clone();
-        Box::pin(async move { txn.write_attributes(inode, &attributes).await })
+        Box::pin(async move {
+            let result = txn.write_attributes(inode, &attributes).await;
+            result.map(|result| (result, txn))
+        })
     }))
     .unwrap();
 }
@@ -246,13 +251,15 @@ fn read_needs_an_existing_regular_file() {
     let engine = new_test_engine();
     let link = block_on(engine.transact(|mut txn| {
         Box::pin(async move {
-            txn.create(
-                Inode::ROOT,
-                b"link",
-                NewItem::SymbolicLink(Bytes::from_static(b"target")),
-                |_| {},
-            )
-            .await
+            let result = txn
+                .create(
+                    Inode::ROOT,
+                    b"link",
+                    NewItem::SymbolicLink(Bytes::from_static(b"target")),
+                    |_| {},
+                )
+                .await;
+            result.map(|result| (result, txn))
         })
     }))
     .unwrap()
@@ -410,7 +417,10 @@ fn write(
     let data = Bytes::copy_from_slice(data);
     block_on(engine.transact(|mut txn| {
         let data = data.clone();
-        Box::pin(async move { txn.write(inode, offset, data).await })
+        Box::pin(async move {
+            let result = txn.write(inode, offset, data).await;
+            result.map(|result| (result, txn))
+        })
     }))
     .map_err(aborted)
 }
@@ -730,13 +740,15 @@ fn write_needs_an_existing_regular_file() {
     let engine = new_test_engine();
     let link = block_on(engine.transact(|mut txn| {
         Box::pin(async move {
-            txn.create(
-                Inode::ROOT,
-                b"link",
-                NewItem::SymbolicLink(Bytes::from_static(b"target")),
-                |_| {},
-            )
-            .await
+            let result = txn
+                .create(
+                    Inode::ROOT,
+                    b"link",
+                    NewItem::SymbolicLink(Bytes::from_static(b"target")),
+                    |_| {},
+                )
+                .await;
+            result.map(|result| (result, txn))
         })
     }))
     .unwrap()

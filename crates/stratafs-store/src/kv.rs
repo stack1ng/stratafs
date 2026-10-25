@@ -40,6 +40,8 @@ pub trait KeyValueStore: Send + Sync + 'static {
     const LARGEST_ACCEPTED_ENTRY: usize;
 
     // transact runs a transaction, returning the result.
+    // When work succeeds it hands its transaction back with its result,
+    // so a store wrapping another store can finish its own part of the transaction before it commits.
     // If work returns an error, the transaction is not applied, and transact returns that error as Aborted.
     // A panic inside work propagates to the caller of transact.
     // The transaction is not applied, and the store stays usable.
@@ -47,8 +49,10 @@ pub trait KeyValueStore: Send + Sync + 'static {
         &'store self,
         work: impl for<'txn> FnMut(
             TransactionHandle<'txn, 'store, Self::Transaction<'txn>>,
-        ) -> BoxFuture<'txn, Result<T, E>>
-        + Send,
+        ) -> BoxFuture<
+            'txn,
+            Result<(T, TransactionHandle<'txn, 'store, Self::Transaction<'txn>>), E>,
+        > + Send,
     ) -> impl Future<Output = Result<T, TransactError<Self::Rejection, Self::Failure, E>>> + Send;
 
     // read_transact runs a read-only transaction, returning the result.
@@ -85,6 +89,10 @@ impl<T> TransactionHandle<'_, '_, T> {
             transaction,
             lifetime: PhantomData,
         }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.transaction
     }
 }
 

@@ -99,8 +99,10 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
         &'store self,
         mut work: impl for<'txn> FnMut(
             TransactionHandle<'txn, 'store, Self::Transaction<'txn>>,
-        ) -> BoxFuture<'txn, Result<T, E>>
-        + Send,
+        ) -> BoxFuture<
+            'txn,
+            Result<(T, TransactionHandle<'txn, 'store, Self::Transaction<'txn>>), E>,
+        > + Send,
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
         let mut written = self.writer.lock().await;
         written.clear();
@@ -112,7 +114,8 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                 written: &mut written,
                 committed: &committed,
             }))
-            .await;
+            .await
+            .map(|(output, _)| output);
             let output = match output {
                 Ok(output) => output,
                 Err(error) => {

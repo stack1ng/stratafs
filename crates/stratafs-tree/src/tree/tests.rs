@@ -118,9 +118,10 @@ fn a_corrupt_pinned_config_is_reported() {
     let store = memory_store();
     block_on(store.transact(|mut transaction| {
         Box::pin(async move {
-            transaction
+            let set = transaction
                 .set(TreeKey::Config.into(), Bytes::from_static(b"not a config"))
-                .await
+                .await;
+            set.map(|()| ((), transaction))
         })
     }))
     .unwrap();

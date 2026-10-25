@@ -129,7 +129,7 @@ where
                         .get(key.clone())
                         .await
                         .map_err(|failure| PinnedConfigError::Store(StoreError::Failed(failure)))?;
-                    match stored {
+                    let checked = match stored {
                         None => transaction
                             .set(key, Bytes::from(&configured))
                             .await
@@ -142,7 +142,8 @@ where
                             }),
                             Err(corrupt) => Err(PinnedConfigError::Corrupt(corrupt.into())),
                         },
-                    }
+                    };
+                    checked.map(|()| ((), transaction))
                 })
             })
             .await?;
@@ -200,6 +201,7 @@ where
                             ),
                         )
                         .await
+                        .map(|()| ((), transaction))
                 })
             })
             .await?;

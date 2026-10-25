@@ -93,7 +93,12 @@ where
     )
     .await?;
     let fork_id = source
-        .transact(|mut transaction| Box::pin(async move { transaction.fork().await }))
+        .transact(|mut transaction| {
+            Box::pin(async move {
+                let fork_id = transaction.fork().await;
+                fork_id.map(|fork_id| (fork_id, transaction))
+            })
+        })
         .await
         .map_err(|error| TestCaseError::fail(format!("forking failed: {error}")))?;
     let fork = Arc::new(

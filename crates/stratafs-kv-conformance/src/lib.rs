@@ -77,10 +77,8 @@ pub fn panics_on_invalid_ranges<S: KeyValueStore>(new_store: impl Fn() -> S) {
             AssertUnwindSafe(store.transact(|transaction| {
                 let range = range.clone();
                 Box::pin(async move {
-                    transaction
-                        .get_range(range, usize::MAX)
-                        .await
-                        .map(|entries| entries.collect::<Vec<_>>())
+                    let entries = transaction.get_range(range, usize::MAX).await;
+                    entries.map(|entries| (entries.collect::<Vec<_>>(), transaction))
                 })
             }))
             .catch_unwind(),
@@ -92,7 +90,10 @@ pub fn panics_on_invalid_ranges<S: KeyValueStore>(new_store: impl Fn() -> S) {
         let clear = block_on(
             AssertUnwindSafe(store.transact(|mut transaction| {
                 let range = range.clone();
-                Box::pin(async move { transaction.clear_range(range).await })
+                Box::pin(async move {
+                    let cleared = transaction.clear_range(range).await;
+                    cleared.map(|()| ((), transaction))
+                })
             }))
             .catch_unwind(),
         );

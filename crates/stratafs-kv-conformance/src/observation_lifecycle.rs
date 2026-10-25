@@ -119,7 +119,7 @@ pub(crate) async fn change_key<S: KeyValueStore>(
                     }
                 }
                 log.lock().unwrap().push(ObservationEvent::ChangerWorkEnded);
-                Ok(())
+                Ok(((), transaction))
             })
         })
         .await
@@ -163,7 +163,7 @@ pub(crate) async fn observe<S: KeyValueStore>(
                         }
                         let second = observe_key(&*transaction, &key).await?;
                         finish_observer_work(watch([first, second]), &log, panics).await;
-                        Ok(())
+                        Ok(((), transaction))
                     })
                 })
                 .await
@@ -232,7 +232,10 @@ pub(crate) async fn run_observation_scenario<P: Replay, S: KeyValueStore + 'stat
         store
             .transact(|mut transaction| {
                 let key = key.clone();
-                Box::pin(async move { transaction.set(key, Bytes::from_static(b"before")).await })
+                Box::pin(async move {
+                    let set = transaction.set(key, Bytes::from_static(b"before")).await;
+                    set.map(|()| ((), transaction))
+                })
             })
             .await
             .expect("setting the observed key before the scenario failed");

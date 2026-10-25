@@ -23,7 +23,7 @@ fn a_value_reads_back_whole_from_one_chunk_or_several() {
                 )
                 .await
                 .unwrap();
-            Ok::<_, Infallible>(())
+            Ok::<_, Infallible>(((), transaction))
         })
     }))
     .unwrap();
@@ -66,7 +66,10 @@ fn a_set_consumes_its_value_from_one_chunk_or_several() {
                 .set(Bytes::from_static(b"several chunks"), &mut several_chunks)
                 .await
                 .unwrap();
-            Ok::<_, Infallible>([one_chunk.remaining(), several_chunks.remaining()])
+            Ok::<_, Infallible>((
+                [one_chunk.remaining(), several_chunks.remaining()],
+                transaction,
+            ))
         })
     }))
     .unwrap();

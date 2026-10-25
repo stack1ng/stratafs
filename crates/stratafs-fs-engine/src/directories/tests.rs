@@ -24,7 +24,10 @@ fn create(
 ) -> Result<EntryChange, Create> {
     block_on(engine.transact(|mut txn| {
         let item = item.clone();
-        Box::pin(async move { txn.create(dir, name, item, |_| {}).await })
+        Box::pin(async move {
+            let result = txn.create(dir, name, item, |_| {}).await;
+            result.map(|result| (result, txn))
+        })
     }))
     .map_err(aborted)
 }
@@ -82,9 +85,12 @@ fn hard_link(
     dir: Inode,
     name: &[u8],
 ) -> Result<EntryChange, HardLink> {
-    block_on(
-        engine.transact(|mut txn| Box::pin(async move { txn.hard_link(inode, dir, name).await })),
-    )
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.hard_link(inode, dir, name).await;
+            result.map(|result| (result, txn))
+        })
+    }))
     .map_err(aborted)
 }
 
@@ -94,17 +100,23 @@ fn hard_unlink(
     name: &[u8],
     expected: Option<Inode>,
 ) -> Result<EntryChange, HardUnlink> {
-    block_on(
-        engine.transact(|mut txn| {
-            Box::pin(async move { txn.hard_unlink(dir, name, expected).await })
-        }),
-    )
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.hard_unlink(dir, name, expected).await;
+            result.map(|result| (result, txn))
+        })
+    }))
     .map_err(aborted)
 }
 
 fn rmdir(engine: &InMemoryEngine, dir: Inode, name: &[u8]) -> Result<EntryChange, Rmdir> {
-    block_on(engine.transact(|mut txn| Box::pin(async move { txn.rmdir(dir, name, None).await })))
-        .map_err(aborted)
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.rmdir(dir, name, None).await;
+            result.map(|result| (result, txn))
+        })
+    }))
+    .map_err(aborted)
 }
 
 fn rename(
@@ -116,7 +128,10 @@ fn rename(
     mode: RenameMode,
 ) -> Result<RenameChange, Rename> {
     block_on(engine.transact(|mut txn| {
-        Box::pin(async move { txn.rename(dir, name, new_dir, new_name, mode, None).await })
+        Box::pin(async move {
+            let result = txn.rename(dir, name, new_dir, new_name, mode, None).await;
+            result.map(|result| (result, txn))
+        })
     }))
     .map_err(aborted)
 }
@@ -155,10 +170,12 @@ fn create_names_a_new_inode_and_records_the_change_on_its_directory() {
     set_clock(9);
     let change = block_on(engine.transact(|mut txn| {
         Box::pin(async move {
-            txn.create(Inode::ROOT, b"a", NewItem::File, |settable| {
-                settable.mode = Mode::OWNER_READ | Mode::OWNER_WRITE;
-            })
-            .await
+            let result = txn
+                .create(Inode::ROOT, b"a", NewItem::File, |settable| {
+                    settable.mode = Mode::OWNER_READ | Mode::OWNER_WRITE;
+                })
+                .await;
+            result.map(|result| (result, txn))
         })
     }))
     .unwrap();
@@ -394,8 +411,10 @@ fn hard_unlinking_the_last_name_deletes_the_inode_and_all_its_keys() {
     let a = file(&engine, Inode::ROOT, b"a");
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
-            txn.setxattr(a, b"user.x", &b"1"[..], SetXattrMode::Create)
-                .await
+            let result = txn
+                .setxattr(a, b"user.x", &b"1"[..], SetXattrMode::Create)
+                .await;
+            result.map(|result| (result, txn))
         })
     }))
     .unwrap();
@@ -446,7 +465,10 @@ fn set_hard_link_count(engine: &InMemoryEngine, inode: Inode, hard_link_count: u
     attributes.hard_link_count = hard_link_count;
     block_on(engine.transact(|mut txn| {
         let attributes = attributes.clone();
-        Box::pin(async move { txn.write_attributes(inode, &attributes).await })
+        Box::pin(async move {
+            let result = txn.write_attributes(inode, &attributes).await;
+            result.map(|result| (result, txn))
+        })
     }))
     .unwrap();
 }
@@ -755,14 +777,16 @@ fn colliding_names_take_the_next_free_position() {
     let occupant = file(&engine, Inode::ROOT, b"occupant");
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
-            txn.add_name(
-                Inode::ROOT,
-                first.max(FIRST_POSITION),
-                b"collides with x",
-                occupant,
-                FileType::File,
-            )
-            .await
+            let result = txn
+                .add_name(
+                    Inode::ROOT,
+                    first.max(FIRST_POSITION),
+                    b"collides with x",
+                    occupant,
+                    FileType::File,
+                )
+                .await;
+            result.map(|result| (result, txn))
         })
     }))
     .unwrap();
@@ -797,7 +821,7 @@ fn a_full_collision_range_is_storage_full() {
                 )
                 .await?;
             }
-            Ok::<_, StoreError<Infallible, RedbFailure>>(())
+            Ok::<_, StoreError<Infallible, RedbFailure>>(((), txn))
         })
     }))
     .unwrap();

@@ -120,7 +120,7 @@ pub(crate) async fn execute<S: KeyValueStore>(
                                 }
                             }
                             last_attempt.lock().unwrap().finished = true;
-                            Ok(seen)
+                            Ok((seen, transaction))
                         })
                     })
                     .await

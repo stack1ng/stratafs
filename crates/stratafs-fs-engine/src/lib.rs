@@ -99,7 +99,10 @@ where
             };
             engine
                 .transact(|mut transaction| {
-                    Box::pin(async move { transaction.create_root_if_missing().await })
+                    Box::pin(async move {
+                        let created = transaction.create_root_if_missing().await;
+                        created.map(|()| ((), transaction))
+                    })
                 })
                 .await?;
             Ok(engine)
@@ -108,15 +111,30 @@ where
 }
 
 impl<M: KeyValueStore, C: Sync, A: Sync, N: Sync, S: FsConfig> FsEngine<M, C, A, N, S> {
-    pub fn transact<'engine, T: Send, E: Send>(
+    // transact runs work in a transaction. When work succeeds it hands its transaction back with its result.
+    #[allow(clippy::type_complexity)]
+    pub fn transact<'engine, T: Send + 'engine, E: Send + 'engine>(
         &'engine self,
         mut work: impl for<'txn> FnMut(
             FsTransaction<'txn, 'engine, M::Transaction<'txn>, C, A, N, S>,
-        ) -> BoxFuture<'txn, Result<T, E>>
-        + Send,
+        ) -> BoxFuture<
+            'txn,
+            Result<
+                (
+                    T,
+                    FsTransaction<'txn, 'engine, M::Transaction<'txn>, C, A, N, S>,
+                ),
+                E,
+            >,
+        > + Send,
     ) -> impl Future<Output = Result<T, TransactError<M::Rejection, M::Failure, E>>> + Send {
-        self.metadata
-            .transact(move |metadata| work(self.transaction(metadata)))
+        self.metadata.transact(move |metadata| {
+            let working = work(self.transaction(metadata));
+            Box::pin(async move {
+                let (result, transaction) = working.await?;
+                Ok((result, transaction.metadata))
+            })
+        })
     }
 
     pub fn read_transact<'engine, T: Send, E: Send>(
