@@ -9,7 +9,8 @@ use futures_util::FutureExt;
 use futures_util::future::{RemoteHandle, join};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactError,
+    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, SetRejection,
+    TransactError,
 };
 
 use crate::execute::WorkFailure;
@@ -112,7 +113,7 @@ pub(crate) async fn change_key<S: KeyValueStore>(
                     KeyWrite::ClearsByRange => {
                         transaction.clear_range((
                             Bound::Excluded(Bytes::from_static(b"o")),
-                            Bound::Included(key),
+                            Bound::Excluded(Bytes::from_static(b"p")),
                         ))?;
                     }
                 }
@@ -166,6 +167,20 @@ pub(crate) async fn observe<S: KeyValueStore>(
                 .await
         }
     }
+}
+
+// keys_around_the_observed_key are the observed key, the keys the range clear removes around it,
+// and keys outside that range on both sides. In a store made of small nodes, the observed key's node
+// then sits inside the cleared range and is dropped without being written,
+// while the nodes above it stay in place.
+fn keys_around_the_observed_key() -> impl Iterator<Item = Bytes> {
+    let numbered =
+        |prefix: &'static str| (0..24).map(move |index| Bytes::from(format!("{prefix}{index:02}")));
+    numbered("a/")
+        .chain(numbered("o/"))
+        .chain([Bytes::from_static(OBSERVED_KEY)])
+        .chain(numbered("observed/"))
+        .chain(numbered("z/"))
 }
 
 async fn observe_key<T: ReadKeyValueTransaction>(
@@ -228,14 +243,15 @@ pub(crate) async fn run_observation_scenario<P: Replay, S: KeyValueStore + 'stat
     if let KeyChange::ClearedByRange = key_change {
         store
             .transact(|mut transaction| {
-                let key = key.clone();
                 Box::pin(async move {
-                    let set = transaction.set(key, Bytes::from_static(b"before"));
-                    set.map(|()| ((), transaction))
+                    for key in keys_around_the_observed_key() {
+                        transaction.set(key, Bytes::from_static(b"before"))?;
+                    }
+                    Ok::<_, StoreError<SetRejection<S::Rejection>, S::Failure>>(((), transaction))
                 })
             })
             .await
-            .expect("setting the observed key before the scenario failed");
+            .expect("setting the observed key and its neighbours before the scenario failed");
     }
     let changing = match key_change {
         KeyChange::Unchanged => None,

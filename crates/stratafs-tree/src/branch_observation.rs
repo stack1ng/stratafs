@@ -1,7 +1,7 @@
-use std::pin::pin;
+use std::iter;
 
 use bytes::Bytes;
-use futures_util::future::{Either, OptionFuture, join, pending, select};
+use futures_util::future::{select_all, try_join_all};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, NotCommitted, ReadKeyValueTransaction, TransactError};
 
@@ -14,9 +14,9 @@ use crate::volume::{TreeTransaction, TreeVolume};
 pub struct BranchWatch<O> {
     key: Bytes,
     initial_value: Option<Bytes>,
-    header_watch: O,
-    // if the deepest node is the header, then this is none
-    deepest_node_watch: Option<O>,
+    // the volume header and every node on the key's path that belongs to the volume's current epoch.
+    // Older nodes never change, so a change under one of them shows up in a current one above it.
+    watches: Vec<O>,
 }
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
@@ -31,34 +31,32 @@ where
         key: Bytes,
         descent: &DescentPath<C::Range>,
     ) -> Result<BranchWatch<T::Observation>, TreeFailure<T::Failure, S::Rejection>> {
-        let initial_value = descent
-            .destination
-            .found_value()
-            .map_err(TreeFailure::Corrupt)?
-            .map(Bytes::copy_from_slice);
-        let deepest_same_epoch_node = if descent.destination.node.epoch == descent.volume.epoch {
-            Some(descent.destination.node)
-        } else {
-            descent
-                .steps
-                .iter()
-                .rfind(|step| step.node.epoch == descent.volume.epoch)
-                .map(|step| step.node)
+        // a write transaction's own buffered writes come before what the tree holds
+        let initial_value = match self.buffered_delta.get(&key) {
+            Some(buffered) => buffered.clone(),
+            None => descent
+                .destination
+                .found_value()
+                .map_err(TreeFailure::Corrupt)?
+                .map(Bytes::copy_from_slice),
         };
-        let (header_watch, deepest_node_watch) = join(
-            self.inner
-                .observe(TreeKey::VolumeHeader(self.volume).into()),
-            OptionFuture::from(
-                deepest_same_epoch_node
-                    .map(|node| self.inner.observe(TreeKey::Node(node.id).into())),
-            ),
+        let current_nodes = descent
+            .steps
+            .iter()
+            .map(|step| step.node)
+            .chain(iter::once(descent.destination.node))
+            .filter(|node| node.epoch == descent.volume.epoch)
+            .map(|node| TreeKey::Node(node.id));
+        let watches = try_join_all(
+            iter::once(TreeKey::VolumeHeader(self.volume))
+                .chain(current_nodes)
+                .map(|key| self.inner.observe(key.into())),
         )
-        .await;
+        .await?;
         Ok(BranchWatch {
             key,
             initial_value,
-            header_watch: header_watch?,
-            deepest_node_watch: deepest_node_watch.transpose()?,
+            watches,
         })
     }
 }
@@ -75,25 +73,17 @@ where
     ) -> Result<(), StoreError<NotCommitted, TreeFailure<S::Failure, S::Rejection>>> {
         let store = &self.shared.store;
         loop {
-            let deepest_node_changed = match watch.deepest_node_watch {
-                Some(deepest_node_watch) => Either::Left(store.changed(deepest_node_watch)),
-                None => Either::Right(pending()),
-            };
-            match select(
-                pin!(store.changed(watch.header_watch)),
-                pin!(deepest_node_changed),
+            let (changed, _, _) = select_all(
+                watch
+                    .watches
+                    .into_iter()
+                    .map(|observation| Box::pin(store.changed(observation))),
             )
-            .await
-            {
-                Either::Left((changed, _)) | Either::Right((changed, _)) => {
-                    changed.map_err(|error| match error {
-                        StoreError::Rejected(not_committed) => StoreError::Rejected(not_committed),
-                        StoreError::Failed(failure) => {
-                            StoreError::Failed(TreeFailure::Store(failure))
-                        }
-                    })?
-                }
-            }
+            .await;
+            changed.map_err(|error| match error {
+                StoreError::Rejected(not_committed) => StoreError::Rejected(not_committed),
+                StoreError::Failed(failure) => StoreError::Failed(TreeFailure::Store(failure)),
+            })?;
 
             let next_watch = self
                 .read_transact(|transaction| {
