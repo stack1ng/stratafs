@@ -29,6 +29,11 @@ fn map_of(inserts: &[(Bounds, char)]) -> RangeBoundsMap<u8, char> {
     map
 }
 
+fn unstored(map: &RangeBoundsMap<u8, char>, bounds: Bounds) -> Vec<Bounds> {
+    map.matching_ranges(bounds, |value| value.is_none())
+        .collect()
+}
+
 fn ends_before_it_starts((start, end): &Bounds) -> bool {
     match (start, end) {
         (Included(start) | Excluded(start), Included(end) | Excluded(end)) if start > end => true,
@@ -44,6 +49,20 @@ fn in_order(earlier: &Bounds, later: &Bounds) -> bool {
     }
 }
 
+fn apart(earlier: &Bounds, later: &Bounds) -> bool {
+    match (points_of(earlier), points_of(later)) {
+        (Some(earlier), Some(later)) => earlier.end < later.start,
+        _ => false,
+    }
+}
+
+fn within(part: &Bounds, query: &Bounds) -> bool {
+    match (points_of(part), points_of(query)) {
+        (Some(part), Some(query)) => query.start <= part.start && part.end <= query.end,
+        _ => false,
+    }
+}
+
 fn share_a_point(left: &Bounds, right: &Bounds) -> bool {
     match (points_of(left), points_of(right)) {
         (Some(left), Some(right)) => left.start < right.end && right.start < left.end,
@@ -52,17 +71,20 @@ fn share_a_point(left: &Bounds, right: &Bounds) -> bool {
 }
 
 #[test]
-fn an_empty_map_holds_nothing_and_leaves_every_query_a_gap() {
+fn an_empty_map_holds_nothing_so_every_query_is_unstored() {
     let map = RangeBoundsMap::<u8, char>::new();
     assert!(map.is_empty());
     assert_eq!(map.get(&5), None);
     assert_eq!(entries(&map), []);
     assert_eq!(map.overlapping(..).count(), 0);
     assert_eq!(
-        map.gaps(2..=7).collect::<Vec<_>>(),
+        unstored(&map, (Included(2), Included(7))),
         [(Included(2), Included(7))]
     );
-    assert_eq!(map.gaps(..).collect::<Vec<_>>(), [(Unbounded, Unbounded)]);
+    assert_eq!(
+        unstored(&map, (Unbounded, Unbounded)),
+        [(Unbounded, Unbounded)]
+    );
 }
 
 #[test]
@@ -107,7 +129,11 @@ fn empty_ranges_are_ignored() {
     ]);
     assert!(map.is_empty());
     assert_eq!(map.overlapping((Included(3), Excluded(3))).count(), 0);
-    assert_eq!(map.gaps((Excluded(3), Included(3))).count(), 0);
+    assert_eq!(
+        map.matching_ranges((Excluded(3), Included(3)), |_| true)
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -120,7 +146,12 @@ fn ranges_that_end_before_they_start_panic() {
         let mut map = map_of(&[((Unbounded, Unbounded), 'a')]);
         assert!(catch_unwind(AssertUnwindSafe(|| map.insert(bounds, 'b'))).is_err());
         assert!(catch_unwind(AssertUnwindSafe(|| map.overlapping(bounds).count())).is_err());
-        assert!(catch_unwind(AssertUnwindSafe(|| map.gaps(bounds).count())).is_err());
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| map
+                .matching_ranges(bounds, |_| true)
+                .count()))
+            .is_err()
+        );
     }
 }
 
@@ -230,14 +261,13 @@ fn overlapping_returns_the_stored_ranges_the_query_shares_keys_with() {
 }
 
 #[test]
-fn gaps_are_the_parts_of_the_query_no_range_covers() {
+fn matching_nothing_stored_finds_the_parts_no_range_covers() {
     let map = map_of(&[
         ((Included(2), Included(3)), 'a'),
         ((Excluded(5), Excluded(7)), 'b'),
     ]);
-    let gaps = |bounds: Bounds| map.gaps(bounds).collect::<Vec<_>>();
     assert_eq!(
-        gaps((Unbounded, Unbounded)),
+        unstored(&map, (Unbounded, Unbounded)),
         [
             (Unbounded, Excluded(2)),
             (Excluded(3), Included(5)),
@@ -245,13 +275,65 @@ fn gaps_are_the_parts_of_the_query_no_range_covers() {
         ]
     );
     assert_eq!(
-        gaps((Included(3), Included(6))),
+        unstored(&map, (Included(3), Included(6))),
         [(Excluded(3), Included(5))]
     );
-    assert_eq!(gaps((Included(2), Included(3))), []);
+    assert_eq!(unstored(&map, (Included(2), Included(3))), []);
     assert_eq!(
-        gaps((Excluded(0), Included(1))),
+        unstored(&map, (Excluded(0), Included(1))),
         [(Excluded(0), Included(1))]
+    );
+}
+
+#[test]
+fn neighbouring_parts_that_match_merge() {
+    let map = map_of(&[
+        ((Included(2), Included(3)), 'a'),
+        ((Included(5), Included(6)), 'b'),
+        ((Included(8), Included(9)), 'a'),
+    ]);
+    let not_b: Vec<Bounds> = map
+        .matching_ranges(.., |value| value != Some(&'b'))
+        .collect();
+    assert_eq!(not_b, [(Unbounded, Excluded(5)), (Excluded(6), Unbounded)]);
+}
+
+#[test]
+fn matching_ranges_are_clipped_to_the_query() {
+    let map = map_of(&[((Unbounded, Unbounded), 'a')]);
+    let matching: Vec<Bounds> = map
+        .matching_ranges(3..=5, |value| value == Some(&'a'))
+        .collect();
+    assert_eq!(matching, [(Included(3), Included(5))]);
+}
+
+#[test]
+fn matching_everything_returns_the_query_and_matching_nothing_returns_nothing() {
+    let map = map_of(&[
+        ((Included(2), Included(3)), 'a'),
+        ((Included(5), Included(6)), 'b'),
+    ]);
+    let everything: Vec<Bounds> = map.matching_ranges(1..=8, |_| true).collect();
+    assert_eq!(everything, [(Included(1), Included(8))]);
+    assert_eq!(map.matching_ranges(1..=8, |_| false).count(), 0);
+}
+
+#[test]
+fn the_parts_not_cleared_include_a_key_set_inside_a_cleared_range() {
+    let map = map_of(&[
+        ((Included(3), Included(6)), 'c'),
+        ((Included(4), Included(4)), 's'),
+    ]);
+    let not_cleared: Vec<Bounds> = map
+        .matching_ranges(1..=8, |value| value != Some(&'c'))
+        .collect();
+    assert_eq!(
+        not_cleared,
+        [
+            (Included(1), Excluded(3)),
+            (Included(4), Included(4)),
+            (Excluded(6), Included(8)),
+        ]
     );
 }
 
@@ -274,7 +356,13 @@ proptest! {
     fn matches_applying_every_insert_to_each_key_in_turn(
         inserts in vec((valid_range(), prop_oneof![Just('a'), Just('b'), Just('c')]), 0..12),
         queries in vec(valid_range(), 1..6),
+        matches_unstored in any::<bool>(),
+        matching_values in proptest::sample::subsequence(vec!['a', 'b', 'c'], 0..=3),
     ) {
+        let matches = |value: Option<&char>| match value {
+            Some(value) => matching_values.contains(value),
+            None => matches_unstored,
+        };
         let map = map_of(&inserts);
         let mut model = [None; 13];
         for (bounds, value) in &inserts {
@@ -308,18 +396,20 @@ proptest! {
                 .collect();
             prop_assert_eq!(overlapping, expected);
 
-            let gaps: Vec<Bounds> = map.gaps(query).collect();
+            let matching: Vec<Bounds> = map.matching_ranges(query, matches).collect();
             for key in KEYS {
-                let in_a_gap = gaps.iter().filter(|gap| gap.contains(&key)).count();
-                let uncovered = query.contains(&key) && model[usize::from(key)].is_none();
-                prop_assert_eq!(in_a_gap, usize::from(uncovered), "key {}", key);
+                let in_a_part = matching.iter().filter(|part| part.contains(&key)).count();
+                let expected = query.contains(&key) && matches(model[usize::from(key)].as_ref());
+                prop_assert_eq!(in_a_part, usize::from(expected), "key {}", key);
             }
-            for gap in &gaps {
-                prop_assert!(points_of(gap).is_some());
-                prop_assert!(!stored.iter().any(|(bounds, _)| share_a_point(gap, bounds)));
+            for part in &matching {
+                prop_assert!(within(part, &query));
+                for (bounds, value) in &stored {
+                    prop_assert!(matches(Some(value)) || !share_a_point(part, bounds));
+                }
             }
-            for pair in gaps.windows(2) {
-                prop_assert!(in_order(&pair[0], &pair[1]));
+            for pair in matching.windows(2) {
+                prop_assert!(apart(&pair[0], &pair[1]));
             }
         }
     }

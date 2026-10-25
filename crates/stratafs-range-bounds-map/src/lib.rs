@@ -67,27 +67,44 @@ impl<K: Ord + Clone, V> RangeBoundsMap<K, V> {
             .map(|(range, value)| (bounds_of(range), value))
     }
 
-    // gaps returns the parts of the given range that no stored range covers, in order.
-    pub fn gaps(&self, range: impl RangeBounds<K>) -> impl Iterator<Item = (Bound<K>, Bound<K>)> {
+    // matching_ranges returns the parts of the given range whose value matches, in order.
+    // Parts where nothing is stored are matched against None, and neighbouring parts that match are merged.
+    pub fn matching_ranges(
+        &self,
+        range: impl RangeBounds<K>,
+        matches: impl Fn(Option<&V>) -> bool,
+    ) -> impl Iterator<Item = (Bound<K>, Bound<K>)> {
         let points = points_of(&range);
-        let end = points.as_ref().map(|points| points.end.clone());
-        let mut cursor = points.as_ref().map(|points| points.start.clone());
+        let query_end = points.as_ref().map(|points| points.end.clone());
+        let mut at = points.as_ref().map(|points| points.start.clone());
         let mut stored = points
             .into_iter()
             .flat_map(|points| self.map.overlapping(points))
-            .map(|(range, _)| range);
-        iter::from_fn(move || {
-            let end = end.as_ref()?;
-            let at = cursor.as_mut()?;
-            for range in stored.by_ref() {
-                let gap = (*at < range.start).then(|| (at.clone(), range.start.clone()));
-                *at = range.end.clone();
-                if gap.is_some() {
-                    return gap;
+            .peekable();
+        let parts = iter::from_fn(move || {
+            let (start, query_end) = (at.take()?, query_end.as_ref()?);
+            let (end, value) = match stored.peek().copied() {
+                Some((range, _)) if start < range.start => (range.start.clone(), None),
+                Some((range, value)) => {
+                    stored.next();
+                    (range.end.clone().min(query_end.clone()), Some(value))
                 }
+                None if start < *query_end => (query_end.clone(), None),
+                None => return None,
+            };
+            at = Some(end.clone());
+            Some((start, end, value))
+        });
+        let mut matching = parts
+            .filter(move |(_, _, value)| matches(*value))
+            .map(|(start, end, _)| (start, end))
+            .peekable();
+        iter::from_fn(move || {
+            let (start, mut end) = matching.next()?;
+            while let Some((_, next_end)) = matching.next_if(|(next_start, _)| *next_start == end) {
+                end = next_end;
             }
-            let last = cursor.take()?;
-            (last < *end).then(|| (last, end.clone()))
+            Some((start, end))
         })
         .map(|(start, end)| (into_start_bound(start), into_end_bound(end)))
     }
