@@ -22,6 +22,7 @@ futures-lite = "2.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 opendal = { version = "0.59.4", default-features = false }
 proptest = { version = "1.5", default-features = false, features = ["std"] }
+rangemap = "1.8"
 send_wrapper = { version = "0.6", features = ["futures"] }
 shuttle = "0.9.7"
 # TODO: move to smallvec 2 once it is stable, for the SmallVec<T, N> syntax (2.0.0-beta.3 as of 2026-10-23)
@@ -31,6 +32,7 @@ stratafs-content-conformance = { path = "crates/stratafs-content-conformance" }
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
 stratafs-opendal = { path = "crates/stratafs-opendal" }
+stratafs-range-bounds-map = { path = "crates/stratafs-range-bounds-map" }
 stratafs-redb = { path = "crates/stratafs-redb" }
 stratafs-serialized = { path = "crates/stratafs-serialized" }
 stratafs-store = { path = "crates/stratafs-store" }

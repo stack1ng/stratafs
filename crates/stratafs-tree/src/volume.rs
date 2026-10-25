@@ -1,9 +1,11 @@
-use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
+use smallvec::SmallVec;
+use stratafs_range_bounds_map::RangeBoundsMap;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkingTransaction;
 use stratafs_store::kv::{
@@ -19,7 +21,6 @@ use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
 use crate::key::TreeKey;
 use crate::node::{InternalEntry, LeafEntry};
 use crate::serialized::CorruptValue;
-use crate::slotted::SlottedList;
 use crate::tree::{TreeConfig, TreeConfigLimits, TreeShared};
 
 pub struct TreeVolume<S, A, C> {
@@ -31,6 +32,11 @@ pub struct TreeTransaction<'txn, T, S, A, C> {
     pub(crate) inner: TransactionHandle<'txn, 'txn, T>,
     pub(crate) shared: &'txn TreeShared<S, A, C>,
     pub(crate) volume: TreeVolumeId,
+    pub(crate) buffered_delta: RangeBoundsMap<
+        Bytes,
+        // None here means the bytes were cleared
+        Option<Bytes>,
+    >,
 }
 
 impl<S, A, C> TreeVolume<S, A, C> {
@@ -42,6 +48,7 @@ impl<S, A, C> TreeVolume<S, A, C> {
             inner,
             shared: &self.shared,
             volume: self.id,
+            buffered_delta: RangeBoundsMap::new(),
         }
     }
 }
@@ -163,7 +170,7 @@ where
     }
 }
 
-impl<T, S, A, C> ReadKeyValueTransaction for TreeTransaction<'_, T, S, A, C>
+impl<'txn, T, S, A, C> ReadKeyValueTransaction for TreeTransaction<'txn, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
     S: KeyValueStore,
@@ -174,6 +181,10 @@ where
     type Observation = BranchWatch<T::Observation>;
 
     async fn get(&self, key: Bytes) -> Result<Option<Bytes>, Self::Failure> {
+        if let Some(buffered) = self.buffered_delta.get(&key) {
+            return Ok(buffered.clone());
+        }
+
         let descent = self.descend(&key).await?;
         Ok(descent
             .destination
@@ -184,42 +195,95 @@ where
 
     // get_range is implemented by walking the tree. The returned Bytes
     // are all pinned to their containing leaf node's buffer, so for any long lived usage, they should be copied.
-    async fn get_range(
+    async fn get_range<R: RangeBounds<Bytes> + Send>(
         &self,
-        range: impl RangeBounds<Bytes> + Send,
+        range: R,
         limit: usize,
-    ) -> Result<Vec<(Bytes, Bytes)>, Self::Failure> {
+    ) -> Result<impl Iterator<Item = (Bytes, Bytes)> + Send + use<'txn, T, S, A, C, R>, Self::Failure>
+    {
         assert_valid_range(&range);
-        let start_target = match range.start_bound() {
-            Included(key) => ConcatenatedBytes::from(&key[..]),
-            Excluded(key) => ConcatenatedBytes::new(key, &[0]),
-            Unbounded => ConcatenatedBytes::default(),
-        };
+        let get_not_cleared_range =
+            async |(start, end): (Bound<&Bytes>, Bound<&Bytes>),
+                   entries: &mut SmallVec<[(Bytes, Bytes); 8]>| {
+                let start_target = match start {
+                    Included(key) => ConcatenatedBytes::from(&key[..]),
+                    Excluded(key) => ConcatenatedBytes::new(key, &[0]),
+                    Unbounded => ConcatenatedBytes::default(),
+                };
 
-        let end = range.end_bound();
-        let reached_end = |key: &[u8]| match end {
-            Included(end) => key > &end[..],
-            Excluded(end) => key >= &end[..],
-            Unbounded => false,
-        };
+                let reached_end = |key: &[u8]| match end {
+                    Included(end) => key > &end[..],
+                    Excluded(end) => key >= &end[..],
+                    Unbounded => false,
+                };
 
-        let mut cursor = self.descend(&start_target).await?;
-        let mut entries: Vec<(Bytes, Bytes)> =
-            Vec::with_capacity(limit.min(cursor.destination.entries.len()));
-        while entries.len() < limit {
-            match self.next_entry(&mut cursor).await? {
-                None => break,
-                Some((entry, leaf_bytes)) => {
-                    let (key, value) = entry.key_and_value().map_err(TreeFailure::Corrupt)?;
-                    if reached_end(key) {
-                        break;
+                let mut cursor = self.descend(&start_target).await?;
+                let mut previous_start_bound: Bound<Bytes> = start.cloned();
+                while entries.len() < limit {
+                    let store_entry = match self.next_entry(&mut cursor).await? {
+                        None => None,
+                        Some((entry, leaf_bytes)) => {
+                            let (store_key, store_value) =
+                                entry.key_and_value().map_err(TreeFailure::Corrupt)?;
+                            (!reached_end(store_key)).then(|| {
+                                (
+                                    leaf_bytes.slice_ref(store_key),
+                                    leaf_bytes.slice_ref(store_value),
+                                )
+                            })
+                        }
+                    };
+                    let store_entry = store_entry.map(|(key, value)| {
+                        // check if there is a value buffered for the key that the store iterated to
+                        let value = match self.buffered_delta.get(&key) {
+                            None => value,
+                            Some(Some(buffered)) => buffered.clone(),
+                            Some(None) => {
+                                panic!("get_not_cleared_range read a key inside a cleared range")
+                            }
+                        };
+                        (key, value)
+                    });
+                    let buffered_end = match &store_entry {
+                        Some((key, _)) => Excluded(key),
+                        None => end,
+                    };
+                    let buffered_before_this = self
+                        .buffered_delta
+                        .overlapping((previous_start_bound.as_ref(), buffered_end))
+                        .filter_map(|((start, _), write)| match (start, write) {
+                            (Included(key), Some(value)) => Some((key.clone(), value.clone())),
+                            _ => None,
+                        });
+                    entries.extend(
+                        buffered_before_this
+                            .chain(store_entry.clone())
+                            .take(limit - entries.len()),
+                    );
+                    match store_entry {
+                        Some((key, _)) => previous_start_bound = Excluded(key),
+                        None => break,
                     }
-                    entries.push((leaf_bytes.slice_ref(key), leaf_bytes.slice_ref(value)));
                 }
+
+                Ok::<_, Self::Failure>(())
+            };
+
+        // only iterate in ranges that have not buffered a clear to avoid wasted store reads
+        let gettable_ranges = self
+            .buffered_delta
+            .matching_ranges((range.start_bound(), range.end_bound()), |buffered_delta| {
+                !matches!(buffered_delta, Some(None))
+            });
+        let mut entries = SmallVec::<[(Bytes, Bytes); 8]>::new();
+        for (start, end) in gettable_ranges {
+            if entries.len() >= limit {
+                break;
             }
+            get_not_cleared_range((start.as_ref(), end.as_ref()), &mut entries).await?;
         }
 
-        Ok(entries)
+        Ok(entries.into_iter())
     }
 
     async fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure> {
@@ -240,7 +304,7 @@ where
     async fn set(
         &mut self,
         key: Bytes,
-        value: impl Buf + Send,
+        mut value: impl Buf + Send,
     ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
         let fits_as_node_entry =
             |length: Option<usize>| length.is_some_and(|length| length <= C::LARGEST_ENTRY_SIZE);
@@ -252,40 +316,18 @@ where
         {
             return Err(StoreError::Rejected(SetRejection::TooLarge));
         }
-        let target = self.descend(&key).await?;
-        let mut target_leaf =
-            SlottedList::<BytesMut, _, C::Range>::from(target.destination.entries);
-        match target.destination.position {
-            Ok(index) => target_leaf.replace_entry(index, &key, value),
-            Err(insert_at) => target_leaf.insert_entry(insert_at, &key, value),
-        }
 
-        self.write_over(
-            target.volume,
-            target.steps,
-            target.destination.node,
-            target_leaf,
-        )
-        .await
+        self.buffered_delta
+            .insert(&key..=&key, Some(value.copy_to_bytes(value.remaining())));
+        Ok(())
     }
 
-    async fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {
-        let target = self.descend(&key).await?;
-        let mut target_leaf =
-            SlottedList::<BytesMut, _, C::Range>::from(target.destination.entries);
-        match target.destination.position {
-            Ok(index) => target_leaf.remove(index),
-            Err(_) => return Ok(()),
-        }
-
-        self.write_over(
-            target.volume,
-            target.steps,
-            target.destination.node,
-            target_leaf,
-        )
-        .await
-        .map_err(refused_write_as_failure)
+    async fn clear_range(
+        &mut self,
+        range: impl RangeBounds<Bytes> + Send,
+    ) -> Result<(), Self::Failure> {
+        self.buffered_delta.insert(range, None);
+        Ok(())
     }
 }
 

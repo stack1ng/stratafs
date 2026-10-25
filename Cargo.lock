@@ -1107,6 +1107,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rangemap"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
+
+[[package]]
 name = "redb"
 version = "4.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1414,6 +1420,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-range-bounds-map"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rangemap",
+]
+
+[[package]]
 name = "stratafs-redb"
 version = "0.1.0"
 dependencies = [
@@ -1464,6 +1478,7 @@ dependencies = [
  "smallvec",
  "storekey",
  "stratafs-kv-conformance",
+ "stratafs-range-bounds-map",
  "stratafs-redb",
  "stratafs-serialized",
  "stratafs-store",
