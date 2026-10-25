@@ -6,6 +6,7 @@ use stratafs_redb::RedbFailure;
 
 use super::*;
 use crate::Timestamp;
+use crate::attributes::error::SetattrError;
 use crate::attributes::{Mode, Ownership, SettableAttributes};
 use crate::directories::NewItem;
 use crate::test_support::{InMemoryEngine, OneKibInline, aborted, new_test_engine, set_clock};
@@ -775,4 +776,154 @@ fn a_write_ending_past_the_largest_offset_is_too_large() {
         write(&engine, inode, u64::MAX, b"a"),
         Err(WriteError::FileTooLarge)
     ));
+}
+
+type Setattr = SetattrError<RedbFailure, Infallible, OpendalError>;
+
+fn setattr(
+    engine: &InMemoryEngine,
+    inode: Inode,
+    update: impl Fn(&mut SettableAttributes) + Send + Sync,
+) -> Result<Attributes, Setattr> {
+    block_on(engine.transact(|mut txn| {
+        let update = &update;
+        Box::pin(async move {
+            let result = txn.setattr(inode, update).await;
+            result.map(|result| (result, txn))
+        })
+    }))
+    .map_err(aborted)
+}
+
+fn resize(engine: &InMemoryEngine, inode: Inode, size: u64) -> Attributes {
+    setattr(engine, inode, |settable| settable.size = size).unwrap()
+}
+
+fn three_written_extents(engine: &InMemoryEngine, inode: Inode) {
+    file_of_size(engine, inode, 0);
+    write(engine, inode, 0, b"0123456789").unwrap();
+    write(engine, inode, 10, b"abcdefghij").unwrap();
+    write(engine, inode, 20, b"klmnopqrst").unwrap();
+}
+
+#[test]
+fn shrinking_keeps_the_part_of_the_extent_that_crosses_the_new_size() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    three_written_extents(&engine, inode);
+    let attributes = resize(&engine, inode, 15);
+    assert_eq!(
+        extents(&engine, inode),
+        vec![
+            (0..10, Bytes::from_static(b"0123456789")),
+            (10..15, Bytes::from_static(b"abcde")),
+        ]
+    );
+    assert_eq!(attributes.settable.size, 15);
+}
+
+#[test]
+fn shrinking_to_the_end_of_an_extent_keeps_that_extent_whole() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    three_written_extents(&engine, inode);
+    resize(&engine, inode, 10);
+    assert_eq!(
+        extents(&engine, inode),
+        vec![(0..10, Bytes::from_static(b"0123456789"))]
+    );
+}
+
+#[test]
+fn shrinking_to_zero_removes_every_extent() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    three_written_extents(&engine, inode);
+    resize(&engine, inode, 0);
+    assert_eq!(extents(&engine, inode), vec![]);
+}
+
+#[test]
+fn growing_after_shrinking_reads_a_hole_instead_of_the_old_content() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"0123456789").unwrap();
+    resize(&engine, inode, 4);
+    resize(&engine, inode, 10);
+    assert_eq!(
+        read(&engine, inode, 0, 10),
+        (
+            10,
+            vec![ContentPiece::Inline {
+                start: 0,
+                content: Bytes::from_static(b"0123")
+            }]
+        )
+    );
+}
+
+#[test]
+fn shrinking_a_spilled_extent_keeps_pointing_into_its_blob() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let content = content_of_length(2000);
+    write(&engine, inode, 0, &content).unwrap();
+    resize(&engine, inode, 1000);
+    assert_eq!(
+        stored_extents(&engine, inode),
+        vec![(
+            1000,
+            ExtentValue {
+                start: 0,
+                content_offset: 0,
+                content: SpillableValue::Overflow {
+                    hash: ContentHash::of(&content),
+                    length: 2000,
+                },
+            }
+        )]
+    );
+}
+
+#[test]
+fn shrinking_a_file_never_touches_the_extents_of_the_next_file() {
+    let engine = new_test_engine();
+    three_written_extents(&engine, Inode(7));
+    file_of_size(&engine, Inode(8), 0);
+    write(&engine, Inode(8), 0, b"next").unwrap();
+    resize(&engine, Inode(7), 0);
+    assert_eq!(
+        extents(&engine, Inode(8)),
+        vec![(0..4, Bytes::from_static(b"next"))]
+    );
+}
+
+#[test]
+fn a_resize_records_a_content_change() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 10);
+    set_clock(5);
+    let attributes = resize(&engine, inode, 4);
+    assert_eq!(attributes.settable.content_changed_at, Timestamp(5));
+    assert_eq!(attributes.attribute_changed_at, Timestamp(5));
+    assert_eq!(attributes.change_version, 1);
+    assert_eq!(getattr(&engine, inode), Some(attributes));
+}
+
+#[test]
+fn a_resize_keeps_a_content_change_time_set_by_the_same_update() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 10);
+    set_clock(5);
+    let attributes = setattr(&engine, inode, |settable| {
+        settable.size = 20;
+        settable.content_changed_at = Timestamp(3);
+    })
+    .unwrap();
+    assert_eq!(attributes.settable.content_changed_at, Timestamp(3));
+    assert_eq!(attributes.attribute_changed_at, Timestamp(5));
 }

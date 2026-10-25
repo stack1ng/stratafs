@@ -12,6 +12,7 @@ use futures_util::future::join;
 use stratafs_store::content::{ContentHash, ContentStore};
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
+use crate::attributes::error::SetattrError;
 use crate::attributes::{Attributes, FileType};
 use crate::content::error::{ReadError, ReadSymbolicLinkError, WriteError};
 use crate::error::{CorruptValue, IoFailure, refused_or_failed};
@@ -275,6 +276,47 @@ where
     N: Fn() -> Timestamp + Sync,
     S: FsConfig,
 {
+    // truncate_content removes a file's content from size up to old_size, keeping the part of the
+    // extent that crosses size. No extent ends past a file's size, so nothing lies after old_size.
+    pub(crate) fn truncate_content(
+        &mut self,
+        inode: Inode,
+        size: u64,
+        old_size: u64,
+    ) -> impl Future<Output = Result<(), SetattrError<T::Failure, T::Rejection, C::Failure>>> + Send
+    {
+        async move {
+            let removed = (
+                Bound::Excluded(Bytes::from(FsKey::new_extent(inode, size))),
+                Bound::Included(Bytes::from(FsKey::new_extent(inode, old_size))),
+            );
+            let crossing = self
+                .metadata
+                .get_range(removed.clone(), 1)
+                .await
+                .map_err(IoFailure::Metadata)?
+                .next();
+            self.metadata
+                .clear_range(removed)
+                .map_err(IoFailure::Metadata)?;
+            if let Some((_, crossing)) = crossing {
+                let crossing = ExtentValue::from_stored(crossing).map_err(IoFailure::Corrupt)?;
+                if crossing.start < size {
+                    self.metadata
+                        .set(
+                            Bytes::from(FsKey::new_extent(inode, size)),
+                            crossing
+                                .slice(crossing.start..size)
+                                .map_err(IoFailure::Corrupt)?
+                                .to_stored(),
+                        )
+                        .map_err(refused_or_failed)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
     pub fn write(
         &mut self,
         inode: Inode,

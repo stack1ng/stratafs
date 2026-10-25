@@ -312,12 +312,23 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 .getattr(inode)
                 .await?
                 .ok_or(SetattrError::StaleFileHandle)?;
-            let size = attributes.settable.size;
+            let (old_size, old_content_changed_at) = (
+                attributes.settable.size,
+                attributes.settable.content_changed_at,
+            );
             update(&mut attributes.settable);
-            if attributes.settable.size != size {
-                todo!("resizing a file's content")
+            let now = self.now();
+            if attributes.settable.size < old_size {
+                self.truncate_content(inode, attributes.settable.size, old_size)
+                    .await?;
             }
-            attributes.record_change(self.now());
+            // a resize changes the content, unless the update set the content change time itself
+            if attributes.settable.size != old_size
+                && attributes.settable.content_changed_at == old_content_changed_at
+            {
+                attributes.settable.content_changed_at = now;
+            }
+            attributes.record_change(now);
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)
         }
