@@ -26,7 +26,7 @@ use crate::activity::{
 use crate::durability::{CrashableStorage, simulate_and_reopen};
 use crate::forking::simulate_and_fork;
 use crate::observation_lifecycle::{
-    KeyChange, KeyWrite, Observations, ObserverOutcome, ObservingTransaction, change_key,
+    KeyChange, KeyWrite, ObserverOutcome, ObservingTransaction, change_key,
     count_suspensions_on_a_fresh_store, observe, run_observation_scenario,
 };
 use crate::runtime::ReplayingRuntime;
@@ -131,15 +131,7 @@ pub fn observation_lifecycle<R: ReplayingRuntime, S: KeyValueStore + 'static>(
     ] {
         let observer_suspensions =
             count_suspensions_on_a_fresh_store(&runtime, &new_store, move |store| async move {
-                let ignore = Arc::new(|_: Observations<S::Observation>| 0);
-                let _ = observe(
-                    &*store,
-                    observing_transaction,
-                    ignore,
-                    Arc::default(),
-                    false,
-                )
-                .await;
+                let _ = observe(&*store, observing_transaction, Arc::default(), false).await;
             });
         let observer_outcomes: Vec<ObserverOutcome> =
             [ObserverOutcome::Commits, ObserverOutcome::Panics]

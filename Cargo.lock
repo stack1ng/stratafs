@@ -1434,7 +1434,6 @@ dependencies = [
  "blocking",
  "bytes",
  "cfg_aliases",
- "futures-channel",
  "futures-core",
  "futures-lite",
  "futures-util",

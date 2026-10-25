@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use bytes::{Buf, Bytes, BytesMut};
 use zerocopy::{
     FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, TryFromBytes, TryReadError, Unaligned,
@@ -123,9 +125,9 @@ impl<R: AddressableRange> Node<Bytes, R> {
         Ok((header.epoch, node))
     }
 
-    pub(crate) fn write<T: ?Sized>(
+    pub(crate) fn write<B: Deref<Target = [u8]>, T: ?Sized>(
         header: &NodeHeader,
-        entries: &SlottedList<BytesMut, T, R>,
+        entries: &SlottedList<B, T, R>,
     ) -> impl Buf + Send {
         header.as_bytes().chain(&entries.get_ref()[..])
     }

@@ -7,10 +7,6 @@ use futures_core::future::BoxFuture;
 use crate::error::StoreError;
 
 #[derive(Debug, thiserror::Error)]
-#[error("the transaction that made this observation did not commit")]
-pub struct NotCommitted;
-
-#[derive(Debug, thiserror::Error)]
 pub enum TransactError<R, F, E> {
     // The store refused the transaction, and it was not applied.
     // the exact reasons for this are specific to the store implementation.
@@ -29,13 +25,8 @@ pub enum TransactError<R, F, E> {
 pub trait KeyValueStore: Send + Sync + 'static {
     type Rejection: std::error::Error + Send + Sync + 'static;
     type Failure: std::error::Error + Send + Sync + 'static;
-    type Observation: Send + 'static;
-    type ReadTransaction<'txn>: ReadKeyValueTransaction<Failure = Self::Failure, Observation = Self::Observation>;
-    type Transaction<'txn>: KeyValueTransaction<
-            Rejection = Self::Rejection,
-            Failure = Self::Failure,
-            Observation = Self::Observation,
-        >;
+    type ReadTransaction<'txn>: ReadKeyValueTransaction<Failure = Self::Failure>;
+    type Transaction<'txn>: KeyValueTransaction<Rejection = Self::Rejection, Failure = Self::Failure>;
 
     const LARGEST_ACCEPTED_ENTRY: usize;
 
@@ -67,12 +58,15 @@ pub trait KeyValueStore: Send + Sync + 'static {
         + Send,
     ) -> impl Future<Output = Result<T, TransactError<Self::Rejection, Self::Failure, E>>> + Send;
 
-    // changed returns a future that resolves once the observed key differs from what its transaction saw (see observe).
-    // It fails if the transaction that produced the observation did not finish successfully.
+    // changed resolves once the key's committed value differs from seen, where None means the key is absent.
+    // It never resolves while the value still equals seen, and it may miss a change that is undone
+    // before it looks, since it compares values.
+    // To watch what a transaction read or wrote, call it with that value after the transaction commits.
     fn changed(
         &self,
-        observation: Self::Observation,
-    ) -> impl Future<Output = Result<(), StoreError<NotCommitted, Self::Failure>>> + Send;
+        key: Bytes,
+        seen: Option<Bytes>,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }
 
 // TransactionHandle gives work its transaction by value, so a store can wrap another store's transaction in its own without allocating.
@@ -140,7 +134,6 @@ pub trait KeyValueTransaction: ReadKeyValueTransaction {
 
 pub trait ReadKeyValueTransaction: Send + Sync {
     type Failure: std::error::Error + Send + Sync + 'static;
-    type Observation: Send + 'static;
 
     fn get(&self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>, Self::Failure>> + Send {
         async move {
@@ -158,14 +151,6 @@ pub trait ReadKeyValueTransaction: Send + Sync {
     ) -> impl Future<
         Output = Result<impl Iterator<Item = (Bytes, Bytes)> + Send + use<Self, R>, Self::Failure>,
     > + Send;
-
-    // observe returns an observation, which can be observed from the store (with changed())
-    // to give a future that resolves once this key is in a different state
-    // from what this transaction saw, after the transaction finishes.
-    fn observe(
-        &self,
-        key: Bytes,
-    ) -> impl Future<Output = Result<Self::Observation, Self::Failure>> + Send;
 }
 
 pub fn is_valid_range<T: Ord + ?Sized>(range: &impl RangeBounds<T>) -> bool {

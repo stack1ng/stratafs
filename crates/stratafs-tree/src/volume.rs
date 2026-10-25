@@ -9,12 +9,11 @@ use stratafs_range_bounds_map::RangeBoundsMap;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkingTransaction;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, SetRejection,
-    TransactError, TransactionHandle, assert_valid_range,
+    KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
+    TransactionHandle, assert_valid_range,
 };
 use zerocopy::KnownLayout;
 
-use crate::branch_observation::BranchWatch;
 use crate::concatenated_bytes::ConcatenatedBytes;
 use crate::error::TreeFailure;
 use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
@@ -133,7 +132,6 @@ where
 {
     type Rejection = S::Rejection;
     type Failure = TreeFailure<S::Failure, S::Rejection>;
-    type Observation = BranchWatch<S::Observation>;
     type ReadTransaction<'txn> = TreeTransaction<'txn, S::ReadTransaction<'txn>, S, A, C>;
     type Transaction<'txn> = TreeTransaction<'txn, S::Transaction<'txn>, S, A, C>;
 
@@ -189,11 +187,8 @@ where
             .map_err(store_failure_as_tree_failure)
     }
 
-    async fn changed(
-        &self,
-        observation: Self::Observation,
-    ) -> Result<(), StoreError<NotCommitted, Self::Failure>> {
-        self.branch_changed(observation).await
+    async fn changed(&self, key: Bytes, seen: Option<Bytes>) -> Result<(), Self::Failure> {
+        self.branch_changed(key, seen).await
     }
 }
 
@@ -205,7 +200,6 @@ where
     C: TreeConfig,
 {
     type Failure = TreeFailure<T::Failure, S::Rejection>;
-    type Observation = BranchWatch<T::Observation>;
 
     async fn get(&self, key: Bytes) -> Result<Option<Bytes>, Self::Failure> {
         if let Some(buffered) = self.buffered_delta.get(&key) {
@@ -311,11 +305,6 @@ where
         }
 
         Ok(entries.into_iter())
-    }
-
-    async fn observe(&self, key: Bytes) -> Result<Self::Observation, Self::Failure> {
-        let descent = self.descend(&key).await?;
-        self.observe_branch(key, &descent).await
     }
 }
 

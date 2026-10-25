@@ -9,9 +9,8 @@ use futures_util::FutureExt;
 use futures_util::future::{Either, RemoteHandle, select};
 use proptest::test_runner::TestCaseError;
 use stateright::semantics::{ConsistencyTester, LinearizabilityTester};
-use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, TransactError,
+    KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, TransactError,
 };
 
 use crate::activity::{SimulatedCall, SimulatedTransaction};
@@ -219,15 +218,16 @@ where
                 cancel_at_nth_suspension(execution, n).await
             }
         };
-        let WorkAttempt { observed, finished } = std::mem::take(&mut *last_attempt.lock().unwrap());
+        let WorkAttempt { observed } = std::mem::take(&mut *last_attempt.lock().unwrap());
         let known_to_commit = match result {
             None => {
                 generation += 1;
                 false
             }
             Some(Ok(outcome)) => {
+                let committed = matches!(outcome, Outcome::Completed(_));
                 history.lock().unwrap().push(Event::Returned(id, outcome));
-                true
+                committed
             }
             Some(Err(TransactError::Failed(failure))) => {
                 return Err(TestCaseError::fail(format!(
@@ -243,8 +243,7 @@ where
                 )));
             }
         };
-        if !finished {
-            require_not_committed(&*store, observed).await?;
+        if !known_to_commit {
             continue;
         }
         for (index, observed) in observed.into_iter().enumerate() {
@@ -258,28 +257,10 @@ where
                 &history,
                 observation,
                 observed,
-                known_to_commit,
             ));
         }
     }
     Ok(observation_waiters)
-}
-
-async fn require_not_committed<S: KeyValueStore>(
-    store: &S,
-    observed: Vec<Observed<S::Observation>>,
-) -> Result<(), TestCaseError> {
-    for Observed { observation, .. } in observed {
-        if !matches!(
-            store.changed(observation).await,
-            Err(StoreError::Rejected(NotCommitted))
-        ) {
-            return Err(TestCaseError::fail(
-                "changed did not report NotCommitted for an observation whose transaction did not finish its work",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn spawn_observation_waiter<P: Replay, S: KeyValueStore + 'static>(
@@ -287,8 +268,7 @@ fn spawn_observation_waiter<P: Replay, S: KeyValueStore + 'static>(
     store: &Arc<S>,
     history: &Arc<Mutex<Vec<Event>>>,
     observation: ObservationId,
-    observed: Observed<S::Observation>,
-    known_to_commit: bool,
+    observed: Observed,
 ) -> ObservationWaiter {
     let observation_waiter_id = HistoryId::ObservationWaiter(observation);
     history.lock().unwrap().push(Event::Invoked(
@@ -296,17 +276,14 @@ fn spawn_observation_waiter<P: Replay, S: KeyValueStore + 'static>(
         HistoryOperation::ObservationFired(observation),
     ));
     let (store, history) = (store.clone(), history.clone());
+    let (key, seen) = (observed.key.clone(), observed.seen.clone());
     let task = spawn_with_handle(replay, async move {
-        match store.changed(observed.observation).await {
+        match store.changed(key, seen).await {
             Ok(()) => history.lock().unwrap().push(Event::Returned(
                 observation_waiter_id,
                 Outcome::Changed(true),
             )),
-            Err(StoreError::Rejected(NotCommitted)) if !known_to_commit => {}
-            Err(StoreError::Rejected(NotCommitted)) => panic!(
-                "changed reported NotCommitted for an observation whose transaction committed"
-            ),
-            Err(StoreError::Failed(failure)) => panic!("changed failed: {failure}"),
+            Err(failure) => panic!("changed failed: {failure}"),
         }
     });
     ObservationWaiter {
@@ -398,13 +375,10 @@ async fn settle_observation_waiters<S: KeyValueStore>(
         let mut late_commits_left = possible_late_commits;
         loop {
             let key = observation_waiter.key.clone();
-            let (current, observation) = store
+            let current = store
                 .read_transact::<_, S::Failure>(move |transaction| {
                     let key = key.clone();
-                    Box::pin(async move {
-                        let current = transaction.get(key.clone()).await?;
-                        Ok((current, transaction.observe(key).await?))
-                    })
+                    Box::pin(async move { transaction.get(key).await })
                 })
                 .await
                 .map_err(|error| {
@@ -414,7 +388,7 @@ async fn settle_observation_waiters<S: KeyValueStore>(
                 observation_waiter.task.now_or_never();
                 break;
             }
-            let changed_again = pin!(store.changed(observation));
+            let changed_again = pin!(store.changed(observation_waiter.key.clone(), current));
             match select(&mut observation_waiter.task, changed_again).await {
                 Either::Left(((), _)) => break,
                 Either::Right((Ok(()), _)) => {
@@ -425,12 +399,7 @@ async fn settle_observation_waiters<S: KeyValueStore>(
                     }
                     late_commits_left -= 1;
                 }
-                Either::Right((Err(StoreError::Rejected(NotCommitted)), _)) => {
-                    return Err(TestCaseError::fail(
-                        "changed reported NotCommitted for an observation from a read transaction that finished",
-                    ));
-                }
-                Either::Right((Err(StoreError::Failed(failure)), _)) => {
+                Either::Right((Err(failure), _)) => {
                     return Err(TestCaseError::fail(format!("changed failed: {failure}")));
                 }
             }

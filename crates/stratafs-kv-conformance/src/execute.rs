@@ -13,10 +13,9 @@ use stratafs_store::kv::{
 use crate::activity::{SimulatedOperation, SimulatedRead, SimulatedTransaction};
 use crate::model::{Outcome, Seen};
 
-pub(crate) struct Observed<O> {
+pub(crate) struct Observed {
     pub(crate) key: Bytes,
     pub(crate) seen: Option<Bytes>,
-    pub(crate) observation: O,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,18 +43,9 @@ impl<R, F> From<StoreError<SetRejection<R>, F>> for WorkFailure<R, F> {
     }
 }
 
-pub(crate) struct WorkAttempt<O> {
-    pub(crate) observed: Vec<Observed<O>>,
-    pub(crate) finished: bool,
-}
-
-impl<O> Default for WorkAttempt<O> {
-    fn default() -> Self {
-        WorkAttempt {
-            observed: Vec::new(),
-            finished: false,
-        }
-    }
+#[derive(Default)]
+pub(crate) struct WorkAttempt {
+    pub(crate) observed: Vec<Observed>,
 }
 
 pub(crate) async fn execute<S: KeyValueStore>(
@@ -64,7 +54,7 @@ pub(crate) async fn execute<S: KeyValueStore>(
     // store implementations are allowed to run the "work" callback more than once,
     // this records only the most recent attempt.
     // The caller owns it, so it survives the transaction being cancelled.
-    last_attempt: &Arc<Mutex<WorkAttempt<S::Observation>>>,
+    last_attempt: &Arc<Mutex<WorkAttempt>>,
 ) -> Result<Outcome, TransactError<S::Rejection, S::Failure, WorkFailure<S::Rejection, S::Failure>>>
 {
     let last_attempt = last_attempt.clone();
@@ -83,7 +73,6 @@ pub(crate) async fn execute<S: KeyValueStore>(
                                     perform_reads(&*transaction, reads, &last_attempt).await?,
                                 );
                             }
-                            last_attempt.lock().unwrap().finished = true;
                             Ok(seen)
                         })
                     })
@@ -98,7 +87,6 @@ pub(crate) async fn execute<S: KeyValueStore>(
                             let seen =
                                 perform_operations(&mut *transaction, operations, &last_attempt)
                                     .await?;
-                            last_attempt.lock().unwrap().finished = true;
                             Ok((seen, transaction))
                         })
                     })
@@ -118,7 +106,7 @@ pub(crate) async fn execute<S: KeyValueStore>(
 pub(crate) async fn perform_operations<T: KeyValueTransaction>(
     transaction: &mut T,
     operations: Vec<SimulatedOperation>,
-    last_attempt: &Mutex<WorkAttempt<T::Observation>>,
+    last_attempt: &Mutex<WorkAttempt>,
 ) -> Result<Vec<Seen>, WorkFailure<T::Rejection, T::Failure>> {
     let mut seen = Vec::new();
     for operation in operations {
@@ -140,7 +128,7 @@ pub(crate) async fn perform_operations<T: KeyValueTransaction>(
 async fn perform_reads<T: ReadKeyValueTransaction>(
     transaction: &T,
     reads: Vec<SimulatedRead>,
-    last_attempt: &Mutex<WorkAttempt<T::Observation>>,
+    last_attempt: &Mutex<WorkAttempt>,
 ) -> Result<Vec<Seen>, T::Failure> {
     let performed = try_join_all(
         reads
@@ -160,7 +148,7 @@ async fn perform_reads<T: ReadKeyValueTransaction>(
 async fn perform_read<T: ReadKeyValueTransaction>(
     transaction: &T,
     read: SimulatedRead,
-) -> Result<(Seen, Option<Observed<T::Observation>>), T::Failure> {
+) -> Result<(Seen, Option<Observed>), T::Failure> {
     Ok(match read {
         SimulatedRead::Get(key) => (Seen::Get(transaction.get(key).await?), None),
         SimulatedRead::GetRange(start, end, limit) => (
@@ -168,16 +156,8 @@ async fn perform_read<T: ReadKeyValueTransaction>(
             None,
         ),
         SimulatedRead::Observe(key) => {
-            let observation = transaction.observe(key.clone()).await?;
             let seen = transaction.get(key.clone()).await?;
-            (
-                Seen::Observe(seen.clone()),
-                Some(Observed {
-                    key,
-                    seen,
-                    observation,
-                }),
-            )
+            (Seen::Observe(seen.clone()), Some(Observed { key, seen }))
         }
     })
 }

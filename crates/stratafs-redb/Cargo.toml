@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
-futures-channel.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 redb = "4.4.0"

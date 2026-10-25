@@ -1,11 +1,8 @@
 use std::ops::RangeBounds;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
-use futures_channel::oneshot;
 use futures_core::future::BoxFuture;
-use futures_util::FutureExt;
-use futures_util::future::Shared;
 use futures_util::lock::Mutex;
 use redb::{
     CommitError, Database, Error, ReadOnlyTable, ReadableDatabase, ReadableTable, StorageError,
@@ -15,8 +12,8 @@ use redb::{
 use stratafs_keyed_notify::KeyedNotify;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
-    KeyValueStore, KeyValueTransaction, NotCommitted, ReadKeyValueTransaction, SetRejection,
-    TransactError, TransactionHandle, assert_valid_range,
+    KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
+    TransactionHandle, assert_valid_range,
 };
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
@@ -89,7 +86,6 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
     type Rejection = std::convert::Infallible;
     // set reports values over redb's limit as SetRejection::TooLarge, so Failure excludes ValueTooLarge.
     type Failure = RedbFailure;
-    type Observation = RedbObservation;
     type ReadTransaction<'txn> = RedbTransaction<'txn, ReadOnlyTable<&'static [u8], &'static [u8]>>;
     type Transaction<'txn> = RedbTransaction<'txn, Table<'txn, &'static [u8], &'static [u8]>>;
 
@@ -108,11 +104,9 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
         written.clear();
         let result: Result<Result<T, E>, RedbFailure> = async {
             let transaction = self.database.begin_write()?;
-            let committed = OnceLock::new();
             let output = work(TransactionHandle::new(RedbTransaction {
                 table: transaction.open_table(TABLE)?,
                 written: &mut written,
-                committed: &committed,
             }))
             .await
             .map(|(output, _)| output);
@@ -123,7 +117,6 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                     return Ok(Err(error));
                 }
             };
-            let committed = committed.into_inner();
             let notify = self.notify.clone();
             let keys = std::mem::take(&mut *written);
             let (commit, keys) = self
@@ -131,9 +124,6 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                 .spawn_blocking(move || {
                     let commit = transaction.commit();
                     if commit.is_ok() {
-                        if let Some((committed, _)) = committed {
-                            let _ = committed.send(());
-                        }
                         notify.notify_waiters(&keys);
                     }
                     (commit, keys)
@@ -160,22 +150,12 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
         let result: Result<Result<T, E>, RedbFailure> = async {
             let transaction = self.database.begin_read()?;
-            let committed = OnceLock::new();
             let mut written = Vec::new();
-            let output = work(TransactionHandle::new(RedbTransaction {
+            Ok(work(TransactionHandle::new(RedbTransaction {
                 table: transaction.open_table(TABLE)?,
                 written: &mut written,
-                committed: &committed,
             }))
-            .await;
-            let output = match output {
-                Ok(output) => output,
-                Err(error) => return Ok(Err(error)),
-            };
-            if let Some((committed, _)) = committed.into_inner() {
-                let _ = committed.send(());
-            }
-            Ok(Ok(output))
+            .await)
         }
         .await;
         match result {
@@ -185,36 +165,22 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
         }
     }
 
-    async fn changed(
-        &self,
-        observation: RedbObservation,
-    ) -> Result<(), StoreError<NotCommitted, Self::Failure>> {
-        if observation.committed.clone().await.is_err() {
-            return Err(StoreError::Rejected(NotCommitted));
-        }
-        let observation = &observation;
+    async fn changed(&self, key: Bytes, seen: Option<Bytes>) -> Result<(), Self::Failure> {
+        let (key, seen) = (&key, &seen);
         self.notify
-            .wait_until(&observation.key, || async move {
+            .wait_until(key, || async move {
                 let transaction = self.database.begin_read()?;
                 let table = transaction.open_table(TABLE)?;
-                let current = table.get(&observation.key[..])?;
-                Ok(current.as_ref().map(|value| value.value()) != observation.seen.as_deref())
+                let current = table.get(&key[..])?;
+                Ok(current.as_ref().map(|value| value.value()) != seen.as_deref())
             })
             .await
-            .map_err(StoreError::Failed)
     }
-}
-
-pub struct RedbObservation {
-    key: Bytes,
-    seen: Option<Bytes>,
-    committed: Shared<oneshot::Receiver<()>>,
 }
 
 pub struct RedbTransaction<'txn, T> {
     table: T,
     written: &'txn mut Vec<Bytes>,
-    committed: &'txn OnceLock<(oneshot::Sender<()>, Shared<oneshot::Receiver<()>>)>,
 }
 
 impl<'txn, T> ReadKeyValueTransaction for RedbTransaction<'txn, T>
@@ -222,7 +188,6 @@ where
     T: ReadableTable<&'static [u8], &'static [u8]> + Send + Sync,
 {
     type Failure = RedbFailure;
-    type Observation = RedbObservation;
 
     async fn get_range<R: RangeBounds<Bytes> + Send>(
         &self,
@@ -247,25 +212,6 @@ where
             })
             .collect::<Result<Vec<_>, Self::Failure>>()?;
         Ok(entries.into_iter())
-    }
-
-    async fn observe(&self, key: Bytes) -> Result<RedbObservation, Self::Failure> {
-        let seen = self
-            .table
-            .get(&key[..])?
-            .map(|value| Bytes::copy_from_slice(value.value()));
-        Ok(RedbObservation {
-            key,
-            seen,
-            committed: self
-                .committed
-                .get_or_init(|| {
-                    let (committed, outcome) = oneshot::channel();
-                    (committed, outcome.shared())
-                })
-                .1
-                .clone(),
-        })
     }
 }
 
