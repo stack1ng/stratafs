@@ -22,12 +22,12 @@ use crate::node::{InternalEntry, LeafEntry};
 use crate::serialized::CorruptValue;
 use crate::tree::{TreeConfig, TreeConfigLimits, TreeShared};
 
-pub struct TreeVolume<S, A, C> {
+pub struct TreeVolume<S: KeyValueStore, A, C> {
     pub(crate) shared: Arc<TreeShared<S, A, C>>,
     pub(crate) id: TreeVolumeId,
 }
 
-pub struct TreeTransaction<'txn, T, S, A, C> {
+pub struct TreeTransaction<'txn, T, S: KeyValueStore, A, C> {
     pub(crate) inner: TransactionHandle<'txn, 'txn, T>,
     pub(crate) shared: &'txn TreeShared<S, A, C>,
     pub(crate) volume: TreeVolumeId,
@@ -44,7 +44,7 @@ enum FlushingWork<E, F, R> {
     Flush(TreeFailure<F, R>),
 }
 
-impl<S, A, C> TreeVolume<S, A, C> {
+impl<S: KeyValueStore, A, C> TreeVolume<S, A, C> {
     fn transaction<'txn, T>(
         &'txn self,
         inner: TransactionHandle<'txn, 'txn, T>,

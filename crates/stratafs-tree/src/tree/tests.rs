@@ -39,7 +39,7 @@ fn memory_store() -> RedbStore<Inline> {
     RedbStore::new(database, Inline).unwrap()
 }
 
-fn into_store<S, A, C>(tree: Tree<S, A, C>) -> S {
+fn into_store<S: KeyValueStore, A, C>(tree: Tree<S, A, C>) -> S {
     Arc::into_inner(tree.0)
         .expect("the test holds the only reference to the tree")
         .store

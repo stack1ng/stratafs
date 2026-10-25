@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 bytes.workspace = true
 equivalent.workspace = true
+foldhash.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 smallvec.workspace = true
@@ -16,6 +17,7 @@ stratafs-range-bounds-map.workspace = true
 stratafs-serialized.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
+weak-table.workspace = true
 xxhash-rust.workspace = true
 zerocopy.workspace = true
 

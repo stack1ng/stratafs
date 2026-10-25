@@ -16,6 +16,7 @@ bytes = "1.12"
 cfg_aliases = "0.2"
 equivalent = "1.0"
 event-listener = "5.4"
+foldhash = "0.2"
 futures-channel = "0.3.34"
 futures-core = "0.3.34"
 futures-lite = "2.6"
@@ -38,6 +39,7 @@ stratafs-serialized = { path = "crates/stratafs-serialized" }
 stratafs-store = { path = "crates/stratafs-store" }
 storekey = "0.11"
 thiserror = "2.0"
+weak-table = "0.4"
 xxhash-rust = { version = "0.8", features = ["const_xxh32"] }
 zerocopy = { version = "0.8", features = ["alloc", "derive"] }
 

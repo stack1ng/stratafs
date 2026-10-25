@@ -1,16 +1,61 @@
 use std::iter;
+use std::sync::{Arc, PoisonError, Weak};
 
 use bytes::{Buf, Bytes};
-use futures_util::future::select_all;
+use futures_core::future::BoxFuture;
+use futures_util::FutureExt;
+use futures_util::future::{Shared, select_all};
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction, TransactError};
+use weak_table::WeakValueHashMap;
 
 use crate::descent::DescentPath;
 use crate::error::TreeFailure;
 use crate::header::NodeId;
 use crate::key::TreeKey;
 use crate::node::{Node, NodeHeader, NodeKind};
-use crate::tree::TreeConfig;
+use crate::tree::{TreeConfig, TreeShared};
 use crate::volume::{TreeTransaction, TreeVolume};
+
+pub(crate) type SharedWatches<F> =
+    WeakValueHashMap<Bytes, Weak<SharedWatch<F>>, foldhash::fast::RandomState>;
+
+// SharedWatch is one watch on a stored entry, shared by every waiter watching the same bytes,
+// so whichever of them is polled drives it.
+pub(crate) struct SharedWatch<F> {
+    value: Bytes,
+    changed: Shared<BoxFuture<'static, Result<(), Arc<F>>>>,
+}
+
+impl<S, A, C> TreeShared<S, A, C>
+where
+    S: KeyValueStore,
+    A: Send + Sync + 'static,
+    C: TreeConfig,
+{
+    // watch returns the watch on key for value, starting one unless a waiter already watches those bytes.
+    // A watch for different bytes takes over the key, while the waiters of the one it replaces keep theirs.
+    fn watch(self: &Arc<Self>, key: Bytes, value: Bytes) -> Arc<SharedWatch<S::Failure>> {
+        let mut watches = self.watches.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(watch) = watches.get(&key).filter(|watch| watch.value == value) {
+            return watch;
+        }
+        let (shared, watched_key, watched_value) = (self.clone(), key.clone(), value.clone());
+        let watch = Arc::new(SharedWatch {
+            value,
+            changed: async move {
+                shared
+                    .store
+                    .changed(watched_key, Some(watched_value))
+                    .await
+                    .map_err(Arc::new)
+            }
+            .boxed()
+            .shared(),
+        });
+        watches.insert(key, watch.clone());
+        watch
+    }
+}
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
@@ -67,7 +112,6 @@ where
         key: Bytes,
         seen: Option<Bytes>,
     ) -> Result<(), TreeFailure<S::Failure, S::Rejection>> {
-        let store = &self.shared.store;
         loop {
             let branch = self
                 .read_transact(|transaction| {
@@ -94,13 +138,13 @@ where
             let Some(branch) = branch else {
                 return Ok(());
             };
-            let (changed, _, _) = select_all(
-                branch
-                    .into_iter()
-                    .map(|(key, value)| Box::pin(store.changed(key, Some(value)))),
-            )
-            .await;
-            changed.map_err(TreeFailure::Store)?;
+            let watches: Vec<_> = branch
+                .into_iter()
+                .map(|(key, value)| self.shared.watch(key, value))
+                .collect();
+            let (changed, _, _) =
+                select_all(watches.iter().map(|watch| watch.changed.clone())).await;
+            changed.map_err(TreeFailure::Watch)?;
         }
     }
 }
@@ -111,3 +155,6 @@ fn stored_node(id: NodeId, mut node: impl Buf) -> (Bytes, Bytes) {
         node.copy_to_bytes(node.remaining()),
     )
 }
+
+#[cfg(test)]
+mod tests;

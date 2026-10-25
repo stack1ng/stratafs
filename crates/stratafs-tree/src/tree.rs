@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use stratafs_serialized::serialized_value;
@@ -11,6 +11,7 @@ use stratafs_store::kv::{
 };
 use zerocopy::little_endian::{U64, U128};
 
+use crate::branch_observation::SharedWatches;
 use crate::error::TreeFailure;
 use crate::header::{NodeId, TreeVolumeId, VolumeEpoch, VolumeHeader};
 use crate::key::TreeKey;
@@ -67,11 +68,13 @@ pub enum PinnedConfigError<R, F> {
     Store(StoreError<SetRejection<R>, F>),
 }
 
-pub struct Tree<S, A, C>(Arc<TreeShared<S, A, C>>);
+pub struct Tree<S: KeyValueStore, A, C>(Arc<TreeShared<S, A, C>>);
 
-pub(crate) struct TreeShared<S, A, C> {
+pub(crate) struct TreeShared<S: KeyValueStore, A, C> {
     pub(crate) store: S,
     pub(crate) id_allocator: A,
+    // watches holds each watch that waiters share, for as long as one of them still waits on it
+    pub(crate) watches: Mutex<SharedWatches<S::Failure>>,
     config: PhantomData<C>,
 }
 
@@ -149,6 +152,7 @@ where
         Ok(Self(Arc::new(TreeShared {
             store,
             id_allocator,
+            watches: Mutex::default(),
             config: PhantomData,
         })))
     }
