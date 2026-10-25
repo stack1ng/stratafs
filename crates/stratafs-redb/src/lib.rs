@@ -272,10 +272,10 @@ where
 impl KeyValueTransaction for RedbTransaction<'_, Table<'_, &'static [u8], &'static [u8]>> {
     type Rejection = std::convert::Infallible;
 
-    async fn set(
+    fn set(
         &mut self,
         key: Bytes,
-        mut value: impl Buf + Send,
+        mut value: impl Buf,
     ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
         let joined;
         let contiguous = if value.chunk().len() == value.remaining() {
@@ -299,17 +299,14 @@ impl KeyValueTransaction for RedbTransaction<'_, Table<'_, &'static [u8], &'stat
         Ok(())
     }
 
-    async fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {
+    fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {
         if self.table.remove(&key[..])?.is_some() {
             self.written.push(key);
         }
         Ok(())
     }
 
-    async fn clear_range(
-        &mut self,
-        range: impl RangeBounds<Bytes> + Send,
-    ) -> Result<(), Self::Failure> {
+    fn clear_range(&mut self, range: impl RangeBounds<Bytes>) -> Result<(), Self::Failure> {
         assert_valid_range(&range);
         let bounds = (
             range.start_bound().map(|key| &key[..]),

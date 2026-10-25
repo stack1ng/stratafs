@@ -27,7 +27,7 @@ where
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
-    pub(super) async fn execute_span_mutation_plans(
+    pub(super) fn execute_span_mutation_plans(
         &mut self,
         volume: VolumeHeader,
         kind: NodeKind,
@@ -57,14 +57,14 @@ where
         }
         let mut parent_spans = SmallVec::new();
         for group in groups {
-            if let Some(parent_span) = self.execute_plan_group(volume, kind, group).await? {
+            if let Some(parent_span) = self.execute_plan_group(volume, kind, group)? {
                 parent_spans.push(parent_span);
             }
         }
         Ok(parent_spans)
     }
 
-    async fn execute_plan_group(
+    fn execute_plan_group(
         &mut self,
         volume: VolumeHeader,
         kind: NodeKind,
@@ -74,7 +74,7 @@ where
         StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
     > {
         if group[0].is_root() {
-            return self.execute_root_plan_group(volume, kind, group).await;
+            return self.execute_root_plan_group(volume, kind, group);
         }
         // Phase 1: accumulate the parent span.
         // Take the parents of each plan's first and last existing node, and put them and their
@@ -137,7 +137,7 @@ where
         let mut replacements: SmallVec<[SlottedList<BytesMut, [u8], u32>; 1]> =
             SmallVec::with_capacity(group.len());
         for plan in group {
-            replacements.push(self.execute_span_mutation_plan(volume, kind, plan).await?);
+            replacements.push(self.execute_span_mutation_plan(volume, kind, plan)?);
         }
 
         // Phase 4: if nothing changed, return nothing.
@@ -166,7 +166,7 @@ where
         Ok(Some(parent_span))
     }
 
-    async fn execute_root_plan_group(
+    fn execute_root_plan_group(
         &mut self,
         volume: VolumeHeader,
         kind: NodeKind,
@@ -177,7 +177,7 @@ where
     > {
         let mut roots = SlottedList::<BytesMut, [u8], u32>::empty();
         for plan in group {
-            roots.extend_from_list(&self.execute_span_mutation_plan(volume, kind, plan).await?);
+            roots.extend_from_list(&self.execute_span_mutation_plan(volume, kind, plan)?);
         }
         if roots.len() == 0 {
             let empty_root = SpanMutationPlan {
@@ -186,9 +186,7 @@ where
                     entries: SlottedList::empty(),
                 }],
             };
-            roots = self
-                .execute_span_mutation_plan(volume, NodeKind::Leaf, empty_root)
-                .await?;
+            roots = self.execute_span_mutation_plan(volume, NodeKind::Leaf, empty_root)?;
         }
         if roots.len() > 1 {
             // if the current root gets planned to have multiple nodes, that means it is getting superseded by a new root, which will be created next iteration
@@ -207,15 +205,14 @@ where
             self.set_volume_header(VolumeHeader {
                 root,
                 epoch: volume.epoch,
-            })
-            .await?;
+            })?;
         }
         Ok(None)
     }
 
     // execute_span_mutation_plan applies the plan to the current layer,
     // and returns the entries that it created/updated
-    async fn execute_span_mutation_plan(
+    fn execute_span_mutation_plan(
         &mut self,
         volume: VolumeHeader,
         kind: NodeKind,
@@ -240,7 +237,6 @@ where
                                 &entries,
                             ),
                         )
-                        .await
                         .map_err(with_tree_failure)?;
                     parent_entries.insert_entry(parent_entries.len(), new_node_id, &separator);
                 }
@@ -265,7 +261,6 @@ where
                                 &entries,
                             ),
                         )
-                        .await
                         .map_err(with_tree_failure)?;
                     parent_entries.insert_entry(parent_entries.len(), target, &separator);
                 }
@@ -273,7 +268,6 @@ where
                     if node.node.epoch == volume.epoch {
                         self.inner
                             .clear(TreeKey::Node(node.node.id).into())
-                            .await
                             .map_err(TreeFailure::Store)
                             .map_err(StoreError::Failed)?;
                     }

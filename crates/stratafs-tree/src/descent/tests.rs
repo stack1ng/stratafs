@@ -85,17 +85,13 @@ fn store_three_levels<S: KeyValueStore>(store: &S) {
         let nodes = nodes.clone();
         Box::pin(async move {
             for (id, node) in nodes {
-                transaction
-                    .set(TreeKey::Node(NodeId(U128::new(id))).into(), node)
-                    .await?;
+                transaction.set(TreeKey::Node(NodeId(U128::new(id))).into(), node)?;
             }
             let header = VolumeHeader {
                 root: NodeId(U128::new(ROOT)),
                 epoch: VolumeEpoch(U64::new(0)),
             };
-            transaction
-                .set(TreeKey::VolumeHeader(VOLUME).into(), Bytes::from(&header))
-                .await?;
+            transaction.set(TreeKey::VolumeHeader(VOLUME).into(), Bytes::from(&header))?;
             Ok::<_, StoreError<SetRejection<S::Rejection>, S::Failure>>(((), transaction))
         })
     }))

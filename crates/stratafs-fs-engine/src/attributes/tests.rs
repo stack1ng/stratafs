@@ -86,7 +86,7 @@ fn removexattr(
 fn insert_inode(engine: &InMemoryEngine, inode: Inode, attributes: &Attributes) {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
-            let result = txn.write_attributes(inode, attributes).await;
+            let result = txn.write_attributes(inode, attributes);
             result.map(|result| (result, txn))
         })
     }))

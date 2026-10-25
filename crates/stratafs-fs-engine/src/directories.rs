@@ -291,30 +291,26 @@ where
         name: &[u8],
         inode: Inode,
         kind: FileType,
-    ) -> impl Future<Output = Result<(), StoreError<T::Rejection, T::Failure>>> + Send {
-        async move {
-            let header = StoredEntryHeader {
-                inode: U64::new(inode.0),
-                kind: kind as u8,
-            };
-            self.metadata
+    ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
+        let header = StoredEntryHeader {
+            inode: U64::new(inode.0),
+            kind: kind as u8,
+        };
+        self.metadata
+            .set(
+                FsKey::new_directory_entry(dir, position).into(),
+                header.as_bytes().chain(name),
+            )
+            .map_err(refused_or_failed)?;
+        match kind {
+            FileType::Directory => Ok(()),
+            FileType::File | FileType::SymbolicLink => self
+                .metadata
                 .set(
-                    FsKey::new_directory_entry(dir, position).into(),
-                    header.as_bytes().chain(name),
+                    FsKey::new_hard_link(inode, dir, position).into(),
+                    Bytes::new(),
                 )
-                .await
-                .map_err(refused_or_failed)?;
-            match kind {
-                FileType::Directory => Ok(()),
-                FileType::File | FileType::SymbolicLink => self
-                    .metadata
-                    .set(
-                        FsKey::new_hard_link(inode, dir, position).into(),
-                        Bytes::new(),
-                    )
-                    .await
-                    .map_err(refused_or_failed),
-            }
+                .map_err(refused_or_failed),
         }
     }
 
@@ -324,19 +320,14 @@ where
         position: u64,
         inode: Inode,
         kind: FileType,
-    ) -> impl Future<Output = Result<(), T::Failure>> + Send {
-        async move {
-            self.metadata
-                .clear(FsKey::new_directory_entry(dir, position).into())
-                .await?;
-            match kind {
-                FileType::Directory => Ok(()),
-                FileType::File | FileType::SymbolicLink => {
-                    self.metadata
-                        .clear(FsKey::new_hard_link(inode, dir, position).into())
-                        .await
-                }
-            }
+    ) -> Result<(), T::Failure> {
+        self.metadata
+            .clear(FsKey::new_directory_entry(dir, position).into())?;
+        match kind {
+            FileType::Directory => Ok(()),
+            FileType::File | FileType::SymbolicLink => self
+                .metadata
+                .clear(FsKey::new_hard_link(inode, dir, position).into()),
         }
     }
 
@@ -350,7 +341,7 @@ where
                 .get_range(every_key_of(inode), usize::MAX)
                 .await?;
             for (key, _) in keys {
-                self.metadata.clear(key).await?;
+                self.metadata.clear(key)?;
             }
             Ok(())
         }
@@ -366,7 +357,6 @@ where
     ) -> impl Future<Output = Result<bool, IoFailure<T::Failure, C::Failure>>> + Send {
         async move {
             self.remove_name(dir, position, inode, item.kind)
-                .await
                 .map_err(IoFailure::Metadata)?;
             item.record_change(now);
             match item.kind {
@@ -403,7 +393,7 @@ where
         dir: Inode,
         directory: &mut Attributes,
         now: Timestamp,
-    ) -> impl Future<Output = Result<(), StoreError<T::Rejection, T::Failure>>> + Send {
+    ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
         directory.settable.content_changed_at = now;
         directory.record_change(now);
         self.write_attributes(dir, directory)
@@ -481,12 +471,11 @@ where
                     .map_err(IoFailure::ContentWrite)?;
                 self.metadata
                     .set(key, value.to_stored())
-                    .await
                     .map_err(refused_or_failed)?;
             }
-            self.write_attributes(inode, &attributes).await?;
-            self.add_name(dir, position, name, inode, kind).await?;
-            self.write_entry_change(dir, &mut directory, now).await?;
+            self.write_attributes(inode, &attributes)?;
+            self.add_name(dir, position, name, inode, kind)?;
+            self.write_entry_change(dir, &mut directory, now)?;
             Ok(EntryChange {
                 inode,
                 item: attributes,
@@ -537,9 +526,9 @@ where
                 .ok_or(HardLinkError::TooManyLinks)?;
             let now = self.now();
             item.record_change(now);
-            self.write_attributes(inode, &item).await?;
-            self.add_name(dir, position, name, inode, item.kind).await?;
-            self.write_entry_change(dir, &mut directory, now).await?;
+            self.write_attributes(inode, &item)?;
+            self.add_name(dir, position, name, inode, item.kind)?;
+            self.write_entry_change(dir, &mut directory, now)?;
             Ok(EntryChange {
                 inode,
                 item,
@@ -587,9 +576,9 @@ where
                 .release_name(dir, entry.position, entry.inode, &mut item, now)
                 .await?
             {
-                self.write_attributes(entry.inode, &item).await?;
+                self.write_attributes(entry.inode, &item)?;
             }
-            self.write_entry_change(dir, &mut directory, now).await?;
+            self.write_entry_change(dir, &mut directory, now)?;
             Ok(EntryChange {
                 inode: entry.inode,
                 item,
@@ -639,7 +628,7 @@ where
                 .hard_link_count
                 .checked_sub(1)
                 .ok_or(IoFailure::Corrupt(CorruptValue::UncountedHardLink))?;
-            self.write_entry_change(dir, &mut directory, now).await?;
+            self.write_entry_change(dir, &mut directory, now)?;
             Ok(EntryChange {
                 inode: entry.inode,
                 item,
@@ -751,10 +740,8 @@ where
                 RenameTarget::Full => return Err(RenameError::StorageFull),
                 RenameTarget::Free(position) => {
                     self.remove_name(dir, source.position, source.inode, item.kind)
-                        .await
                         .map_err(IoFailure::Metadata)?;
-                    self.add_name(new_dir, position, new_name, source.inode, item.kind)
-                        .await?;
+                    self.add_name(new_dir, position, new_name, source.inode, item.kind)?;
                     None
                 }
                 RenameTarget::Exchanged(target) => {
@@ -767,18 +754,15 @@ where
                         from_hard_links += 1;
                     }
                     self.remove_name(dir, source.position, source.inode, item.kind)
-                        .await
                         .map_err(IoFailure::Metadata)?;
                     self.remove_name(new_dir, target.position, target.inode, other.kind)
-                        .await
                         .map_err(IoFailure::Metadata)?;
-                    self.add_name(dir, source.position, name, target.inode, other.kind)
-                        .await?;
+                    self.add_name(dir, source.position, name, target.inode, other.kind)?;
                     if other.parent == new_dir {
                         other.parent = dir;
                     }
                     other.record_change(now);
-                    self.write_attributes(target.inode, &other).await?;
+                    self.write_attributes(target.inode, &other)?;
                     Some((target.inode, other, target.position))
                 }
                 RenameTarget::Replaced(target) => {
@@ -805,21 +789,19 @@ where
                         ) => {}
                     }
                     self.remove_name(dir, source.position, source.inode, item.kind)
-                        .await
                         .map_err(IoFailure::Metadata)?;
                     if !self
                         .release_name(new_dir, target.position, target.inode, &mut replaced, now)
                         .await?
                     {
-                        self.write_attributes(target.inode, &replaced).await?;
+                        self.write_attributes(target.inode, &replaced)?;
                     }
                     Some((target.inode, replaced, target.position))
                 }
             };
             let replaced = match replaced {
                 Some((inode, attributes, position)) => {
-                    self.add_name(new_dir, position, new_name, source.inode, item.kind)
-                        .await?;
+                    self.add_name(new_dir, position, new_name, source.inode, item.kind)?;
                     Some((inode, attributes))
                 }
                 None => None,
@@ -828,7 +810,7 @@ where
                 item.parent = new_dir;
             }
             item.record_change(now);
-            self.write_attributes(source.inode, &item).await?;
+            self.write_attributes(source.inode, &item)?;
             if moves_between_directories {
                 from.hard_link_count = from
                     .hard_link_count
@@ -838,14 +820,14 @@ where
                     .hard_link_count
                     .checked_add_signed(to_hard_links)
                     .ok_or(RenameError::TooManyLinks)?;
-                self.write_entry_change(dir, &mut from, now).await?;
-                self.write_entry_change(new_dir, &mut to, now).await?;
+                self.write_entry_change(dir, &mut from, now)?;
+                self.write_entry_change(new_dir, &mut to, now)?;
             } else {
                 from.hard_link_count = from
                     .hard_link_count
                     .checked_add_signed(from_hard_links + to_hard_links)
                     .ok_or(RenameError::TooManyLinks)?;
-                self.write_entry_change(dir, &mut from, now).await?;
+                self.write_entry_change(dir, &mut from, now)?;
                 to = from.clone();
             }
             Ok(RenameChange {

@@ -94,7 +94,7 @@ pub fn panics_on_invalid_ranges<S: KeyValueStore>(new_store: impl Fn() -> S) {
             AssertUnwindSafe(store.transact(|mut transaction| {
                 let range = range.clone();
                 Box::pin(async move {
-                    let cleared = transaction.clear_range(range).await;
+                    let cleared = transaction.clear_range(range);
                     cleared.map(|()| ((), transaction))
                 })
             }))

@@ -132,7 +132,6 @@ where
                     let checked = match stored {
                         None => transaction
                             .set(key, Bytes::from(&configured))
-                            .await
                             .map_err(PinnedConfigError::Store),
                         Some(stored) => match PinnedConfig::view(&stored) {
                             Ok(stored) if *stored == configured => Ok(()),
@@ -175,15 +174,13 @@ where
             .store
             .transact(move |mut transaction| {
                 Box::pin(async move {
-                    transaction
-                        .set(
-                            TreeKey::VolumeHeader(id).into(),
-                            Bytes::from(&VolumeHeader {
-                                root,
-                                epoch: VolumeEpoch(U64::new(0)),
-                            }),
-                        )
-                        .await?;
+                    transaction.set(
+                        TreeKey::VolumeHeader(id).into(),
+                        Bytes::from(&VolumeHeader {
+                            root,
+                            epoch: VolumeEpoch(U64::new(0)),
+                        }),
+                    )?;
                     transaction
                         .set(
                             TreeKey::Node(root).into(),
@@ -200,7 +197,6 @@ where
                                 >::empty(),
                             ),
                         )
-                        .await
                         .map(|()| ((), transaction))
                 })
             })

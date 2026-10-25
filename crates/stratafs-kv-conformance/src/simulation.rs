@@ -341,7 +341,7 @@ async fn measure_suspensions<S: KeyValueStore>(
         let entries = entries.clone();
         Box::pin(async move {
             for (key, value) in entries {
-                transaction.set(key, value).await?;
+                transaction.set(key, value)?;
             }
             Ok(((), transaction))
         })

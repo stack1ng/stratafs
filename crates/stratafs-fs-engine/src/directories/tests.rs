@@ -466,7 +466,7 @@ fn set_hard_link_count(engine: &InMemoryEngine, inode: Inode, hard_link_count: u
     block_on(engine.transact(|mut txn| {
         let attributes = attributes.clone();
         Box::pin(async move {
-            let result = txn.write_attributes(inode, &attributes).await;
+            let result = txn.write_attributes(inode, &attributes);
             result.map(|result| (result, txn))
         })
     }))
@@ -777,15 +777,13 @@ fn colliding_names_take_the_next_free_position() {
     let occupant = file(&engine, Inode::ROOT, b"occupant");
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
-            let result = txn
-                .add_name(
-                    Inode::ROOT,
-                    first.max(FIRST_POSITION),
-                    b"collides with x",
-                    occupant,
-                    FileType::File,
-                )
-                .await;
+            let result = txn.add_name(
+                Inode::ROOT,
+                first.max(FIRST_POSITION),
+                b"collides with x",
+                occupant,
+                FileType::File,
+            );
             result.map(|result| (result, txn))
         })
     }))
@@ -818,8 +816,7 @@ fn a_full_collision_range_is_storage_full() {
                     b"collides with x",
                     occupant,
                     FileType::Directory,
-                )
-                .await?;
+                )?;
             }
             Ok::<_, StoreError<Infallible, RedbFailure>>(((), txn))
         })

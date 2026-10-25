@@ -118,9 +118,7 @@ where
             .map(|span| self.create_span_mutation_plan(layer.kind, span, packing))
             .collect::<Result<SmallVec<[_; 1]>, _>>()
             .map_err(StoreError::Failed)?;
-        let spans = self
-            .execute_span_mutation_plans(volume, layer.kind, plans)
-            .await?;
+        let spans = self.execute_span_mutation_plans(volume, layer.kind, plans)?;
         Ok(Layer {
             kind: NodeKind::Internal,
             spans,

@@ -317,7 +317,6 @@ where
                                 .map_err(IoFailure::Corrupt)?
                                 .to_stored(),
                         )
-                        .await
                         .map_err(refused_or_failed)?
                 }
 
@@ -332,12 +331,10 @@ where
                                 .map_err(IoFailure::Corrupt)?
                                 .to_stored(),
                         )
-                        .await
                         .map_err(refused_or_failed)?,
                     None => self
                         .metadata
                         .clear(Bytes::from(FsKey::new_extent(inode, end)))
-                        .await
                         .map_err(IoFailure::Metadata)?,
                 }
             }
@@ -358,14 +355,13 @@ where
                     }
                     .to_stored(),
                 )
-                .await
                 .map_err(refused_or_failed)?;
 
             let now = self.now();
             attributes.settable.size = attributes.settable.size.max(write_end);
             attributes.settable.content_changed_at = now;
             attributes.record_change(now);
-            self.write_attributes(inode, &attributes).await?;
+            self.write_attributes(inode, &attributes)?;
             Ok(attributes)
         }
     }

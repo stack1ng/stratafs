@@ -70,8 +70,7 @@ fn write_extent(engine: &InMemoryEngine, inode: Inode, end: u64, extent: &Extent
         Box::pin(async move {
             let result = txn
                 .metadata
-                .set(FsKey::new_extent(inode, end).into(), extent.to_stored())
-                .await;
+                .set(FsKey::new_extent(inode, end).into(), extent.to_stored());
             result.map(|result| (result, txn))
         })
     }))
@@ -100,7 +99,7 @@ fn file_of_size(engine: &InMemoryEngine, inode: Inode, size: u64) {
     block_on(engine.transact(|mut txn| {
         let attributes = attributes.clone();
         Box::pin(async move {
-            let result = txn.write_attributes(inode, &attributes).await;
+            let result = txn.write_attributes(inode, &attributes);
             result.map(|result| (result, txn))
         })
     }))

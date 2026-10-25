@@ -14,14 +14,12 @@ fn a_value_reads_back_whole_from_one_chunk_or_several() {
         Box::pin(async move {
             transaction
                 .set(Bytes::from_static(b"one chunk"), &b"value"[..])
-                .await
                 .unwrap();
             transaction
                 .set(
                     Bytes::from_static(b"several chunks"),
                     (&b"val"[..]).chain(&b"ue"[..]),
                 )
-                .await
                 .unwrap();
             Ok::<_, Infallible>(((), transaction))
         })
@@ -59,12 +57,10 @@ fn a_set_consumes_its_value_from_one_chunk_or_several() {
             let mut one_chunk = Bytes::from_static(b"value");
             transaction
                 .set(Bytes::from_static(b"one chunk"), &mut one_chunk)
-                .await
                 .unwrap();
             let mut several_chunks = (&b"val"[..]).chain(&b"ue"[..]);
             transaction
                 .set(Bytes::from_static(b"several chunks"), &mut several_chunks)
-                .await
                 .unwrap();
             Ok::<_, Infallible>((
                 [one_chunk.remaining(), several_chunks.remaining()],

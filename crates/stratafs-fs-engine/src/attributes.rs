@@ -238,7 +238,6 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
             }
             let names = stored
                 .map_err(IoFailure::Metadata)?
-                .into_iter()
                 .map(|(key, _)| extended_attribute_name(&key))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(IoFailure::Corrupt)?;
@@ -254,14 +253,11 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
         &mut self,
         inode: Inode,
         attributes: &Attributes,
-    ) -> impl Future<Output = Result<(), StoreError<T::Rejection, T::Failure>>> + Send {
+    ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
         let stored = Bytes::from(&StoredAttributes::from(attributes));
-        async move {
-            self.metadata
-                .set(FsKey::new_attributes(inode).into(), stored)
-                .await
-                .map_err(refused_or_failed)
-        }
+        self.metadata
+            .set(FsKey::new_attributes(inode).into(), stored)
+            .map_err(refused_or_failed)
     }
 
     pub(crate) fn create_root_if_missing(
@@ -301,7 +297,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 parent: Inode::ROOT,
                 change_version: 0,
             };
-            self.write_attributes(Inode::ROOT, &root).await
+            self.write_attributes(Inode::ROOT, &root)
         }
     }
 
@@ -322,7 +318,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 todo!("resizing a file's content")
             }
             attributes.record_change(self.now());
-            self.write_attributes(inode, &attributes).await?;
+            self.write_attributes(inode, &attributes)?;
             Ok(attributes)
         }
     }
@@ -360,10 +356,9 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 .map_err(IoFailure::ContentWrite)?;
             self.metadata
                 .set(key, value.to_stored())
-                .await
                 .map_err(refused_or_failed)?;
             attributes.record_change(self.now());
-            self.write_attributes(inode, &attributes).await?;
+            self.write_attributes(inode, &attributes)?;
             Ok(())
         }
     }
@@ -388,12 +383,9 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             if existing.map_err(IoFailure::Metadata)?.is_none() {
                 return Err(RemovexattrError::AttributeNotFound);
             }
-            self.metadata
-                .clear(key)
-                .await
-                .map_err(IoFailure::Metadata)?;
+            self.metadata.clear(key).map_err(IoFailure::Metadata)?;
             attributes.record_change(self.now());
-            self.write_attributes(inode, &attributes).await?;
+            self.write_attributes(inode, &attributes)?;
             Ok(())
         }
     }

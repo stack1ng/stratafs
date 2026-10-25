@@ -320,14 +320,12 @@ where
                     if writing_over_node.epoch == volume.epoch {
                         self.inner
                             .clear(TreeKey::Node(writing_over_node.id).into())
-                            .await
                             .map_err(TreeFailure::Store)?;
                     }
                     self.set_volume_header(VolumeHeader {
                         root: only_child,
                         epoch: volume.epoch,
-                    })
-                    .await?;
+                    })?;
                     return Ok(());
                 }
                 _ => [
@@ -366,7 +364,6 @@ where
                                     entries,
                                 ),
                             )
-                            .await
                             .map_err(with_tree_failure)?;
                         parent_edits[i] = match action {
                             LayerMutationPlanAction::Replace { separator, .. } => {
@@ -397,7 +394,6 @@ where
                                     entries,
                                 ),
                             )
-                            .await
                             .map_err(with_tree_failure)?;
                         parent_edits[i] = Some(ParentEdit::Insert {
                             separator,
@@ -409,7 +405,6 @@ where
                         if node.epoch == volume.epoch {
                             self.inner
                                 .clear(TreeKey::Node(node.id).into())
-                                .await
                                 .map_err(TreeFailure::Store)?;
                         }
 
@@ -516,8 +511,7 @@ where
                             self.set_volume_header(VolumeHeader {
                                 root: updated_root.child,
                                 epoch: volume.epoch,
-                            })
-                            .await?;
+                            })?;
                             return Ok(());
                         }
                         2 => {
@@ -534,13 +528,11 @@ where
                                         &parent_entries,
                                     ),
                                 )
-                                .await
                                 .map_err(with_tree_failure)?;
                             self.set_volume_header(VolumeHeader {
                                 root: new_root,
                                 epoch: volume.epoch,
-                            })
-                            .await?;
+                            })?;
                             return Ok(());
                         }
                         count => unreachable!(

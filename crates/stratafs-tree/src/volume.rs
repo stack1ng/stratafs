@@ -93,7 +93,7 @@ where
     T: KeyValueTransaction<Rejection = S::Rejection>,
     S: KeyValueStore,
 {
-    pub(crate) async fn set_volume_header(
+    pub(crate) fn set_volume_header(
         &mut self,
         new_value: VolumeHeader,
     ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
@@ -103,7 +103,6 @@ where
                 TreeKey::VolumeHeader(self.volume).into(),
                 Bytes::from(&new_value),
             )
-            .await
             .map_err(with_tree_failure)
     }
 }
@@ -329,10 +328,10 @@ where
 {
     type Rejection = T::Rejection;
 
-    async fn set(
+    fn set(
         &mut self,
         key: Bytes,
-        mut value: impl Buf + Send,
+        mut value: impl Buf,
     ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>> {
         let fits_as_node_entry =
             |length: Option<usize>| length.is_some_and(|length| length <= C::LARGEST_ENTRY_SIZE);
@@ -350,10 +349,7 @@ where
         Ok(())
     }
 
-    async fn clear_range(
-        &mut self,
-        range: impl RangeBounds<Bytes> + Send,
-    ) -> Result<(), Self::Failure> {
+    fn clear_range(&mut self, range: impl RangeBounds<Bytes>) -> Result<(), Self::Failure> {
         self.buffered_delta.insert(range, None);
         Ok(())
     }
@@ -373,7 +369,6 @@ where
         let mut from_header = self.get_volume_header().await?;
         from_header.epoch += 1;
         self.set_volume_header(from_header)
-            .await
             .map_err(refused_write_as_failure)?;
 
         let new_volume = TreeVolumeId((self.shared.id_allocator)());
@@ -382,7 +377,6 @@ where
                 TreeKey::VolumeHeader(new_volume).into(),
                 Bytes::from(&from_header),
             )
-            .await
             .map_err(with_tree_failure)
             .map_err(refused_write_as_failure)?;
 

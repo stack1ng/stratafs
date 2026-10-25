@@ -103,19 +103,17 @@ pub(crate) async fn change_key<S: KeyValueStore>(
                 let key = Bytes::from_static(OBSERVED_KEY);
                 match write {
                     KeyWrite::Changes => {
-                        transaction.set(key, Bytes::from_static(b"changed")).await?;
+                        transaction.set(key, Bytes::from_static(b"changed"))?;
                     }
                     KeyWrite::RewritesSameValue => match transaction.get(key.clone()).await? {
-                        Some(value) => transaction.set(key, value).await?,
-                        None => transaction.clear(key).await?,
+                        Some(value) => transaction.set(key, value)?,
+                        None => transaction.clear(key)?,
                     },
                     KeyWrite::ClearsByRange => {
-                        transaction
-                            .clear_range((
-                                Bound::Excluded(Bytes::from_static(b"o")),
-                                Bound::Included(key),
-                            ))
-                            .await?;
+                        transaction.clear_range((
+                            Bound::Excluded(Bytes::from_static(b"o")),
+                            Bound::Included(key),
+                        ))?;
                     }
                 }
                 log.lock().unwrap().push(ObservationEvent::ChangerWorkEnded);
@@ -158,8 +156,7 @@ pub(crate) async fn observe<S: KeyValueStore>(
                             ObservingTransaction::WritesObservedKey
                         ) {
                             transaction
-                                .set(key.clone(), Bytes::from_static(b"written by the observer"))
-                                .await?;
+                                .set(key.clone(), Bytes::from_static(b"written by the observer"))?;
                         }
                         let second = observe_key(&*transaction, &key).await?;
                         finish_observer_work(watch([first, second]), &log, panics).await;
@@ -233,7 +230,7 @@ pub(crate) async fn run_observation_scenario<P: Replay, S: KeyValueStore + 'stat
             .transact(|mut transaction| {
                 let key = key.clone();
                 Box::pin(async move {
-                    let set = transaction.set(key, Bytes::from_static(b"before")).await;
+                    let set = transaction.set(key, Bytes::from_static(b"before"));
                     set.map(|()| ((), transaction))
                 })
             })

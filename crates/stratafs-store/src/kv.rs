@@ -122,22 +122,20 @@ pub enum SetRejection<R> {
 pub trait KeyValueTransaction: ReadKeyValueTransaction {
     type Rejection: std::error::Error + Send + Sync + 'static;
 
+    // Writes never wait: a store keeps them in the transaction, and they take effect when it commits.
     fn set(
         &mut self,
         key: Bytes,
-        value: impl Buf + Send,
-    ) -> impl Future<Output = Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>>> + Send;
+        value: impl Buf,
+    ) -> Result<(), StoreError<SetRejection<Self::Rejection>, Self::Failure>>;
 
-    fn clear(&mut self, key: Bytes) -> impl Future<Output = Result<(), Self::Failure>> + Send {
-        async move { self.clear_range(&key..=&key).await }
+    fn clear(&mut self, key: Bytes) -> Result<(), Self::Failure> {
+        self.clear_range(&key..=&key)
     }
 
     // clear_range removes every key in a range.
     // If an inverted (end < start) or fully excluded (start == end == Bound::Excluded) range is provided, the call panics.
-    fn clear_range(
-        &mut self,
-        range: impl RangeBounds<Bytes> + Send,
-    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
+    fn clear_range(&mut self, range: impl RangeBounds<Bytes>) -> Result<(), Self::Failure>;
 }
 
 pub trait ReadKeyValueTransaction: Send + Sync {

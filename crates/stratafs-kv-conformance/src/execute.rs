@@ -127,11 +127,9 @@ pub(crate) async fn perform_operations<T: KeyValueTransaction>(
             SimulatedOperation::Read(reads) => {
                 seen.extend(perform_reads(&*transaction, reads, last_attempt).await?)
             }
-            SimulatedOperation::Set(key, value) => transaction.set(key, value).await?,
-            SimulatedOperation::Clear(key) => transaction.clear(key).await?,
-            SimulatedOperation::ClearRange(start, end) => {
-                transaction.clear_range((start, end)).await?
-            }
+            SimulatedOperation::Set(key, value) => transaction.set(key, value)?,
+            SimulatedOperation::Clear(key) => transaction.clear(key)?,
+            SimulatedOperation::ClearRange(start, end) => transaction.clear_range((start, end))?,
             SimulatedOperation::Panic => resume_unwind(Box::new("simulated panic inside work")),
             SimulatedOperation::Abort => return Err(WorkFailure::SimulatedAbort),
         }
