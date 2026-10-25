@@ -45,6 +45,14 @@ pub struct SimulatedCall {
     pub cancelled_at_fraction: Option<f64>,
 }
 
+// SimulatedForkTransaction is a transaction that forks its volume part way through:
+// what it does before the fork belongs in both volumes, and what it does after belongs only in the source.
+#[derive(Clone, Debug)]
+pub struct SimulatedForkTransaction {
+    pub before_fork: Vec<SimulatedOperation>,
+    pub after_fork: Vec<SimulatedOperation>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum SimulatedStop {
     Clean,
@@ -64,6 +72,34 @@ pub fn simulated_client_activity() -> impl Strategy<Value = Vec<Vec<SimulatedCal
 
 pub fn simulated_client_transactions() -> impl Strategy<Value = Vec<Vec<SimulatedTransaction>>> {
     concurrent_clients(transaction())
+}
+
+pub fn simulated_fork_transaction() -> impl Strategy<Value = SimulatedForkTransaction> {
+    (committing_operations(), committing_operations()).prop_map(|(before_fork, after_fork)| {
+        SimulatedForkTransaction {
+            before_fork,
+            after_fork,
+        }
+    })
+}
+
+// committing_operations are a transaction's reads and writes without observations,
+// which need waiters, or panics and aborts, which would stop it committing.
+fn committing_operations() -> impl Strategy<Value = Vec<SimulatedOperation>> {
+    vec(
+        prop_oneof![
+            3 => prop_oneof![
+                6 => vec(unobserved_read(), 1..=3).prop_map(SimulatedOperation::Read),
+                6 => (key(), value()).prop_map(|(key, value)| SimulatedOperation::Set(key, value)),
+                6 => key().prop_map(SimulatedOperation::Clear),
+                2 => valid_range().prop_map(|(start, end)| SimulatedOperation::ClearRange(start, end)),
+            ]
+            .prop_map(|operation| vec![operation]),
+            1 => numbered_key_run(),
+        ],
+        0..=4,
+    )
+    .prop_map(|steps| steps.into_iter().flatten().collect())
 }
 
 fn concurrent_clients<C: Strategy>(call: C) -> impl Strategy<Value = Vec<Vec<C::Value>>> {
@@ -131,10 +167,16 @@ fn operation() -> impl Strategy<Value = SimulatedOperation> {
 
 fn read() -> impl Strategy<Value = SimulatedRead> {
     prop_oneof![
-        4 => key().prop_map(SimulatedRead::Get),
-        4 => (valid_range(), limit())
-            .prop_map(|((start, end), limit)| SimulatedRead::GetRange(start, end, limit)),
+        8 => unobserved_read(),
         1 => key().prop_map(SimulatedRead::Observe),
+    ]
+}
+
+fn unobserved_read() -> impl Strategy<Value = SimulatedRead> {
+    prop_oneof![
+        key().prop_map(SimulatedRead::Get),
+        (valid_range(), limit())
+            .prop_map(|((start, end), limit)| SimulatedRead::GetRange(start, end, limit)),
     ]
 }
 

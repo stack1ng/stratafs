@@ -369,6 +369,7 @@ where
     type VolumeId = TreeVolumeId;
 
     async fn fork(&mut self) -> Result<TreeVolumeId, Self::Failure> {
+        self.flush().await.map_err(refused_write_as_failure)?;
         let mut from_header = self.get_volume_header().await?;
         from_header.epoch += 1;
         self.set_volume_header(from_header)

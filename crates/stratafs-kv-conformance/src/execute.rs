@@ -95,30 +95,9 @@ pub(crate) async fn execute<S: KeyValueStore>(
                         let (operations, last_attempt) = (operations.clone(), last_attempt.clone());
                         Box::pin(async move {
                             *last_attempt.lock().unwrap() = WorkAttempt::default();
-                            let mut seen = Vec::new();
-                            for operation in operations {
-                                yield_now().await;
-                                match operation {
-                                    SimulatedOperation::Read(reads) => seen.extend(
-                                        perform_reads(&*transaction, reads, &last_attempt).await?,
-                                    ),
-                                    SimulatedOperation::Set(key, value) => {
-                                        transaction.set(key, value).await?
-                                    }
-                                    SimulatedOperation::Clear(key) => {
-                                        transaction.clear(key).await?
-                                    }
-                                    SimulatedOperation::ClearRange(start, end) => {
-                                        transaction.clear_range((start, end)).await?
-                                    }
-                                    SimulatedOperation::Panic => {
-                                        resume_unwind(Box::new("simulated panic inside work"))
-                                    }
-                                    SimulatedOperation::Abort => {
-                                        return Err(WorkFailure::SimulatedAbort);
-                                    }
-                                }
-                            }
+                            let seen =
+                                perform_operations(&mut *transaction, operations, &last_attempt)
+                                    .await?;
                             last_attempt.lock().unwrap().finished = true;
                             Ok((seen, transaction))
                         })
@@ -133,6 +112,31 @@ pub(crate) async fn execute<S: KeyValueStore>(
         Ok(Err(error)) => Err(error),
         Err(_) => Ok(Outcome::Panicked),
     }
+}
+
+// perform_operations runs a write transaction's operations in order, returning what its reads saw.
+pub(crate) async fn perform_operations<T: KeyValueTransaction>(
+    transaction: &mut T,
+    operations: Vec<SimulatedOperation>,
+    last_attempt: &Mutex<WorkAttempt<T::Observation>>,
+) -> Result<Vec<Seen>, WorkFailure<T::Rejection, T::Failure>> {
+    let mut seen = Vec::new();
+    for operation in operations {
+        yield_now().await;
+        match operation {
+            SimulatedOperation::Read(reads) => {
+                seen.extend(perform_reads(&*transaction, reads, last_attempt).await?)
+            }
+            SimulatedOperation::Set(key, value) => transaction.set(key, value).await?,
+            SimulatedOperation::Clear(key) => transaction.clear(key).await?,
+            SimulatedOperation::ClearRange(start, end) => {
+                transaction.clear_range((start, end)).await?
+            }
+            SimulatedOperation::Panic => resume_unwind(Box::new("simulated panic inside work")),
+            SimulatedOperation::Abort => return Err(WorkFailure::SimulatedAbort),
+        }
+    }
+    Ok(seen)
 }
 
 async fn perform_reads<T: ReadKeyValueTransaction>(

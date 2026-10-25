@@ -19,7 +19,10 @@ use proptest::proptest;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
 
-use crate::activity::{simulated_client_activity, simulated_client_transactions, simulated_stop};
+use crate::activity::{
+    simulated_client_activity, simulated_client_transactions, simulated_fork_transaction,
+    simulated_stop,
+};
 use crate::durability::{CrashableStorage, simulate_and_reopen};
 use crate::forking::simulate_and_fork;
 use crate::observation_lifecycle::{
@@ -204,6 +207,7 @@ pub fn forks_stay_isolated<R, F>(
     let new_forkable_store = Arc::new(new_forkable_store);
     proptest!(|(
         simulated_client_activity_before_fork in simulated_client_activity(),
+        simulated_fork_transaction in simulated_fork_transaction(),
         simulated_client_activity_on_source in simulated_client_activity(),
         simulated_client_activity_on_fork in simulated_client_activity(),
         seed in any::<u64>(),
@@ -212,6 +216,7 @@ pub fn forks_stay_isolated<R, F>(
             &runtime,
             new_forkable_store.clone(),
             simulated_client_activity_before_fork,
+            simulated_fork_transaction,
             simulated_client_activity_on_source,
             simulated_client_activity_on_fork,
             seed,
