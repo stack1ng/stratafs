@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 use bytes::Bytes;
@@ -405,74 +404,11 @@ fn binary_search_on_an_empty_list_inserts_at_the_start() {
 }
 
 #[test]
-fn the_midpoint_is_the_index_where_the_front_is_closest_to_half_the_size() {
-    assert_eq!(
-        list_of::<u16>(&[b"aaaa", b"b", b"c", b"dddd"]).n_midpoints_by_size(1),
-        vec![2]
-    );
-    assert_eq!(
-        list_of::<u16>(&[b"aaaaaaaa", b"b", b"c"]).n_midpoints_by_size(1),
-        vec![1]
-    );
-    assert_eq!(
-        list_of::<u16>(&[b"b", b"c", b"aaaaaaaa"]).n_midpoints_by_size(1),
-        vec![2]
-    );
-    assert_eq!(list_of::<u16>(&[b"a"]).n_midpoints_by_size(1), vec![1]);
-    assert_eq!(list_of::<u16>(&[]).n_midpoints_by_size(1), vec![0]);
-}
-
-#[test]
-fn the_size_before_an_index_is_the_data_and_slots_of_the_entries_before_it() {
-    let list = list_of::<u16>(&[b"aa", b"b"]);
-    assert_eq!(list.size_before(0), 0);
-    assert_eq!(list.size_before(1), 4);
-    assert_eq!(list.size_before(2), 7);
-}
-
-#[test]
 fn the_data_before_an_index_is_the_data_of_the_entries_before_it() {
     let list = list_of::<u32>(&[b"aa", b"b"]);
     assert_eq!(list.data_before(0), 0);
     assert_eq!(list.data_before(1), 2);
     assert_eq!(list.data_before(2), 3);
-}
-
-#[test]
-fn n_midpoints_are_the_indices_where_the_front_is_closest_to_each_share_of_the_size() {
-    assert_eq!(
-        list_of::<u16>(&[b"aa", b"bb", b"cc", b"dd", b"ee", b"ff"]).n_midpoints_by_size(2),
-        vec![2, 4]
-    );
-    assert_eq!(
-        list_of::<u16>(&[b"aaaaaaaaaa", b"b", b"c", b"d", b"e"]).n_midpoints_by_size(2),
-        vec![1, 2]
-    );
-    assert_eq!(
-        list_of::<u16>(&[b"a"]).n_midpoints_by_size(0),
-        Vec::<usize>::new()
-    );
-}
-
-fn midpoint_matches_the_index_closest_to_half_the_size<R: AddressableRange>(
-    entries: Vec<Vec<u8>>,
-) -> Result<(), TestCaseError> {
-    let list = list_of::<R>(&entries.iter().map(Vec::as_slice).collect::<Vec<_>>());
-    let mut fronts = vec![0];
-    for entry in &entries {
-        fronts.push(fronts[fronts.len() - 1] + entry.len() + size_of::<R::Stored>());
-    }
-    let total = fronts[fronts.len() - 1];
-    let expected = (0..fronts.len())
-        .min_by_key(|&index| {
-            (
-                fronts[index].abs_diff(total - fronts[index]),
-                Reverse(index),
-            )
-        })
-        .unwrap();
-    prop_assert_eq!(list.n_midpoints_by_size(1), vec![expected]);
-    Ok(())
 }
 
 #[test]
@@ -689,15 +625,6 @@ proptest! {
         edits_match_a_vector_of_entries::<u32>(edits)?;
     }
 
-    #[test]
-    fn u8_midpoint_matches_the_index_closest_to_half_the_size(entries in vec(vec(any::<u8>(), 0..8), 0..16)) {
-        midpoint_matches_the_index_closest_to_half_the_size::<u8>(entries)?;
-    }
-
-    #[test]
-    fn u16_midpoint_matches_the_index_closest_to_half_the_size(entries in vec(vec(any::<u8>(), 0..24), 0..32)) {
-        midpoint_matches_the_index_closest_to_half_the_size::<u16>(entries)?;
-    }
 }
 
 #[test]

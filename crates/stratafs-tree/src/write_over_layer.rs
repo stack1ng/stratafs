@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
 

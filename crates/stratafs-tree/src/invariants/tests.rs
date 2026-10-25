@@ -4,7 +4,7 @@ use zerocopy::little_endian::{U64, U128};
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
-use crate::header::VolumeEpoch;
+use crate::header::{NodeId, VolumeEpoch};
 use crate::node::ObservedNode;
 
 fn leaf_list(keys: &[&[u8]]) -> SlottedList<BytesMut, LeafEntry<u16>, u16> {
@@ -31,10 +31,6 @@ fn observed(id: u128) -> ObservedNode {
     }
 }
 
-fn untyped() -> SlottedList<BytesMut, [u8], u16> {
-    SlottedList::<BytesMut, [u8], u16>::empty()
-}
-
 #[test]
 fn leaf_keys_must_strictly_ascend() {
     assert!(leaf_keys_ascend(&leaf_list(&[])));
@@ -48,65 +44,6 @@ fn separator_keys_must_strictly_ascend() {
     assert!(separator_keys_ascend(&separator_list(&[b"", b"m", b"t"])));
     assert!(!separator_keys_ascend(&separator_list(&[b"", b"t", b"m"])));
     assert!(!separator_keys_ascend(&separator_list(&[b"", b"m", b"m"])));
-}
-
-#[test]
-fn a_plan_must_observe_each_node_once() {
-    let update = |id| {
-        Some(LayerMutationPlanAction::Update {
-            node: observed(id),
-            at: 0,
-            entries: untyped(),
-        })
-    };
-    let delete = |id| {
-        Some(LayerMutationPlanAction::Delete {
-            node: observed(id),
-            at: 0,
-        })
-    };
-    let create = || {
-        Some(LayerMutationPlanAction::Create {
-            separator: Box::from(&b"m"[..]),
-            entries: untyped(),
-        })
-    };
-    let replace = |id| {
-        Some(LayerMutationPlanAction::Replace {
-            node: observed(id),
-            at: 0,
-            separator: Box::from(&b"m"[..]),
-            entries: untyped(),
-        })
-    };
-    assert!(plan_has_at_most_one_action_per_node::<u16>(&[
-        update(1),
-        None
-    ]));
-    assert!(plan_has_at_most_one_action_per_node::<u16>(&[
-        update(1),
-        create()
-    ]));
-    assert!(plan_has_at_most_one_action_per_node::<u16>(&[
-        update(1),
-        delete(2)
-    ]));
-    assert!(!plan_has_at_most_one_action_per_node::<u16>(&[
-        update(1),
-        delete(1)
-    ]));
-    assert!(!plan_has_at_most_one_action_per_node::<u16>(&[
-        update(1),
-        update(1)
-    ]));
-    assert!(plan_has_at_most_one_action_per_node::<u16>(&[
-        update(1),
-        replace(2)
-    ]));
-    assert!(!plan_has_at_most_one_action_per_node::<u16>(&[
-        update(1),
-        replace(1)
-    ]));
 }
 
 fn step(separators: &[&[u8]], position: usize) -> DescentStep<u16, InternalEntry, usize> {

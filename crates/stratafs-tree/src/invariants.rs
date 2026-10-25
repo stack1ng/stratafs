@@ -1,27 +1,9 @@
 use std::cmp::Ordering;
 
-use crate::copy_on_write::LayerMutationPlanAction;
 use crate::descent::DescentStep;
-use crate::header::NodeId;
 use crate::node::{InternalEntry, LeafEntry, NodeKind};
 use crate::slotted::{AddressableRange, SlottedList};
 use crate::write_over_layer::{Layer, LayerNode, LayerSpan};
-
-pub(crate) fn plan_has_at_most_one_action_per_node<R: AddressableRange>(
-    plan: &[Option<LayerMutationPlanAction<R>>],
-) -> bool {
-    let observed = || {
-        plan.iter().flatten().filter_map(|action| match action {
-            LayerMutationPlanAction::Update { node, .. }
-            | LayerMutationPlanAction::Replace { node, .. }
-            | LayerMutationPlanAction::Delete { node, .. } => Some(node.id),
-            LayerMutationPlanAction::Create { .. } => None,
-        })
-    };
-    observed()
-        .enumerate()
-        .all(|(index, id): (usize, NodeId)| observed().skip(index + 1).all(|other| other != id))
-}
 
 pub(crate) fn leaf_keys_ascend<B: AsRef<[u8]>, K: AddressableRange, R: AddressableRange>(
     entries: &SlottedList<B, LeafEntry<K>, R>,
