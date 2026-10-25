@@ -6,9 +6,6 @@ use bytes::Bytes;
 
 use crate::volume_url::VolumeUrl;
 
-// FILE_SYSTEM_NAME is the short name the extension declares in its Info.plist, which mount looks it up by.
-pub const FILE_SYSTEM_NAME: &str = "stratafs";
-
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
     #[error("the command could not be started")]
@@ -17,18 +14,25 @@ pub enum MountError {
     Failed { status: ExitStatus, stderr: String },
 }
 
-// mount mounts the volume on dir through the stratafs FSKit extension, and returns once it is mounted.
-// dir must exist and belong to the user.
-pub fn mount<V: Clone + Into<Bytes>>(url: &VolumeUrl<V>, dir: &Path) -> Result<(), MountError> {
+pub fn mount<V: Clone + Into<Bytes>>(
+    // mount(8)'s -t external_type: https://keith.github.io/xcode-man-pages/mount.8.html#t
+    external_type: &str,
+    volume: V,
+    // mount(8)'s mount_point: https://keith.github.io/xcode-man-pages/mount.8.html#DESCRIPTION
+    mount_point: &Path,
+) -> Result<(), MountError> {
     run(Command::new("/sbin/mount")
-        .args(["-F", "-t", FILE_SYSTEM_NAME])
-        .arg(url.to_string())
-        .arg(dir))
+        .args(["-F", "-t", external_type])
+        .arg(VolumeUrl { volume }.to_string())
+        .arg(mount_point))
 }
 
-// unmount unmounts whatever volume is mounted on dir.
-pub fn unmount(dir: &Path) -> Result<(), MountError> {
-    run(Command::new("/sbin/umount").arg(dir))
+// unmount unmounts whatever volume is mounted on node.
+pub fn unmount(
+    // umount(8)'s node: https://keith.github.io/xcode-man-pages/umount.8.html#DESCRIPTION
+    node: &Path,
+) -> Result<(), MountError> {
+    run(Command::new("/sbin/umount").arg(node))
 }
 
 fn run(command: &mut Command) -> Result<(), MountError> {
