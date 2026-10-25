@@ -214,24 +214,25 @@ pub struct RedbTransaction<'txn, T> {
     committed: &'txn OnceLock<(oneshot::Sender<()>, Shared<oneshot::Receiver<()>>)>,
 }
 
-impl<T> ReadKeyValueTransaction for RedbTransaction<'_, T>
+impl<'txn, T> ReadKeyValueTransaction for RedbTransaction<'txn, T>
 where
     T: ReadableTable<&'static [u8], &'static [u8]> + Send + Sync,
 {
     type Failure = RedbFailure;
     type Observation = RedbObservation;
 
-    async fn get_range(
+    async fn get_range<R: RangeBounds<Bytes> + Send>(
         &self,
-        range: impl RangeBounds<Bytes> + Send,
+        range: R,
         limit: usize,
-    ) -> Result<Vec<(Bytes, Bytes)>, Self::Failure> {
+    ) -> Result<impl Iterator<Item = (Bytes, Bytes)> + Send + use<'txn, T, R>, Self::Failure> {
         assert_valid_range(&range);
         let bounds = (
             range.start_bound().map(|key| &key[..]),
             range.end_bound().map(|key| &key[..]),
         );
-        self.table
+        let entries = self
+            .table
             .range::<&[u8]>(bounds)?
             .take(limit)
             .map(|entry| {
@@ -241,7 +242,8 @@ where
                     Bytes::copy_from_slice(value.value()),
                 ))
             })
-            .collect()
+            .collect::<Result<Vec<_>, Self::Failure>>()?;
+        Ok(entries.into_iter())
     }
 
     async fn observe(&self, key: Bytes) -> Result<RedbObservation, Self::Failure> {

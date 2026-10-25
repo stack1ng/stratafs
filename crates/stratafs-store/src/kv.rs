@@ -138,18 +138,20 @@ pub trait ReadKeyValueTransaction: Send + Sync {
 
     fn get(&self, key: Bytes) -> impl Future<Output = Result<Option<Bytes>, Self::Failure>> + Send {
         async move {
-            let found = self.get_range(&key..=&key, 1).await?;
-            Ok(found.into_iter().next().map(|(_, value)| value))
+            let mut found = self.get_range(&key..=&key, 1).await?;
+            Ok(found.next().map(|(_, value)| value))
         }
     }
 
-    // get_range returns a range of key-value pairs.
+    // get_range returns a range of key-value pairs, owned so they can be used while writing to the transaction.
     // If an inverted (end < start) or fully excluded (start == end == Bound::Excluded) range is provided, the call panics.
-    fn get_range(
+    fn get_range<R: RangeBounds<Bytes> + Send>(
         &self,
-        range: impl RangeBounds<Bytes> + Send,
+        range: R,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<(Bytes, Bytes)>, Self::Failure>> + Send;
+    ) -> impl Future<
+        Output = Result<impl Iterator<Item = (Bytes, Bytes)> + Send + use<Self, R>, Self::Failure>,
+    > + Send;
 
     // observe returns an observation, which can be observed from the store (with changed())
     // to give a future that resolves once this key is in a different state

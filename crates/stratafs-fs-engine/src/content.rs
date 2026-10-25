@@ -132,15 +132,15 @@ where
                     ),
                     1,
                 )
-                .map(|found| found.map(|extents| extents.into_iter().next()));
+                .map(|found| found.map(|mut extents| extents.next()));
             let (directly_in_bounds, indirectly_in_bounds) =
                 join(directly_in_bounds_future, indirectly_in_bounds_future).await;
             let directly_in_bounds = directly_in_bounds.map_err(IoFailure::Metadata)?;
             let indirectly_in_bounds = indirectly_in_bounds.map_err(IoFailure::Metadata)?;
             let mut extents = Vec::with_capacity(
-                directly_in_bounds.len() + usize::from(indirectly_in_bounds.is_some()),
+                directly_in_bounds.size_hint().0 + usize::from(indirectly_in_bounds.is_some()),
             );
-            for (key, value) in directly_in_bounds.into_iter().chain(indirectly_in_bounds) {
+            for (key, value) in directly_in_bounds.chain(indirectly_in_bounds) {
                 let extent_end = content_extent_end(&key).map_err(IoFailure::Corrupt)?;
                 let extent = ExtentValue::from_stored(value).map_err(IoFailure::Corrupt)?;
                 if extent.start >= extent_end {

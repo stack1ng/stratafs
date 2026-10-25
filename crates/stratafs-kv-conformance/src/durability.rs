@@ -287,7 +287,12 @@ pub(crate) async fn read_whole_store<S: KeyValueStore>(
     ));
     let entries = store
         .read_transact(|transaction| {
-            Box::pin(async move { transaction.get_range(.., usize::MAX).await })
+            Box::pin(async move {
+                transaction
+                    .get_range(.., usize::MAX)
+                    .await
+                    .map(|entries| entries.collect::<Vec<_>>())
+            })
         })
         .await
         .map_err(|error| TestCaseError::fail(format!("reading the whole store failed: {error}")))?;

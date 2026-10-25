@@ -328,7 +328,12 @@ async fn measure_suspensions<S: KeyValueStore>(
     let copy = new_store();
     let entries = store
         .read_transact(|transaction| {
-            Box::pin(async move { transaction.get_range(.., usize::MAX).await })
+            Box::pin(async move {
+                transaction
+                    .get_range(.., usize::MAX)
+                    .await
+                    .map(|entries| entries.collect::<Vec<_>>())
+            })
         })
         .await
         .expect("reading the store to copy failed");

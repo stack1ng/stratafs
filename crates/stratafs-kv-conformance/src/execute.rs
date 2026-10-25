@@ -162,7 +162,7 @@ async fn perform_read<T: ReadKeyValueTransaction>(
     Ok(match read {
         SimulatedRead::Get(key) => (Seen::Get(transaction.get(key).await?), None),
         SimulatedRead::GetRange(start, end, limit) => (
-            Seen::GetRange(transaction.get_range((start, end), limit).await?),
+            Seen::GetRange(transaction.get_range((start, end), limit).await?.collect()),
             None,
         ),
         SimulatedRead::Observe(key) => {

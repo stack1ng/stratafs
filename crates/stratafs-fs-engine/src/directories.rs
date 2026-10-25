@@ -187,12 +187,12 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
         dir: Inode,
     ) -> impl Future<Output = Result<bool, IoFailure<T::Failure, C::Failure>>> + Send {
         async move {
-            let entries = self
+            let mut entries = self
                 .metadata
                 .get_range(directory_entries_after(dir, 0), 1)
                 .await
                 .map_err(IoFailure::Metadata)?;
-            Ok(entries.is_empty())
+            Ok(entries.next().is_none())
         }
     }
 
@@ -385,13 +385,13 @@ where
                 return Ok(true);
             }
             if item.parent == dir {
-                let remaining = self
+                let mut remaining = self
                     .metadata
                     .get_range(hard_links_of(inode), 1)
                     .await
                     .map_err(IoFailure::Metadata)?;
-                if let Some((key, _)) = remaining.first() {
-                    item.parent = hard_link_directory(key).map_err(IoFailure::Corrupt)?;
+                if let Some((key, _)) = remaining.next() {
+                    item.parent = hard_link_directory(&key).map_err(IoFailure::Corrupt)?;
                 }
             }
             Ok(false)

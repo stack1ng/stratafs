@@ -140,10 +140,10 @@ fn stored_keys_of(engine: &InMemoryEngine, inode: Inode) -> usize {
             txn.metadata
                 .get_range(every_key_of(inode), usize::MAX)
                 .await
+                .map(|entries| entries.count())
         })
     }))
     .unwrap()
-    .len()
 }
 
 const MISSING: Inode = Inode(5000);
