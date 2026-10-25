@@ -9,7 +9,8 @@ use std::ops::{Bound, Range};
 use bytes::{Buf, Bytes};
 use futures_util::FutureExt;
 use futures_util::future::join;
-use stratafs_store::content::{ContentHash, ContentStore};
+use stratafs_store::content::{ContentHash, ContentStore, GetRejection};
+use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
 use crate::attributes::error::SetattrError;
@@ -98,6 +99,59 @@ enum ContentPiece {
         offset: u64,
         length: u64,
     },
+}
+
+impl ContentLoadPlan {
+    // load returns one future per piece of the read, in file order, each resolving to that piece's bytes.
+    // Holes resolve to zeros straight away. The caller decides how many of them to run at once.
+    pub fn load<C: ContentStore>(
+        self,
+        content: &C,
+    ) -> impl Iterator<
+        Item = impl Future<Output = Result<impl Buf + Send, StoreError<GetRejection, C::Failure>>>
+               + Send,
+    > {
+        let read_end = self.offset + self.size;
+        let mut covered_until = self.offset;
+        self.pieces
+            .into_iter()
+            .map(Some)
+            .chain([None])
+            .flat_map(move |piece| {
+                let range = piece
+                    .as_ref()
+                    .map_or(read_end..read_end, ContentPiece::range);
+                let hole = (covered_until < range.start).then(|| ContentPiece::Inline {
+                    start: covered_until,
+                    content: Bytes::from(vec![0; (range.start - covered_until) as usize]),
+                });
+                covered_until = range.end;
+                hole.into_iter().chain(piece)
+            })
+            .map(move |piece| async move {
+                match piece {
+                    ContentPiece::Inline { content, .. } => Ok(SpillableContent::Inline(content)),
+                    ContentPiece::Stored {
+                        hash,
+                        offset,
+                        length,
+                        ..
+                    } => content
+                        .get(&hash, offset, length)
+                        .await
+                        .map(SpillableContent::Overflow),
+                }
+            })
+    }
+}
+
+impl ContentPiece {
+    fn range(&self) -> Range<u64> {
+        match self {
+            ContentPiece::Inline { start, content } => *start..*start + content.len() as u64,
+            ContentPiece::Stored { start, length, .. } => *start..*start + length,
+        }
+    }
 }
 
 impl<T, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S>

@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 
 use futures_lite::future::block_on;
+use futures_util::future::try_join_all;
 use stratafs_opendal::OpendalError;
 use stratafs_redb::RedbFailure;
 
@@ -926,4 +927,68 @@ fn a_resize_keeps_a_content_change_time_set_by_the_same_update() {
     .unwrap();
     assert_eq!(attributes.settable.content_changed_at, Timestamp(3));
     assert_eq!(attributes.attribute_changed_at, Timestamp(5));
+}
+
+fn loaded(engine: &InMemoryEngine, inode: Inode, offset: u64, size: u64) -> Vec<Bytes> {
+    let plan = plan(engine, inode, offset, size).unwrap();
+    block_on(try_join_all(plan.load(&engine.content)))
+        .unwrap()
+        .into_iter()
+        .map(|mut piece| piece.copy_to_bytes(piece.remaining()))
+        .collect()
+}
+
+#[test]
+fn load_returns_every_piece_in_file_order_with_holes_as_zeros() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let spilled = content_of_length(2000);
+    write(&engine, inode, 0, b"abc").unwrap();
+    write(&engine, inode, 10, &spilled).unwrap();
+    resize(&engine, inode, 2100);
+    let pieces = loaded(&engine, inode, 0, 3000);
+    assert_eq!(
+        pieces,
+        vec![
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(&[0; 7]),
+            spilled,
+            Bytes::from(vec![0; 90]),
+        ]
+    );
+}
+
+#[test]
+fn load_starts_and_ends_inside_pieces_at_the_read_bounds() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let spilled = content_of_length(2000);
+    write(&engine, inode, 0, &spilled).unwrap();
+    write(&engine, inode, 2000, b"tail").unwrap();
+    let pieces = loaded(&engine, inode, 1990, 12);
+    assert_eq!(
+        pieces,
+        vec![spilled.slice(1990..2000), Bytes::from_static(b"ta")]
+    );
+}
+
+#[test]
+fn load_of_a_file_without_content_returns_its_size_in_zeros() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 200_000);
+    assert_eq!(
+        loaded(&engine, inode, 0, 300_000),
+        vec![Bytes::from(vec![0; 200_000])]
+    );
+}
+
+#[test]
+fn load_of_an_empty_read_returns_nothing() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 10);
+    assert_eq!(loaded(&engine, inode, 10, 5), Vec::<Bytes>::new());
 }
