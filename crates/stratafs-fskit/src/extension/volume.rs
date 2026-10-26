@@ -1,3 +1,6 @@
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -6,7 +9,7 @@ use bytes::Bytes;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
 use objc2::{AllocAnyThread, Ivars, Message, define_class, msg_send};
-use objc2_foundation::{NSData, NSError, NSInteger, NSObject, NSString};
+use objc2_foundation::{NSData, NSError, NSInteger, NSObject, NSString, NSURL};
 use objc2_fs_kit::{
     FSActivateResult, FSContext, FSCreateItemResult, FSCreateLinkResult, FSCreateSymlinkResult,
     FSDeactivateOptions, FSDirectoryCookie, FSDirectoryEntryPacker, FSDirectoryVerifier,
@@ -25,9 +28,9 @@ use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{Inode, LARGEST_NAME_LENGTH};
 
 use super::changes::attribute_change;
-use super::item::{StrataItem, name_bytes};
+use super::item::{StrataItem, file_name, name_bytes};
 use super::operations::{Handed, Reply, VolumeOperations};
-use super::{OpenedVolume, errno, identity, posix_error};
+use super::{ActivateError, errno, identity, open_volume, posix_error};
 
 // FILE_SYSTEM_TYPE is the type name statfs reports for a mounted volume.
 const FILE_SYSTEM_TYPE: &str = "stratafs";
@@ -38,11 +41,13 @@ const REPORTED_BYTES: u64 = 1 << 50;
 const BLOCK_SIZE: u64 = 4096;
 
 define_class!(
-    // StrataVolume is the volume FSKit mounts. It forwards each operation to the volume's operations,
-    // which it holds until deactivate.
+    // StrataVolume is the volume FSKit mounts. activate opens it from the store directory, and it
+    // forwards each operation to the volume's operations, which it holds until deactivate.
     #[unsafe(super(FSVolume, NSObject))]
     #[name = "StrataVolume"]
     pub(crate) struct StrataVolume {
+        store: PathBuf,
+        access: Mutex<Option<StoreAccess>>,
         operations: Mutex<Option<Arc<dyn VolumeOperations>>>,
     }
 
@@ -146,26 +151,23 @@ define_class!(
             reply.call(null_mut());
         }
 
-        // activate hands FSKit the root directory.
+        // activate opens the volume mount's options name, and hands FSKit its root directory.
         #[unsafe(method(activateVolumeWithOptions:replyHandler:))]
         fn activate(
             &self,
-            _options: &FSTaskOptions,
+            options: &FSTaskOptions,
             reply: &SendableBlock<'static, fn(*mut FSActivateResult, *mut NSError)>,
         ) {
-            let Some(operations) = self.active_operations() else {
-                return reply.call(null_mut(), deactivated().cast_mut());
-            };
-            let root = operations.items().item(Inode::ROOT, FileType::Directory);
-            // SAFETY: the root is a live item.
-            let result =
-                unsafe { FSActivateResult::initWithRootItem(FSActivateResult::alloc(), &root) }
-                    .expect("an activate result holds any root item");
-            reply.call(Retained::as_ptr(&result).cast_mut(), null_mut());
+            // SAFETY: taskOptions reads the options as strings.
+            let arguments: Vec<String> = unsafe { options.taskOptions() }
+                .iter()
+                .map(|argument| argument.to_string())
+                .collect();
+            self.activate_with(&arguments, reply);
         }
 
         // deactivate is the last call FSKit makes before it kills the process, without releasing the
-        // volume first, so the engine is dropped here or not at all.
+        // volume first, so the engine and the store access are dropped here or not at all.
         #[unsafe(method(deactivateVolumeWithOptions:replyHandler:))]
         fn deactivate(
             &self,
@@ -174,6 +176,12 @@ define_class!(
         ) {
             drop(
                 self.operations()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(),
+            );
+            drop(
+                self.access()
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .take(),
@@ -471,22 +479,54 @@ define_class!(
 unsafe impl FSVolumeCommonOperations for StrataVolume {}
 
 impl StrataVolume {
-    pub(crate) fn new(opened: OpenedVolume) -> Retained<Self> {
-        // SAFETY: FSVolumeIdentifier and FSFileName are plain value objects made from valid arguments.
-        let (volume_id, volume_name) = unsafe {
-            (
-                FSVolumeIdentifier::initWithUUID(
-                    FSVolumeIdentifier::alloc(),
-                    &identity(&opened.id),
-                ),
-                FSFileName::nameWithString(&NSString::from_str(&hex::encode(&opened.id))),
+    // new is the volume for the store directory store, named after it until activate opens a volume.
+    pub(crate) fn new(store: PathBuf, access: StoreAccess) -> Retained<Self> {
+        // SAFETY: FSVolumeIdentifier is a plain value object made from valid arguments.
+        let volume_id = unsafe {
+            FSVolumeIdentifier::initWithUUID(
+                FSVolumeIdentifier::alloc(),
+                &identity(store.as_os_str().as_bytes()),
             )
         };
+        let volume_name = file_name(store_name(&store).as_bytes());
         let this = Self::alloc().set_ivars(Ivars::<Self> {
-            operations: Mutex::new(Some(opened.operations)),
+            store,
+            access: Mutex::new(Some(access)),
+            operations: Mutex::new(None),
         });
         // SAFETY: initWithVolumeID:volumeName: is FSVolume's designated initializer.
         unsafe { msg_send![super(this), initWithVolumeID: &*volume_id, volumeName: &*volume_name] }
+    }
+
+    // activate_with opens the volume arguments name from the store directory, names the volume after it,
+    // and replies with its root directory, as activate does with FSKit's options.
+    pub(crate) fn activate_with(
+        &self,
+        arguments: &[String],
+        reply: &SendableBlock<'static, fn(*mut FSActivateResult, *mut NSError)>,
+    ) {
+        let opened = match open_volume(self.store(), arguments) {
+            Ok(opened) => opened,
+            Err(error) => {
+                let error = posix_error(activate_errno(&error), &error.to_string());
+                return reply.call(null_mut(), Retained::as_ptr(&error).cast_mut());
+            }
+        };
+        let root = opened
+            .operations
+            .items()
+            .item(Inode::ROOT, FileType::Directory);
+        // SAFETY: setName copies the name, and the root is a live item.
+        let result = unsafe {
+            self.setName(&file_name(hex::encode(&opened.id).as_bytes()));
+            FSActivateResult::initWithRootItem(FSActivateResult::alloc(), &root)
+        }
+        .expect("an activate result holds any root item");
+        *self
+            .operations()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(opened.operations);
+        reply.call(Retained::as_ptr(&result).cast_mut(), null_mut());
     }
 
     // active_operations are the volume's operations, until deactivate drops them and the engine with them.
@@ -512,9 +552,45 @@ impl StrataVolume {
     }
 }
 
-// deactivated is the error an operation gets once deactivate has dropped the engine.
+// deactivated is the error an operation gets before activate opens the engine or after deactivate drops it.
 fn deactivated() -> *const NSError {
-    Retained::autorelease_ptr(posix_error(libc::ENXIO, "the volume has been deactivated"))
+    Retained::autorelease_ptr(posix_error(libc::ENXIO, "the volume is not active"))
+}
+
+fn activate_errno(error: &ActivateError) -> libc::c_int {
+    match error {
+        ActivateError::UnreadableOptions(_) | ActivateError::InvalidOptions(_) => libc::EINVAL,
+        ActivateError::OpenFailed { posix, .. } => errno(*posix),
+    }
+}
+
+// store_name is the name of the store directory, or its whole path when it has none, such as /.
+pub(crate) fn store_name(store: &Path) -> &OsStr {
+    store.file_name().unwrap_or(store.as_os_str())
+}
+
+// StoreAccess is the sandbox's access to the store directory FSKit handed the extension, which lasts until
+// it is dropped. Starting it does nothing for a URL that carries no access, such as outside a sandbox.
+pub(crate) struct StoreAccess {
+    url: Retained<NSURL>,
+    started: bool,
+}
+
+impl StoreAccess {
+    pub(crate) fn start(url: Retained<NSURL>) -> Self {
+        // SAFETY: starting access reads the URL's security scope, if it has one.
+        let started = unsafe { url.startAccessingSecurityScopedResource() };
+        StoreAccess { url, started }
+    }
+}
+
+impl Drop for StoreAccess {
+    fn drop(&mut self) {
+        if self.started {
+            // SAFETY: access was started on this URL, so it is stopped once.
+            unsafe { self.url.stopAccessingSecurityScopedResource() };
+        }
+    }
 }
 
 fn invalid_offset<R: Message>(reply: &SendableBlock<'static, fn(*mut R, *mut NSError)>) {

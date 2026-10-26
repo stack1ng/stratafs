@@ -8,6 +8,7 @@ use stratafs_store::kv::SetRejection;
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PosixError {
+    EBUSY,
     EEXIST,
     EFBIG,
     EINVAL,

@@ -1,19 +1,19 @@
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::ptr;
 
 use block2::SendableBlock;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
 use objc2::{AllocAnyThread, define_class};
-use objc2_foundation::{NSError, NSObject, NSString};
+use objc2_foundation::{NSError, NSObject, NSString, NSURL};
 use objc2_fs_kit::{
-    FSContainerIdentifier, FSContainerStatus, FSFileSystemBase, FSGenericURLResource,
-    FSProbeResult, FSResource, FSTaskOptions, FSUnaryFileSystem, FSUnaryFileSystemOperations,
-    FSVolume,
+    FSContainerIdentifier, FSContainerStatus, FSFileSystemBase, FSPathURLResource, FSProbeResult,
+    FSResource, FSTaskOptions, FSUnaryFileSystem, FSUnaryFileSystemOperations, FSVolume,
 };
 
-use super::volume::StrataVolume;
-use super::{LoadError, identity, open_volume, posix_error};
-use crate::volume_url::VolumeUrl;
+use super::volume::{StoreAccess, StrataVolume, store_name};
+use super::{LoadError, identity, posix_error};
 
 define_class!(
     // StrataFileSystem is the principal class the extension's Info.plist names. FSKit makes one per process.
@@ -24,27 +24,22 @@ define_class!(
     unsafe impl NSObjectProtocol for StrataFileSystem {}
 
     unsafe impl FSUnaryFileSystemOperations for StrataFileSystem {
-        // probeResource says whether a resource is a volume URL. Mounting a URL skips the probe,
-        // so this only answers tools that ask.
+        // probeResource says whether a resource is a path a store directory can be at. The store's
+        // contents are the extension binary's to judge, when activate opens it.
         #[unsafe(method(probeResource:replyHandler:))]
         fn probe_resource(
             &self,
             resource: &FSResource,
             reply: &SendableBlock<'static, fn(*mut FSProbeResult, *mut NSError)>,
         ) {
-            let volume_id = url_of(resource).and_then(|url| {
-                url.parse::<VolumeUrl<bytes::Bytes>>()
-                    .map(|url| url.volume)
-                    .map_err(|error| LoadError::InvalidUrl(Box::new(error)))
-            });
             // SAFETY: the probe results are made from valid arguments.
             let result = unsafe {
-                match volume_id {
-                    Ok(volume_id) => FSProbeResult::usableProbeResultWithName_containerID(
-                        &NSString::from_str(&hex::encode(&volume_id)),
+                match store_of(resource) {
+                    Ok((_, store)) => FSProbeResult::usableProbeResultWithName_containerID(
+                        &NSString::from_str(&store_name(&store).to_string_lossy()),
                         &FSContainerIdentifier::initWithUUID(
                             FSContainerIdentifier::alloc(),
-                            &identity(&volume_id),
+                            &identity(store.as_os_str().as_bytes()),
                         ),
                     ),
                     Err(_) => FSProbeResult::notRecognizedProbeResult(),
@@ -53,7 +48,8 @@ define_class!(
             reply.call(Retained::as_ptr(&result).cast_mut(), ptr::null_mut());
         }
 
-        // loadResource opens the volume the mount URL names, and replies with it.
+        // loadResource takes the store directory mount was given, and replies with the volume. mount hands
+        // its options to activate, not here, so the volume opens its store when FSKit activates it.
         #[unsafe(method(loadResource:options:replyHandler:))]
         fn load_resource(
             &self,
@@ -61,9 +57,10 @@ define_class!(
             _options: &FSTaskOptions,
             reply: &SendableBlock<'static, fn(*mut FSVolume, *mut NSError)>,
         ) {
-            match url_of(resource).and_then(|url| open_volume(&url)) {
-                Ok(opened) => {
-                    let volume = Retained::into_super(StrataVolume::new(opened));
+            match store_of(resource) {
+                Ok((url, store)) => {
+                    let volume =
+                        Retained::into_super(StrataVolume::new(store, StoreAccess::start(url)));
                     // SAFETY: setting the container status to ready is what FSKit expects before the reply.
                     unsafe { self.setContainerStatus(&FSContainerStatus::ready()) };
                     reply.call(Retained::as_ptr(&volume).cast_mut(), ptr::null_mut());
@@ -90,21 +87,20 @@ define_class!(
     }
 );
 
-fn url_of(resource: &FSResource) -> Result<String, LoadError> {
+// store_of is the store directory a path resource names, as its URL and as a path.
+fn store_of(resource: &FSResource) -> Result<(Retained<NSURL>, PathBuf), LoadError> {
     let resource = resource
-        .downcast_ref::<FSGenericURLResource>()
-        .ok_or(LoadError::NoUrl)?;
-    // SAFETY: a generic URL resource always has a URL.
+        .downcast_ref::<FSPathURLResource>()
+        .ok_or(LoadError::NotAPath)?;
+    // SAFETY: a path URL resource always has a URL.
     let url = unsafe { resource.url() };
-    url.absoluteString()
-        .map(|url| url.to_string())
-        .ok_or(LoadError::NoUrl)
+    let store = url.to_file_path().ok_or(LoadError::NotAPath)?;
+    Ok((url, store))
 }
 
 fn ns_error(error: &LoadError) -> Retained<NSError> {
     let errno = match error {
-        LoadError::NoUrl | LoadError::InvalidUrl(_) => libc::EINVAL,
-        LoadError::OpenFailed(_) => libc::EIO,
+        LoadError::NotAPath => libc::EINVAL,
     };
     posix_error(errno, &error.to_string())
 }

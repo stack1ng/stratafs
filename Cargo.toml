@@ -17,6 +17,7 @@ block2 = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc046
 blocking = "1.7"
 bytes = "1.12"
 cfg_aliases = "0.2"
+clap = { version = "4.6", features = ["derive"] }
 equivalent = "1.0"
 event-listener = "5.4"
 foldhash = "0.2"

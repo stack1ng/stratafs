@@ -10,6 +10,7 @@ license.workspace = true
 extension = [
     "dep:blake3",
     "dep:block2",
+    "dep:clap",
     "dep:futures-lite",
     "dep:futures-util",
     "dep:libc",
@@ -24,6 +25,7 @@ extension = [
 [dependencies]
 blake3 = { workspace = true, optional = true }
 block2 = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
 bytes.workspace = true
 futures-lite = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }

@@ -10,9 +10,11 @@ mod volume;
 use std::error::Error;
 use std::ffi::{CString, c_char, c_int};
 use std::os::unix::ffi::OsStringExt;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use clap::Parser;
 use futures_lite::future::block_on;
 use futures_util::task::Spawn;
 use objc2::ClassType;
@@ -27,13 +29,13 @@ use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
 use stratafs_store::content::ContentStore;
 use stratafs_store::kv::KeyValueStore;
 
-use crate::volume_url::VolumeUrl;
+use crate::mount_options::MountOptions;
 use file_system::StrataFileSystem;
 use items::Items;
 use operations::{Volume, VolumeOperations};
 use volume::StrataVolume;
 
-// OpenedVolume is a loaded volume: its id, and its operations on the engine the extension binary opened.
+// OpenedVolume is an activated volume: its id, and its operations on the engine the extension binary opened.
 pub(crate) struct OpenedVolume {
     id: Bytes,
     operations: Arc<dyn VolumeOperations>,
@@ -41,28 +43,47 @@ pub(crate) struct OpenedVolume {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LoadError {
-    #[error("the resource is not a URL")]
-    NoUrl,
-    #[error("the URL does not name a volume: {0}")]
-    InvalidUrl(Box<dyn Error + Send + Sync>),
-    #[error("the volume could not be opened: {0}")]
-    OpenFailed(Box<dyn Error + Send + Sync>),
+    #[error("the resource is not the path of a store directory")]
+    NotAPath,
 }
 
-type OpenVolume = Box<dyn Fn(&str) -> Result<OpenedVolume, LoadError> + Send + Sync>;
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ActivateError {
+    #[error("the mount options could not be read: {0}")]
+    UnreadableOptions(#[source] clap::Error),
+    #[error(transparent)]
+    InvalidOptions(Box<dyn Error + Send + Sync>),
+    #[error("the volume could not be opened: {source}")]
+    OpenFailed {
+        posix: PosixError,
+        source: Box<dyn Error + Send + Sync>,
+    },
+}
 
-// OPEN_VOLUME is how loadResource opens a volume. It is the one static: NSExtensionMain creates
+// ActivateArguments are the options FSKit hands activate: each -o mount was given.
+#[derive(Parser)]
+#[command(no_binary_name = true)]
+struct ActivateArguments {
+    #[arg(short = 'o')]
+    options: Vec<String>,
+}
+
+type OpenVolume =
+    Box<dyn Fn(&Path, &[String]) -> Result<OpenedVolume, ActivateError> + Send + Sync>;
+
+// OPEN_VOLUME is how activate opens a volume. It is the one static: NSExtensionMain creates
 // StrataFileSystem itself, with no arguments, so this is the only way run's arguments reach it.
 // Everything loadResource builds from here on gets what it needs passed in.
 static OPEN_VOLUME: OnceLock<OpenVolume> = OnceLock::new();
 
 // run starts the FSKit extension and never returns. The extension binary's main calls it.
-// When FSKit loads a mounted volume, run's open_volume opens it from its volume id.
+// When FSKit activates a mounted volume, run's open_volume opens it from the store directory mount was
+// given and the volume its -o volume option names. Its errors reach mount as the POSIX errors they stand for.
 // FSKit hands every operation over on one thread and does not wait for the reply, so each operation
 // runs on spawner, which must run on threads of its own: NSExtensionMain keeps the main thread.
 pub fn run<V, M, C, A, N, S, F>(
     spawner: impl Spawn + Send + Sync + 'static,
-    open_volume: impl AsyncFn(V) -> Result<FsEngine<M, C, A, N, S>, F> + Send + Sync + 'static,
+    open_volume: impl AsyncFn(&Path, V) -> Result<FsEngine<M, C, A, N, S>, F> + Send + Sync + 'static,
 ) -> !
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
@@ -72,6 +93,7 @@ where
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
     F: Error + Send + Sync + 'static,
+    for<'e> PosixError: From<&'e F>,
 {
     if OPEN_VOLUME.set(opener(spawner, open_volume)).is_err() {
         panic!("run is called once per extension process");
@@ -93,11 +115,11 @@ where
     std::process::exit(status)
 }
 
-// opener wraps open_volume so it takes a mount URL and returns the volume as FSKit's classes hold it,
-// running its operations on spawner.
+// opener wraps open_volume so it takes the store directory and activate's options, and returns the volume
+// as FSKit's classes hold it, running its operations on spawner.
 fn opener<V, M, C, A, N, S, F>(
     spawner: impl Spawn + Send + Sync + 'static,
-    open_volume: impl AsyncFn(V) -> Result<FsEngine<M, C, A, N, S>, F> + Send + Sync + 'static,
+    open_volume: impl AsyncFn(&Path, V) -> Result<FsEngine<M, C, A, N, S>, F> + Send + Sync + 'static,
 ) -> OpenVolume
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
@@ -107,15 +129,24 @@ where
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
     F: Error + Send + Sync + 'static,
+    for<'e> PosixError: From<&'e F>,
 {
     let spawner: Arc<dyn Spawn + Send + Sync> = Arc::new(spawner);
-    Box::new(move |url| {
-        let url: VolumeUrl<V> = url
+    Box::new(move |store, arguments| {
+        let arguments = ActivateArguments::try_parse_from(arguments)
+            .map_err(ActivateError::UnreadableOptions)?;
+        let options: MountOptions<V> = arguments
+            .options
+            .join(",")
             .parse()
-            .map_err(|error| LoadError::InvalidUrl(Box::new(error)))?;
-        let id = url.volume.clone().into();
-        let engine = block_on(open_volume(url.volume))
-            .map_err(|error| LoadError::OpenFailed(Box::new(error)))?;
+            .map_err(|error| ActivateError::InvalidOptions(Box::new(error)))?;
+        let id = options.volume.clone().into();
+        let engine = block_on(open_volume(store, options.volume)).map_err(|error| {
+            ActivateError::OpenFailed {
+                posix: PosixError::from(&error),
+                source: Box::new(error),
+            }
+        })?;
         Ok(OpenedVolume {
             id,
             operations: Arc::new(Volume {
@@ -127,16 +158,20 @@ where
     })
 }
 
-pub(crate) fn open_volume(url: &str) -> Result<OpenedVolume, LoadError> {
+pub(crate) fn open_volume(
+    store: &Path,
+    arguments: &[String],
+) -> Result<OpenedVolume, ActivateError> {
     let open = OPEN_VOLUME
         .get()
         .expect("run stores the volume opener before FSKit can call in");
-    open(url)
+    open(store, arguments)
 }
 
 // errno is a POSIX error's number on macOS.
 pub(crate) fn errno(error: PosixError) -> c_int {
     match error {
+        PosixError::EBUSY => libc::EBUSY,
         PosixError::EEXIST => libc::EEXIST,
         PosixError::EFBIG => libc::EFBIG,
         PosixError::EINVAL => libc::EINVAL,
@@ -169,11 +204,12 @@ pub(crate) fn posix_error(errno: c_int, description: &str) -> Retained<NSError> 
     }
 }
 
-// identity is the UUID FSKit knows a volume by, the same for every mount of it.
+// identity is the UUID FSKit knows a volume or its store by, made from bytes that name it, the same for
+// every mount.
 // It goes through the UUID's string form, since NSUUID::from_bytes fails objc2's argument checks
 // on current macOS (see its documentation).
-pub(crate) fn identity(volume_id: &[u8]) -> Retained<NSUUID> {
-    let hash = blake3::hash(volume_id);
+pub(crate) fn identity(name: &[u8]) -> Retained<NSUUID> {
+    let hash = blake3::hash(name);
     let (uuid, _) = hash
         .as_bytes()
         .split_first_chunk::<16>()

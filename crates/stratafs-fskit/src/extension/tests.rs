@@ -1,4 +1,5 @@
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
@@ -10,10 +11,10 @@ use objc2::encode::RefEncode;
 use objc2::{AllocAnyThread, msg_send};
 use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_fs_kit::{
-    FSContext, FSCreateItemResult, FSDeactivateOptions, FSGenericURLResource,
+    FSActivateResult, FSContext, FSCreateItemResult, FSDeactivateOptions, FSGenericURLResource,
     FSGetAttributesResult, FSItemAttribute, FSItemGetAttributesRequest, FSItemID,
-    FSItemSetAttributesRequest, FSItemType, FSSetAttributesResult, FSTaskOptions,
-    FSUnaryFileSystemOperations, FSVolume, FSVolumeHandler,
+    FSItemSetAttributesRequest, FSItemType, FSPathURLResource, FSResource, FSSetAttributesResult,
+    FSTaskOptions, FSUnaryFileSystemOperations, FSVolume, FSVolumeHandler,
 };
 use opendal::Operator;
 use redb::backends::InMemoryBackend;
@@ -66,18 +67,54 @@ impl Spawn for ThreadSpawner {
     }
 }
 
-// install sets up what run would, once per test process. A volume id of ff fails to open.
+#[derive(Debug, thiserror::Error)]
+enum TestOpenError {
+    #[error("the store is down")]
+    Down,
+    #[error("the store is open in another mount")]
+    Busy,
+    #[error("the store is not the test store: {0}")]
+    WrongStore(PathBuf),
+    #[error(transparent)]
+    Engine(io::Error),
+}
+
+impl From<&TestOpenError> for PosixError {
+    fn from(error: &TestOpenError) -> Self {
+        match error {
+            TestOpenError::Busy => PosixError::EBUSY,
+            TestOpenError::Down | TestOpenError::WrongStore(_) | TestOpenError::Engine(_) => {
+                PosixError::EIO
+            }
+        }
+    }
+}
+
+// store is the store directory the tests mount. Opening only checks it is the directory that was mounted.
+fn store() -> PathBuf {
+    std::env::temp_dir()
+}
+
+// install sets up what run would, once per test process. A volume id of ff fails to open, and bb is
+// open in another mount.
 fn install() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
         assert!(
             OPEN_VOLUME
-                .set(opener(ThreadSpawner, async |volume: Bytes| {
-                    match &volume[..] {
-                        [0xff] => Err(io::Error::other("the store is down")),
-                        _ => new_engine().await,
+                .set(opener(
+                    ThreadSpawner,
+                    async |mounted: &Path, volume: Bytes| {
+                        if mounted != store() {
+                            return Err(TestOpenError::WrongStore(mounted.to_owned()));
+                        }
+                        match &volume[..] {
+                            [0xff] => Err(TestOpenError::Down),
+                            [0xbb] => Err(TestOpenError::Busy),
+                            _ => new_engine().await.map_err(TestOpenError::Engine),
+                        }
                     }
-                }))
+                ))
                 .is_ok()
         );
     });
@@ -98,8 +135,19 @@ fn error_of(error: *mut NSError) -> (isize, String) {
 // Loaded is what loadResource replied: the volume's address, or the error's code and description.
 type Loaded = Result<usize, (isize, String)>;
 
+fn store_resource() -> Retained<FSResource> {
+    let url = NSURL::from_directory_path(store()).expect("the temporary directory is a path");
+    // SAFETY: the URL is a file URL.
+    let resource =
+        unsafe { FSPathURLResource::initWithURL_writable(FSPathURLResource::alloc(), &url, true) };
+    Retained::into_super(resource)
+}
+
 // load calls loadResource, and returns the volume it replied with, or its error's code and description.
-fn load(file_system: &StrataFileSystem, url: &str) -> Result<Retained<FSVolume>, (isize, String)> {
+fn load(
+    file_system: &StrataFileSystem,
+    resource: &FSResource,
+) -> Result<Retained<FSVolume>, (isize, String)> {
     // The volume crosses the reply as an address, since a reply block must be Send and a volume is not.
     let replied: Arc<Mutex<Option<Loaded>>> = Arc::default();
     let reply = RcBlock::<fn(*mut FSVolume, *mut NSError), dyn Send + Sync>::new({
@@ -114,11 +162,9 @@ fn load(file_system: &StrataFileSystem, url: &str) -> Result<Retained<FSVolume>,
     });
     // SAFETY: the resource, options and reply are all valid for the call.
     unsafe {
-        let url = NSURL::URLWithString(&NSString::from_str(url)).expect("the test URL is valid");
-        let resource = FSGenericURLResource::initWithURL(FSGenericURLResource::alloc(), &url);
         // FSTaskOptions has no public initializer, so the test makes one with NSObject's.
         let options: Retained<FSTaskOptions> = msg_send![FSTaskOptions::alloc(), init];
-        file_system.loadResource_options_replyHandler(&resource, &options, &reply);
+        file_system.loadResource_options_replyHandler(resource, &options, &reply);
     }
     let result = replied
         .lock()
@@ -157,6 +203,31 @@ fn strata_volume(volume: &FSVolume) -> &StrataVolume {
 fn context() -> Retained<FSContext> {
     // SAFETY: init is NSObject's initializer, which FSContext inherits.
     unsafe { msg_send![FSContext::alloc(), init] }
+}
+
+// activate activates a loaded volume as FSKit would with arguments as its options, and returns what it
+// replied.
+fn activate(volume: &FSVolume, arguments: &[&str]) -> Replied {
+    let (reply, replied) = reply::<FSActivateResult>();
+    let arguments: Vec<String> = arguments
+        .iter()
+        .map(|argument| argument.to_string())
+        .collect();
+    strata_volume(volume).activate_with(&arguments, &reply);
+    replied.recv_timeout(Duration::from_secs(10)).unwrap()
+}
+
+// mounted is the volume volume loaded from the test store and activated.
+fn mounted(volume: &str) -> Retained<FSVolume> {
+    let volume_option = format!("volume={volume}");
+    let loaded = load(&new_file_system(), &store_resource()).expect("the store loads");
+    assert_eq!(activate(&loaded, &["-o", &volume_option]), Ok(()));
+    loaded
+}
+
+fn name_of(volume: &FSVolume) -> Option<String> {
+    // SAFETY: a volume always has a name.
+    unsafe { volume.name().string() }.map(|name| name.to_string())
 }
 
 // get_attributes calls getAttributes on an inode, and returns a receiver that gets what it replied.
@@ -218,28 +289,68 @@ fn create_file(
 }
 
 #[test]
-fn load_resource_opens_the_volume_its_url_names_or_replies_why_not() {
+fn load_resource_takes_a_store_directory_and_refuses_any_other_resource() {
     let file_system = new_file_system();
-    let volume = load(&file_system, "stratavolume://ab01").expect("the volume loads");
-    // SAFETY: a volume always has a name.
-    let name = unsafe { volume.name().string() }.map(|name| name.to_string());
-    assert_eq!(name.as_deref(), Some("ab01"));
+    let volume = load(&file_system, &store_resource()).expect("the store loads");
+    assert_eq!(
+        name_of(&volume).as_deref(),
+        store().file_name().and_then(|name| name.to_str())
+    );
+    // SAFETY: the URL is valid.
+    let url_resource = unsafe {
+        let url =
+            NSURL::URLWithString(&NSString::from_str("https://ab01")).expect("the URL is valid");
+        Retained::into_super(FSGenericURLResource::initWithURL(
+            FSGenericURLResource::alloc(),
+            &url,
+        ))
+    };
     assert!(matches!(
-        load(&file_system, "https://ab01"),
+        load(&file_system, &url_resource),
         Err((code, description))
-            if code == libc::EINVAL as isize && description.contains("does not name a volume")
+            if code == libc::EINVAL as isize && description.contains("not the path of a store directory")
     ));
+}
+
+#[test]
+fn activate_opens_the_volume_its_options_name_or_replies_why_not() {
+    let volume = mounted("ab01");
+    assert_eq!(name_of(&volume).as_deref(), Some("ab01"));
+    for (arguments, errno, message) in [
+        (&[][..], libc::EINVAL, "no volume was given"),
+        (&["-o", "volume=zz"], libc::EINVAL, "not hex"),
+        (
+            &["-o", "volume=ab01,rdonly"],
+            libc::EINVAL,
+            "rdonly is not a mount option",
+        ),
+        (&["-x"], libc::EINVAL, "could not be read"),
+        (&["-o", "volume=ff"], libc::EIO, "the store is down"),
+        (&["-o", "volume=bb"], libc::EBUSY, "open in another mount"),
+    ] {
+        let loaded = load(&new_file_system(), &store_resource()).expect("the store loads");
+        assert!(
+            matches!(
+                activate(&loaded, arguments),
+                Err((code, description)) if code == errno as isize && description.contains(message)
+            ),
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn operations_before_activate_reply_that_the_volume_is_not_active() {
+    let loaded = load(&new_file_system(), &store_resource()).expect("the store loads");
     assert!(matches!(
-        load(&file_system, "stratavolume://ff"),
-        Err((code, description))
-            if code == libc::EIO as isize && description.contains("the store is down")
+        get_attributes(&loaded, Inode::ROOT).recv_timeout(Duration::from_secs(10)).unwrap(),
+        Err((code, description)) if code == libc::ENXIO as isize && description.contains("not active")
     ));
 }
 
 #[test]
 fn get_attributes_replies_until_the_volume_is_deactivated() {
-    let file_system = new_file_system();
-    let volume = load(&file_system, "stratavolume://ab02").expect("the volume loads");
+    let volume = mounted("ab02");
     let replied = |inode| {
         get_attributes(&volume, inode)
             .recv_timeout(Duration::from_secs(10))
@@ -420,8 +531,7 @@ fn an_attribute_change_without_flags_keeps_the_restrictions_and_hints() {
 
 #[test]
 fn set_attributes_and_create_refuse_flags_the_volume_does_not_store() {
-    let file_system = new_file_system();
-    let volume = load(&file_system, "stratavolume://ab03").expect("the volume loads");
+    let volume = mounted("ab03");
     let replied =
         |replies: Receiver<Replied>| replies.recv_timeout(Duration::from_secs(10)).unwrap();
     let not_supported =
