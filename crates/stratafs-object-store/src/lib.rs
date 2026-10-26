@@ -18,6 +18,8 @@ pub enum ObjectStoreError {
     Store(#[from] object_store::Error),
     #[error("the content directory could not be made")]
     Directory(#[source] io::Error),
+    #[error("the content could not be flushed to the disk")]
+    Flush(#[source] io::Error),
 }
 
 // ObjectStoreContentStore keeps each blob in an object_store store, under its BLAKE3 hash.
@@ -52,10 +54,11 @@ impl ObjectStoreContentStore {
         let path = object_path(&hash);
         if !self.stored_object_matches(&path, &hash, len).await? {
             self.store.put(&path, PutPayload::from_iter(chunks)).await?;
-            #[cfg(disk)]
-            if let Some(unflushed) = &self.unflushed {
-                unflushed.record(&path);
-            }
+        }
+        // A blob that was already there is recorded too, since nothing says that copy reached the disk.
+        #[cfg(disk)]
+        if let Some(unflushed) = &self.unflushed {
+            unflushed.record(&path);
         }
         Ok(hash)
     }
@@ -139,6 +142,18 @@ impl ContentStore for ObjectStoreContentStore {
         size: u64,
     ) -> impl Future<Output = Result<Bytes, StoreError<GetRejection, Self::Failure>>> + Send {
         self.load(*hash, offset, size)
+    }
+
+    async fn ensure_durable(&self) -> Result<(), Self::Failure> {
+        #[cfg(disk)]
+        if let Some(unflushed) = &self.unflushed {
+            // The flush waits on the disk, so it runs on a thread of its own while this yields.
+            let unflushed = Arc::clone(unflushed);
+            blocking::unblock(move || unflushed.flush())
+                .await
+                .map_err(ObjectStoreError::Flush)?;
+        }
+        Ok(())
     }
 }
 

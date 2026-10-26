@@ -5,6 +5,7 @@ use std::task::{Context, Waker};
 
 use block2::RcBlock;
 use bytes::{Buf, Bytes};
+use futures_lite::future::block_on;
 use futures_util::future::{join, try_join_all};
 use futures_util::task::{Spawn, SpawnExt};
 use objc2::rc::Retained;
@@ -35,6 +36,9 @@ use super::{errno, posix_error};
 
 // Reply is an FSKit reply block, copied so an operation can call it once it finishes.
 pub(crate) type Reply<R> = RcBlock<'static, fn(*mut R, *mut NSError), dyn Send + Sync>;
+
+// ErrorReply is an FSKit reply block that carries only an error, which is nil on success.
+pub(crate) type ErrorReply = RcBlock<'static, fn(*mut NSError), dyn Send + Sync>;
 
 // Handed carries an object FSKit handed an operation to fill, such as a directory entry packer or a read
 // buffer, to the thread the operation finishes on.
@@ -155,14 +159,42 @@ pub(crate) trait VolumeOperations: Send + Sync {
     );
 
     fn list_xattrs(self: Arc<Self>, inode: Inode, reply: Reply<FSListXattrsResult>);
+
+    // ensure_durable makes every committed operation durable. With wait it replies once they are; without it,
+    // it replies at once and lets that finish on its own.
+    fn ensure_durable(self: Arc<Self>, wait: bool, reply: ErrorReply);
 }
 
 // Volume is a mounted volume's engine. Each operation replies when it finishes, on FSKit's thread unless it
 // has to wait, and then on spawner.
-pub(crate) struct Volume<M, C, A, N, S> {
+pub(crate) struct Volume<M, C, A, N, S>
+where
+    M: KeyValueStore,
+    C: ContentStore + 'static,
+    A: Fn() -> u64 + Send + Sync + 'static,
+    N: Fn() -> Timestamp + Send + Sync + 'static,
+    S: FsConfig,
+{
     pub(crate) engine: FsEngine<M, C, A, N, S>,
     pub(crate) spawner: Arc<dyn Spawn + Send + Sync>,
     pub(crate) items: Items,
+}
+
+// Closing the engine's metadata store makes every commit durable, so dropping the volume, which happens after its
+// last operation, first makes the content those commits name durable.
+impl<M, C, A, N, S> Drop for Volume<M, C, A, N, S>
+where
+    M: KeyValueStore,
+    C: ContentStore + 'static,
+    A: Fn() -> u64 + Send + Sync + 'static,
+    N: Fn() -> Timestamp + Send + Sync + 'static,
+    S: FsConfig,
+{
+    fn drop(&mut self) {
+        if let Err(error) = block_on(self.engine.ensure_durable()) {
+            tracing::warn!(%error, "making the volume durable before closing it failed");
+        }
+    }
 }
 
 // RenameFailure is why a rename's transaction failed: looking up the destination, finding something other
@@ -912,12 +944,36 @@ where
             }
         });
     }
+
+    fn ensure_durable(self: Arc<Self>, wait: bool, reply: ErrorReply) {
+        if !wait {
+            reply.call(null_mut());
+        }
+        self.run(move |volume| async move {
+            match (volume.engine.ensure_durable().await, wait) {
+                (Ok(()), true) => reply.call(null_mut()),
+                (Err(error), true) => {
+                    let error = posix_error(errno(PosixError::EIO), &error.to_string());
+                    reply.call(Retained::as_ptr(&error).cast_mut());
+                }
+                (Ok(()), false) => {}
+                (Err(error), false) => tracing::warn!(%error, "making the volume durable failed"),
+            }
+        });
+    }
 }
 
-impl<M, C, A, N, S> Volume<M, C, A, N, S> {
+impl<M, C, A, N, S> Volume<M, C, A, N, S>
+where
+    M: KeyValueStore,
+    C: ContentStore + 'static,
+    A: Fn() -> u64 + Send + Sync + 'static,
+    N: Fn() -> Timestamp + Send + Sync + 'static,
+    S: FsConfig,
+{
     // run runs an operation, handing it the volume, on FSKit's thread until it finishes or has to wait, such
-    // as on a commit that flushes. An operation that has to wait finishes on the spawner, so FSKit can hand
-    // over the next one meanwhile.
+    // as while the store makes commits durable. An operation that has to wait finishes on the spawner, so
+    // FSKit can hand over the next one meanwhile.
     fn run<O: Future<Output = ()> + Send + 'static>(
         self: Arc<Self>,
         operation: impl FnOnce(Arc<Self>) -> O,

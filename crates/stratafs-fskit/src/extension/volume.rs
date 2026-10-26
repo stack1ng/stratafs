@@ -140,15 +140,21 @@ define_class!(
             reply.call();
         }
 
-        // synchronize has nothing to flush: every operation is durable once its transaction commits.
+        // synchronize makes every committed operation durable, replying at once when FSKit asks it not to wait.
         #[unsafe(method(synchronizeWithFlags:replyHandler:))]
         fn synchronize(
             &self,
             flags: FSSyncFlags,
             reply: &SendableBlock<'static, fn(*mut NSError)>,
         ) {
-            tracing::info!(flags = flags.0, "synchronize");
-            reply.call(null_mut());
+            let reply = reply.copy();
+            match self.active_operations() {
+                Some(operations) => {
+                    operations.ensure_durable(flags.0 & FSSyncFlags::NoWait.0 == 0, reply)
+                }
+                // With no engine open, nothing committed waits to be made durable.
+                None => reply.call(null_mut()),
+            }
         }
 
         #[unsafe(method(reclaimItem:replyHandler:))]

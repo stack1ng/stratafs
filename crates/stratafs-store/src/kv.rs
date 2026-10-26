@@ -67,6 +67,9 @@ pub trait KeyValueStore: Send + Sync + 'static {
         key: Bytes,
         seen: Option<Bytes>,
     ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
+
+    // ensure_durable makes every transaction committed before it is called durable, and resolves once they are.
+    fn ensure_durable(&self) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }
 
 // TransactionHandle gives work its transaction by value, so a store can wrap another store's transaction in its own without allocating.

@@ -32,11 +32,6 @@ struct Configuration {
     merge_below_percent: Option<u8>,
     #[arg(long, help = "The largest entry the engine keeps inline, in bytes")]
     largest_inline_entry: Option<u32>,
-    #[arg(
-        long,
-        help = "How often commits reach the disk: every-commit, never, or milliseconds to flush at most once in"
-    )]
-    durability: Option<String>,
 }
 
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister";
@@ -83,10 +78,6 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
             configuration
                 .largest_inline_entry
                 .map(|value| value.to_string()),
-        ),
-        (
-            "STRATAFS_BENCH_DURABILITY",
-            configuration.durability.clone(),
         ),
     ] {
         match value {

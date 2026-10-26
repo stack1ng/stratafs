@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
 use stratafs_kv_conformance::runtime::{exhaustive_dfs, seeded};
-use stratafs_redb::{CommitDurability, Inline, RedbStore};
+use stratafs_redb::{Inline, RedbStore};
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_tree::header::TreeVolumeId;
@@ -35,7 +35,7 @@ fn new_tree<C: TreeConfig>() -> Tree<RedbStore<Inline>, impl Fn() -> u128, C> {
     let next_id = AtomicU64::new(1);
     let allocate_id = move || u128::from(next_id.fetch_add(1, Ordering::Relaxed));
     block_on(Tree::new(
-        RedbStore::new(database, Inline, CommitDurability::EveryCommit, || Ok(())).unwrap(),
+        RedbStore::new(database, Inline).unwrap(),
         allocate_id,
     ))
     .unwrap()

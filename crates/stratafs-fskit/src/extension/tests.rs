@@ -15,7 +15,7 @@ use objc2_fs_kit::{
     FSActivateResult, FSContext, FSCreateItemResult, FSDeactivateOptions, FSGenericURLResource,
     FSGetAttributesResult, FSItemAttribute, FSItemGetAttributesRequest, FSItemID,
     FSItemSetAttributesRequest, FSItemType, FSPathURLResource, FSResource, FSSetAttributesResult,
-    FSTaskOptions, FSUnaryFileSystemOperations, FSVolume, FSVolumeHandler,
+    FSSyncFlags, FSTaskOptions, FSUnaryFileSystemOperations, FSVolume, FSVolumeHandler,
 };
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
@@ -24,7 +24,7 @@ use stratafs_fs_engine::attributes::{
 };
 use stratafs_fs_engine::{FsConfig, FsEngine, Inode, Timestamp};
 use stratafs_object_store::ObjectStoreContentStore;
-use stratafs_redb::{CommitDurability, RedbStore, SpawnBlocking};
+use stratafs_redb::{RedbStore, SpawnBlocking};
 
 use super::changes::attribute_change;
 use super::item::{StrataItem, file_name, flags_of, item_attributes, restrictions_and_hints};
@@ -46,7 +46,7 @@ type TestEngine = FsEngine<
 >;
 
 // SimulatedThreadPool yields before it does the work, as a thread pool does when the work is not done by the
-// first poll, so every commit that flushes makes its operation wait.
+// first poll, so making commits durable makes its operation wait.
 struct SimulatedThreadPool;
 
 impl SpawnBlocking for SimulatedThreadPool {
@@ -66,13 +66,7 @@ async fn new_engine() -> Result<TestEngine, io::Error> {
     let allocate_inode: fn() -> u64 = || 7;
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
     FsEngine::new(
-        RedbStore::new(
-            database,
-            SimulatedThreadPool,
-            CommitDurability::EveryCommit,
-            || Ok(()),
-        )
-        .map_err(io::Error::other)?,
+        RedbStore::new(database, SimulatedThreadPool).map_err(io::Error::other)?,
         ObjectStoreContentStore::new(InMemory::new()),
         allocate_inode,
         now,
@@ -600,21 +594,9 @@ fn set_attributes_and_create_refuse_flags_the_volume_does_not_store() {
 }
 
 #[test]
-fn an_operation_replies_on_fskits_thread_unless_it_waits_on_a_flushing_commit() {
+fn an_operation_replies_on_fskits_thread_unless_it_waits_to_be_made_durable() {
     let volume = mounted("ab04");
-    // getAttributes only reads, so it replies before the call returns, on the thread that called it.
-    let (reply, replied) = replying_thread::<FSGetAttributesResult>();
-    // SAFETY: the request, item, context and reply are all valid for the call.
-    unsafe {
-        strata_volume(&volume).getAttributes_ofItem_context_replyHandler(
-            &FSItemGetAttributesRequest::new(),
-            &StrataItem::new(Inode::ROOT, FileType::Directory),
-            &context(),
-            &reply,
-        );
-    }
-    assert_eq!(replied.try_recv(), Ok(thread::current().id()));
-    // setAttributes commits, and every commit flushes in the test store, so it finishes on the spawner.
+    // setAttributes commits in memory, so it replies before the call returns, on the thread that called it.
     let (reply, replied) = replying_thread::<FSSetAttributesResult>();
     // SAFETY: the request, item, context and reply are all valid for the call.
     unsafe {
@@ -625,8 +607,36 @@ fn an_operation_replies_on_fskits_thread_unless_it_waits_on_a_flushing_commit() 
             &reply,
         );
     }
+    assert_eq!(replied.try_recv(), Ok(thread::current().id()));
+    // synchronize waits while the store takes that commit to the disk, so it finishes on the spawner.
+    let (replied, received) = channel();
+    let reply = RcBlock::<fn(*mut NSError), dyn Send + Sync>::new(move |_error: *mut NSError| {
+        replied.send(thread::current().id()).unwrap();
+    });
+    // SAFETY: the reply is valid for the call.
+    unsafe { strata_volume(&volume).synchronizeWithFlags_replyHandler(FSSyncFlags::Wait, &reply) };
     assert_ne!(
-        replied.recv_timeout(Duration::from_secs(10)).unwrap(),
+        received.recv_timeout(Duration::from_secs(10)).unwrap(),
         thread::current().id()
     );
+}
+
+#[test]
+fn synchronize_replies_that_the_volume_is_durable() {
+    let volume = mounted("ab05");
+    for flags in [FSSyncFlags::NoWait, FSSyncFlags::Wait] {
+        let (replied, received) = channel();
+        let reply =
+            RcBlock::<fn(*mut NSError), dyn Send + Sync>::new(move |error: *mut NSError| {
+                replied.send(error.is_null()).unwrap();
+            });
+        // SAFETY: the reply is valid for the call.
+        unsafe { strata_volume(&volume).synchronizeWithFlags_replyHandler(flags, &reply) };
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "{}",
+            flags.0
+        );
+    }
 }

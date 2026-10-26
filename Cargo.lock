@@ -105,6 +105,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-lock"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1510,6 +1521,7 @@ dependencies = [
 name = "stratafs-fs-engine"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "bitflags",
  "bytes",
  "futures-core",
@@ -1582,6 +1594,7 @@ name = "stratafs-object-store"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "blocking",
  "bytes",
  "cfg_aliases",
  "futures-lite",
@@ -1617,7 +1630,6 @@ dependencies = [
  "stratafs-kv-conformance",
  "stratafs-store",
  "thiserror",
- "web-time",
 ]
 
 [[package]]

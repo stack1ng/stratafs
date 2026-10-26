@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-lock.workspace = true
 bitflags.workspace = true
 bytes.workspace = true
 futures-core.workspace = true

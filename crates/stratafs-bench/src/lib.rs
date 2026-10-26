@@ -5,12 +5,12 @@ pub mod suite;
 
 use std::io;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
 use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
-use stratafs_redb::{CommitDurability, RedbStore, ThreadPool};
+use stratafs_redb::{RedbStore, ThreadPool};
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::kv::{KeyValueStore, TransactError};
@@ -36,10 +36,6 @@ impl FsConfig for BenchFsConfig {
     const LARGEST_INLINE_ENTRY: usize =
         number(option_env!("STRATAFS_BENCH_LARGEST_INLINE_ENTRY"), 4 * 1024);
 }
-
-// DURABILITY is how often commits reach the disk: every-commit, never, or a number of milliseconds to flush at
-// most once in.
-pub const DURABILITY: CommitDurability = durability(option_env!("STRATAFS_BENCH_DURABILITY"));
 
 type Metadata = RedbStore<ThreadPool>;
 type MetadataRejection = <Metadata as KeyValueStore>::Rejection;
@@ -130,12 +126,7 @@ pub async fn open_store(directory: &Path) -> Result<Store, OpenStoreError> {
             redb::DatabaseError::DatabaseAlreadyOpen => OpenStoreError::AlreadyOpen,
             error => OpenStoreError::Database(error),
         })?;
-    // Content reaches the disk on the metadata's cadence, just before the metadata that names it.
-    let flushed_content = content.clone();
-    let metadata = RedbStore::new(database, ThreadPool, DURABILITY, move || {
-        flushed_content.flush()
-    })
-    .map_err(OpenStoreError::Table)?;
+    let metadata = RedbStore::new(database, ThreadPool).map_err(OpenStoreError::Table)?;
     let allocate_node: fn() -> u128 = rand::random;
     let tree = Tree::new(metadata, allocate_node)
         .await
@@ -209,17 +200,4 @@ const fn number(setting: Option<&str>, default: usize) -> usize {
         index += 1;
     }
     value
-}
-
-const fn durability(setting: Option<&str>) -> CommitDurability {
-    match setting {
-        None => CommitDurability::EveryCommit,
-        Some(setting) => match setting.as_bytes() {
-            b"every-commit" => CommitDurability::EveryCommit,
-            b"never" => CommitDurability::Never,
-            _ => CommitDurability::AtMostEvery(Duration::from_millis(
-                number(Some(setting), 0) as u64
-            )),
-        },
-    }
 }

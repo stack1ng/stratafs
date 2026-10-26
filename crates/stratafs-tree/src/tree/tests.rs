@@ -1,6 +1,6 @@
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
-use stratafs_redb::{CommitDurability, Inline, RedbStore};
+use stratafs_redb::{Inline, RedbStore};
 
 use super::*;
 use crate::node::Node;
@@ -36,7 +36,7 @@ fn memory_store() -> RedbStore<Inline> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
-    RedbStore::new(database, Inline, CommitDurability::EveryCommit, || Ok(())).unwrap()
+    RedbStore::new(database, Inline).unwrap()
 }
 
 fn into_store<S: KeyValueStore, A, C>(tree: Tree<S, A, C>) -> S {

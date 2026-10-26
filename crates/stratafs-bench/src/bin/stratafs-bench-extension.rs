@@ -18,7 +18,7 @@ fn main() {
         tracing::error!(%panic, "panicked");
         std::process::abort();
     }));
-    // Operations that have to wait, such as on a commit that flushes, finish on the pool's threads.
+    // Operations that have to wait, such as while commits are made durable, finish on the pool's threads.
     let pool = ThreadPool::new().expect("the operating system starts the pool's threads");
     stratafs_fskit::extension::run(pool, stratafs_bench::open_volume)
 }

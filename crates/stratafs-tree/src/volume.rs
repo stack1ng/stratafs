@@ -190,6 +190,11 @@ where
     async fn changed(&self, key: Bytes, seen: Option<Bytes>) -> Result<(), Self::Failure> {
         self.branch_changed(key, seen).await
     }
+
+    // ensure_durable makes the whole store durable, since every volume shares it.
+    async fn ensure_durable(&self) -> Result<(), Self::Failure> {
+        Ok(self.shared.store.ensure_durable().await?)
+    }
 }
 
 impl<'txn, T, S, A, C> ReadKeyValueTransaction for TreeTransaction<'txn, T, S, A, C>

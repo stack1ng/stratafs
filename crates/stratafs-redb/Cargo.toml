@@ -13,7 +13,6 @@ redb = "4.4.0"
 stratafs-keyed-notify.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
-web-time.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 blocking.workspace = true

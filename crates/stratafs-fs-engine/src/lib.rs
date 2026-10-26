@@ -1,10 +1,13 @@
 use std::marker::PhantomData;
 
+use async_lock::RwLock;
 use futures_core::future::BoxFuture;
 use storekey::{BorrowDecode, Encode};
 use stratafs_store::content::ContentStore;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
+
+use crate::error::IoFailure;
 
 pub mod annotations;
 pub mod attributes;
@@ -30,6 +33,9 @@ pub struct FsEngine<M, C, A, N, S> {
     content: C,
     allocate_inode: A,
     now: N,
+    // writing is held by every write transaction together, and by ensure_durable alone, so no transaction
+    // commits between ensure_durable making the content durable and making the metadata durable.
+    writing: RwLock<()>,
     config: PhantomData<S>,
 }
 
@@ -96,6 +102,7 @@ where
                 content,
                 allocate_inode,
                 now,
+                writing: RwLock::new(()),
                 config: PhantomData,
             };
             engine
@@ -111,6 +118,28 @@ where
     }
 }
 
+impl<M: KeyValueStore, C: ContentStore, A: Sync, N: Sync, S: Sync> FsEngine<M, C, A, N, S> {
+    // ensure_durable makes every transaction committed before it is called durable, and resolves once they are.
+    // The content goes first, so durable metadata never names content that is not.
+    // It returns `impl Future + Send` instead of being `async fn` for the reason spillable.rs gives.
+    #[allow(clippy::manual_async_fn)]
+    pub fn ensure_durable(
+        &self,
+    ) -> impl Future<Output = Result<(), IoFailure<M::Failure, C::Failure>>> + Send {
+        async move {
+            let _alone = self.writing.write().await;
+            self.content
+                .ensure_durable()
+                .await
+                .map_err(IoFailure::ContentWrite)?;
+            self.metadata
+                .ensure_durable()
+                .await
+                .map_err(IoFailure::Metadata)
+        }
+    }
+}
+
 impl<M, C, A, N, S> FsEngine<M, C, A, N, S> {
     // content is the content store, which loads a read's ContentLoadPlan once the read's transaction ends.
     pub fn content(&self) -> &C {
@@ -120,7 +149,8 @@ impl<M, C, A, N, S> FsEngine<M, C, A, N, S> {
 
 impl<M: KeyValueStore, C: Sync, A: Sync, N: Sync, S: FsConfig> FsEngine<M, C, A, N, S> {
     // transact runs work in a transaction. When work succeeds it hands its transaction back with its result.
-    #[allow(clippy::type_complexity)]
+    // It returns `impl Future + Send` instead of being `async fn` for the reason spillable.rs gives.
+    #[allow(clippy::type_complexity, clippy::manual_async_fn)]
     pub fn transact<'engine, T: Send + 'engine, E: Send + 'engine>(
         &'engine self,
         mut work: impl for<'txn> FnMut(
@@ -136,13 +166,18 @@ impl<M: KeyValueStore, C: Sync, A: Sync, N: Sync, S: FsConfig> FsEngine<M, C, A,
             >,
         > + Send,
     ) -> impl Future<Output = Result<T, TransactError<M::Rejection, M::Failure, E>>> + Send {
-        self.metadata.transact(move |metadata| {
-            let working = work(self.transaction(metadata));
-            Box::pin(async move {
-                let (result, transaction) = working.await?;
-                Ok((result, transaction.metadata))
-            })
-        })
+        async move {
+            let _together = self.writing.read().await;
+            self.metadata
+                .transact(move |metadata| {
+                    let working = work(self.transaction(metadata));
+                    Box::pin(async move {
+                        let (result, transaction) = working.await?;
+                        Ok((result, transaction.metadata))
+                    })
+                })
+                .await
+        }
     }
 
     pub fn read_transact<'engine, T: Send, E: Send>(

@@ -80,7 +80,7 @@ static OPEN_VOLUME: OnceLock<OpenVolume> = OnceLock::new();
 // When FSKit activates a mounted volume, run's open_volume opens it from the store directory mount was
 // given and the volume its -o volume option names. Its errors reach mount as the POSIX errors they stand for.
 // FSKit hands every operation over on one thread and does not wait for the reply. Each operation runs on
-// that thread until it finishes or yields, as a store does while it waits on a commit that flushes, and then
+// that thread until it finishes or yields, as a store does while it waits for the disk to make commits durable, and then
 // finishes on spawner, so FSKit can hand over the next one. Store work that blocks without yielding, such as
 // file IO on this machine's disk, holds up that thread. spawner must run on threads of its own:
 // NSExtensionMain keeps the main thread.

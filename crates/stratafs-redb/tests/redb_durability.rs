@@ -1,13 +1,17 @@
 mod common;
 
+use std::convert::Infallible;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use common::SimulatedThreadPool;
+use futures_lite::future::block_on;
 use redb::StorageBackend;
 use stratafs_kv_conformance::durability::CrashableStorage;
 use stratafs_kv_conformance::runtime::seeded;
 use stratafs_redb::RedbStore;
+use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
 
 #[test]
 fn is_durable() {
@@ -116,4 +120,41 @@ fn new_crashable_store() -> (RedbStore<SimulatedThreadPool>, CrashableMemory) {
 
 fn reopen_crashed_store(storage: CrashableMemory) -> RedbStore<SimulatedThreadPool> {
     common::open_store(storage.synced_copy())
+}
+
+#[test]
+fn what_ensure_durable_made_durable_survives_a_crash() {
+    let storage = CrashableMemory::default();
+    let store = common::open_store(storage.clone());
+    set(&store, b"made durable");
+    block_on(store.ensure_durable()).unwrap();
+    set(&store, b"left unflushed");
+    let reopened = reopen_crashed_store(storage);
+    assert_eq!(
+        get(&reopened, b"made durable"),
+        Some(Bytes::from_static(b"value"))
+    );
+    // The crash loses the commit nothing made durable, which shows the store really crashed.
+    assert_eq!(get(&reopened, b"left unflushed"), None);
+}
+
+fn set(store: &RedbStore<SimulatedThreadPool>, key: &'static [u8]) {
+    block_on(store.transact(|mut transaction| {
+        Box::pin(async move {
+            transaction
+                .set(Bytes::from_static(key), &b"value"[..])
+                .unwrap();
+            Ok::<_, Infallible>(((), transaction))
+        })
+    }))
+    .unwrap();
+}
+
+fn get(store: &RedbStore<SimulatedThreadPool>, key: &'static [u8]) -> Option<Bytes> {
+    block_on(store.read_transact(|transaction| {
+        Box::pin(async move {
+            Ok::<_, Infallible>(transaction.get(Bytes::from_static(key)).await.unwrap())
+        })
+    }))
+    .unwrap()
 }

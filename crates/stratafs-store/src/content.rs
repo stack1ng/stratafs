@@ -40,4 +40,8 @@ pub trait ContentStore: Send + Sync {
         offset: u64,
         size: u64,
     ) -> impl Future<Output = Result<Self::Content, StoreError<GetRejection, Self::Failure>>> + Send;
+
+    // ensure_durable makes every put that finished before it is called durable, and resolves once they are.
+    // A store whose puts are durable when put returns has nothing to do.
+    fn ensure_durable(&self) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }

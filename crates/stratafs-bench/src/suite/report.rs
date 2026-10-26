@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::suite::SuiteError;
 use crate::suite::config::Config;
-use crate::{BenchFsConfig, BenchTreeConfig, DURABILITY};
+use crate::{BenchFsConfig, BenchTreeConfig};
 use stratafs_fs_engine::FsConfig;
 use stratafs_tree::tree::TreeConfig;
 
@@ -29,11 +29,10 @@ pub fn write_environment(results: &Path, config: &Config) -> Result<(), SuiteErr
     }
     writeln!(
         environment,
-        "stratafs build: node capacity {}, merge below {}%, largest inline entry {}, durability {:?}",
+        "stratafs build: node capacity {}, merge below {}%, largest inline entry {}",
         BenchTreeConfig::NODE_CAPACITY,
         BenchTreeConfig::MERGE_BELOW_PERCENT,
         BenchFsConfig::LARGEST_INLINE_ENTRY,
-        DURABILITY,
     )
     .expect("writing to a string succeeds");
     writeln!(

@@ -1,7 +1,5 @@
-use std::io;
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
@@ -10,7 +8,6 @@ use redb::{
     CommitError, Database, Durability, Error, ReadOnlyTable, ReadableDatabase, ReadableTable,
     StorageError, Table, TableDefinition, TableError, TransactionError,
 };
-use web_time::Instant;
 
 use stratafs_keyed_notify::KeyedNotify;
 use stratafs_store::error::StoreError;
@@ -62,20 +59,6 @@ pub enum RedbFailure {
     Table(#[from] TableError),
     #[error(transparent)]
     Commit(#[from] CommitError),
-    #[error("what the commit depends on could not be flushed first")]
-    FlushFirst(#[source] io::Error),
-}
-
-// CommitDurability is how often commits reach the disk, each of which costs a full flush. A commit that does
-// not reach it is lost if the machine stops before a later commit does, or before the store closes cleanly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitDurability {
-    EveryCommit,
-    // AtMostEvery flushes a commit once the last flushed one is at least this old, so writes that stop
-    // stay unflushed until the next commit or the close.
-    AtMostEvery(Duration),
-    // Never flushes only when the store closes.
-    Never,
 }
 
 pub struct RedbStore<S> {
@@ -83,25 +66,17 @@ pub struct RedbStore<S> {
     writer: Mutex<Writer>,
     notify: Arc<KeyedNotify>,
     spawner: S,
-    durability: CommitDurability,
-    flush_first: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
 }
 
 // Writer is what the one write transaction at a time keeps between commits.
 struct Writer {
     written: Vec<Bytes>,
-    last_flushed_at: Option<Instant>,
+    // unflushed_commits is whether a commit since the last ensure_durable has not reached the disk.
+    unflushed_commits: bool,
 }
 
 impl<S> RedbStore<S> {
-    // flush_first makes durable whatever the store's commits depend on that is kept elsewhere, such as the
-    // content their values name. It runs before every commit that reaches the disk, including the close.
-    pub fn new(
-        database: Database,
-        spawner: S,
-        durability: CommitDurability,
-        flush_first: impl Fn() -> io::Result<()> + Send + Sync + 'static,
-    ) -> Result<Self, Error> {
+    pub fn new(database: Database, spawner: S) -> Result<Self, Error> {
         let transaction = database.begin_write()?;
         transaction.open_table(TABLE)?;
         transaction.commit()?;
@@ -109,21 +84,11 @@ impl<S> RedbStore<S> {
             database,
             writer: Mutex::new(Writer {
                 written: Vec::new(),
-                last_flushed_at: None,
+                unflushed_commits: false,
             }),
             notify: Arc::new(KeyedNotify::new()),
             spawner,
-            durability,
-            flush_first: Arc::new(flush_first),
         })
-    }
-}
-
-impl<S> Drop for RedbStore<S> {
-    fn drop(&mut self) {
-        // Closing the database flushes every commit, so what they depend on is flushed first. Nothing is left to
-        // report a failure to; the commits are then flushed regardless, as redb's close does.
-        let _ = (self.flush_first)();
     }
 }
 
@@ -149,19 +114,10 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
         writer.written.clear();
         let result: Result<Result<T, E>, RedbFailure> = async {
             let mut transaction = self.database.begin_write()?;
-            let flushes = match self.durability {
-                CommitDurability::EveryCommit => true,
-                CommitDurability::AtMostEvery(interval) => writer
-                    .last_flushed_at
-                    .is_none_or(|flushed_at| flushed_at.elapsed() >= interval),
-                CommitDurability::Never => false,
-            };
+            // A commit reaches the disk through ensure_durable, so it finishes here. Only the rare commit that grows
+            // the file waits on the disk, since redb flushes the file when it grows it.
             transaction
-                .set_durability(if flushes {
-                    Durability::Immediate
-                } else {
-                    Durability::None
-                })
+                .set_durability(Durability::None)
                 .expect("the store makes no persistent savepoints, so it may set any durability");
             let output = work(TransactionHandle::new(RedbTransaction {
                 table: transaction.open_table(TABLE)?,
@@ -176,35 +132,9 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                     return Ok(Err(error));
                 }
             };
-            let notify = self.notify.clone();
-            let flush_first = self.flush_first.clone();
-            let keys = std::mem::take(&mut writer.written);
-            let commit = move || {
-                let flushed_first = if flushes {
-                    flush_first().map_err(RedbFailure::FlushFirst)
-                } else {
-                    Ok(())
-                };
-                let commit =
-                    flushed_first.and_then(|()| transaction.commit().map_err(RedbFailure::Commit));
-                if commit.is_ok() {
-                    notify.notify_waiters(&keys);
-                }
-                (commit, keys)
-            };
-            // Only a commit that flushes always waits on the disk, so only it goes to the spawner. Any other
-            // commit almost always stays in memory and finishes faster here than the handoff would take; it
-            // touches the disk only in the rare commit that grows the file, which redb flushes.
-            let (commit, keys) = if flushes {
-                self.spawner.spawn_blocking(commit).await
-            } else {
-                commit()
-            };
-            writer.written = keys;
-            commit?;
-            if flushes {
-                writer.last_flushed_at = Some(Instant::now());
-            }
+            transaction.commit()?;
+            writer.unflushed_commits = true;
+            self.notify.notify_waiters(&writer.written);
             Ok(Ok(output))
         }
         .await;
@@ -249,6 +179,24 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                 Ok(current.as_ref().map(|value| value.value()) != seen.as_deref())
             })
             .await
+    }
+
+    async fn ensure_durable(&self) -> Result<(), Self::Failure> {
+        let mut writer = self.writer.lock().await;
+        if !writer.unflushed_commits {
+            return Ok(());
+        }
+        // An empty commit that reaches the disk takes every commit before it there too. It waits on the disk,
+        // so it goes to the spawner.
+        let mut transaction = self.database.begin_write()?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .expect("the store makes no persistent savepoints, so it may set any durability");
+        self.spawner
+            .spawn_blocking(move || transaction.commit())
+            .await?;
+        writer.unflushed_commits = false;
+        Ok(())
     }
 }
 

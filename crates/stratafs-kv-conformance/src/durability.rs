@@ -243,7 +243,19 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
             return Ok(());
         }
         match result {
-            Ok(outcome) => history.lock().unwrap().push(Event::Returned(id, outcome)),
+            Ok(outcome) => {
+                // A store only promises a transaction survives once ensure_durable returns after it.
+                let durable = store.ensure_durable().await;
+                if crashed() {
+                    return Ok(());
+                }
+                if let Err(failure) = durable {
+                    return Err(TestCaseError::fail(format!(
+                        "the store failed to make a transaction durable: {failure}"
+                    )));
+                }
+                history.lock().unwrap().push(Event::Returned(id, outcome));
+            }
             Err(TransactError::Failed(failure)) => {
                 return Err(TestCaseError::fail(format!(
                     "the store failed a transaction: {failure}"
