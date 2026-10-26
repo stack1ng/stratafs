@@ -146,7 +146,7 @@ fn get_attributes(volume: &FSVolume, inode: Inode) -> Receiver<Result<(), (isize
         let context: Retained<FSContext> = msg_send![FSContext::alloc(), init];
         volume.getAttributes_ofItem_context_replyHandler(
             &FSItemGetAttributesRequest::new(),
-            &StrataItem::new(inode),
+            &StrataItem::new(inode, stratafs_fs_engine::attributes::FileType::File),
             &context,
             &reply,
         );

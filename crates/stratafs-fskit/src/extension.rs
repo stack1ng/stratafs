@@ -1,9 +1,10 @@
 #![allow(unsafe_code)]
 
+mod changes;
 mod file_system;
 mod item;
+mod items;
 mod operations;
-mod snapshots;
 mod volume;
 
 use std::error::Error;
@@ -28,8 +29,8 @@ use stratafs_store::kv::KeyValueStore;
 
 use crate::volume_url::VolumeUrl;
 use file_system::StrataFileSystem;
+use items::Items;
 use operations::{Volume, VolumeOperations};
-use snapshots::Snapshots;
 use volume::StrataVolume;
 
 // OpenedVolume is a loaded volume: its id, and its operations on the engine the extension binary opened.
@@ -120,7 +121,7 @@ where
             operations: Arc::new(Volume {
                 engine,
                 spawner: spawner.clone(),
-                snapshots: Snapshots::default(),
+                items: Items::default(),
             }),
         })
     })

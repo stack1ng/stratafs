@@ -1,35 +1,42 @@
+use bytes::Bytes;
 use libc::timespec;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
 use objc2::{AllocAnyThread, Encode, Encoding, Ivars, define_class, msg_send};
-use objc2_foundation::NSObject;
-use objc2_fs_kit::{FSItem, FSItemAttributes, FSItemID, FSItemType};
+use objc2_foundation::{NSData, NSObject};
+use objc2_fs_kit::{FSFileName, FSItem, FSItemAttributes, FSItemID, FSItemType};
 use stratafs_fs_engine::attributes::{Attributes, FileType};
 use stratafs_fs_engine::{Inode, Timestamp};
 
 define_class!(
-    // StrataItem is an item FSKit holds on to, naming the inode it stands for.
+    // StrataItem is an item FSKit holds on to, naming the inode it stands for and that inode's type, which
+    // never changes.
     #[unsafe(super(FSItem, NSObject))]
     #[name = "StrataItem"]
     pub(crate) struct StrataItem {
-        inode: Inode,
+        pub(crate) inode: Inode,
+        pub(crate) kind: FileType,
     }
 
     unsafe impl NSObjectProtocol for StrataItem {}
 );
 
+// SAFETY: a StrataItem's only state is its inode and type, which never change after it is made, and FSKit
+// itself hands items between threads.
+unsafe impl Send for StrataItem {}
+unsafe impl Sync for StrataItem {}
+
 impl StrataItem {
-    pub(crate) fn new(inode: Inode) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(Ivars::<Self> { inode });
+    pub(crate) fn new(inode: Inode, kind: FileType) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(Ivars::<Self> { inode, kind });
         // SAFETY: init is NSObject's initializer, which FSItem inherits.
         unsafe { msg_send![super(this), init] }
     }
 
-    pub(crate) fn inode_of(item: &FSItem) -> Inode {
-        *item
-            .downcast_ref::<Self>()
+    // of is FSKit's item as the StrataItem this volume made it as.
+    pub(crate) fn of(item: &FSItem) -> &Self {
+        item.downcast_ref::<Self>()
             .expect("FSKit only hands back items this volume made")
-            .inode()
     }
 }
 
@@ -76,7 +83,7 @@ pub(crate) fn item_attributes(inode: Inode, attributes: &Attributes) -> Retained
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-struct Time(timespec);
+pub(crate) struct Time(timespec);
 
 // SAFETY: timespec is two C longs on macOS, which is how Objective-C encodes it.
 unsafe impl Encode for Time {
@@ -90,4 +97,26 @@ fn time(timestamp: Timestamp) -> Time {
         tv_sec: timestamp.0.div_euclid(NANOSECONDS),
         tv_nsec: timestamp.0.rem_euclid(NANOSECONDS),
     })
+}
+
+// timestamp is a timespec as a Timestamp, nanoseconds since the Unix epoch.
+pub(crate) fn timestamp(time: Time) -> Timestamp {
+    Timestamp(
+        time.0
+            .tv_sec
+            .saturating_mul(1_000_000_000)
+            .saturating_add(time.0.tv_nsec),
+    )
+}
+
+// name_bytes is an FSKit file name as the engine takes it.
+pub(crate) fn name_bytes(name: &FSFileName) -> Bytes {
+    // SAFETY: data reads the name's bytes.
+    Bytes::from(unsafe { name.data() }.to_vec())
+}
+
+// file_name is an engine name as FSKit takes it.
+pub(crate) fn file_name(name: &[u8]) -> Retained<FSFileName> {
+    // SAFETY: nameWithData copies the bytes.
+    unsafe { FSFileName::nameWithData(&NSData::with_bytes(name)) }
 }
