@@ -3,7 +3,7 @@ use std::pin::pin;
 use futures_lite::future::{block_on, poll_once};
 
 use super::*;
-use crate::attributes::SetXattrMode;
+use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::directories::NewItem;
 use crate::test_support::{InMemoryEngine, new_test_engine};
 
@@ -54,14 +54,19 @@ fn a_watch_resolves_at_once_when_seen_is_already_stale() {
 }
 
 #[test]
-fn an_extended_attribute_change_resolves_a_watch() {
+fn an_annotation_change_resolves_a_watch() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"watched");
     let changed = engine.changed(inode, &seen);
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
             let result = txn
-                .setxattr(inode, b"user.a", &b"1"[..], SetXattrMode::Create)
+                .set_annotation(
+                    inode,
+                    AnnotationKey::Portable(b"a"),
+                    &b"1"[..],
+                    SetAnnotationMode::Create,
+                )
                 .await;
             result.map(|result| (result, txn))
         })

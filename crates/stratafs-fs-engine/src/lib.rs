@@ -6,6 +6,7 @@ use stratafs_store::content::ContentStore;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
 
+pub mod annotations;
 pub mod attributes;
 pub mod content;
 pub mod directories;
@@ -107,6 +108,13 @@ where
                 .await?;
             Ok(engine)
         }
+    }
+}
+
+impl<M, C, A, N, S> FsEngine<M, C, A, N, S> {
+    // content is the content store, which loads a read's ContentLoadPlan once the read's transaction ends.
+    pub fn content(&self) -> &C {
+        &self.content
     }
 }
 

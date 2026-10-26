@@ -5,6 +5,7 @@ use bytes::Bytes;
 use storekey::{BorrowDecode, Encode};
 
 use crate::Inode;
+use crate::annotations::{AnnotationKey, AnnotationScope};
 use crate::error::CorruptValue;
 
 #[derive(Encode, BorrowDecode)]
@@ -17,11 +18,32 @@ pub(crate) struct FsKey<'a> {
 #[derive(Encode, BorrowDecode)]
 pub(crate) enum KeyKind<'a> {
     Attributes,
-    ExtendedAttribute(Cow<'a, [u8]>),
+    Annotation(StoredAnnotationKey<'a>),
     DirectoryEntry(u64),
     HardLink { dir: Inode, position: u64 },
     SymbolicLinkTarget,
     ContentExtent { end: u64 },
+}
+
+#[derive(Encode, BorrowDecode)]
+pub(crate) enum StoredAnnotationKey<'a> {
+    Portable(Cow<'a, [u8]>),
+    Platform {
+        platform: Cow<'a, [u8]>,
+        name: Cow<'a, [u8]>,
+    },
+}
+
+impl<'a> From<AnnotationKey<'a>> for StoredAnnotationKey<'a> {
+    fn from(key: AnnotationKey<'a>) -> Self {
+        match key {
+            AnnotationKey::Portable(name) => StoredAnnotationKey::Portable(Cow::Borrowed(name)),
+            AnnotationKey::Platform { platform, name } => StoredAnnotationKey::Platform {
+                platform: Cow::Borrowed(platform),
+                name: Cow::Borrowed(name),
+            },
+        }
+    }
 }
 
 const INODE_AND_KIND_LENGTH: usize = size_of::<u64>() + 1;
@@ -34,10 +56,10 @@ impl<'a> FsKey<'a> {
         }
     }
 
-    pub(crate) fn new_extended_attribute(inode: Inode, name: &'a [u8]) -> Self {
+    pub(crate) fn new_annotation(inode: Inode, key: AnnotationKey<'a>) -> Self {
         FsKey {
             inode,
-            kind: KeyKind::ExtendedAttribute(Cow::Borrowed(name)),
+            kind: KeyKind::Annotation(key.into()),
         }
     }
 
@@ -79,24 +101,36 @@ impl From<FsKey<'_>> for Bytes {
     }
 }
 
-fn after_every_key_of_kind(key: &[u8]) -> Bytes {
-    let mut after = key[..INODE_AND_KIND_LENGTH].to_vec();
-    let kind = after
-        .last_mut()
-        .expect("an encoded key starts with its inode and then its kind's tag");
-    *kind = kind
+fn after_every_key_starting_with(prefix: &[u8]) -> Bytes {
+    let mut after = prefix.to_vec();
+    let last = after.last_mut().expect("a key prefix is not empty");
+    *last = last
         .checked_add(1)
-        .expect("a key kind's tag is below the largest byte");
+        .expect("a key prefix ends in a tag or terminator below the largest byte");
     Bytes::from(after)
 }
 
-pub(crate) fn extended_attributes_range(inode: Inode) -> (Bound<Bytes>, Bound<Bytes>) {
-    let empty_name = Bytes::from(FsKey::new_extended_attribute(inode, &[]));
-    let after_every_name = after_every_key_of_kind(&empty_name);
-    (
-        Bound::Included(empty_name),
-        Bound::Excluded(after_every_name),
-    )
+fn after_every_key_of_kind(key: &[u8]) -> Bytes {
+    after_every_key_starting_with(&key[..INODE_AND_KIND_LENGTH])
+}
+
+pub(crate) fn annotations_in(
+    inode: Inode,
+    scope: AnnotationScope<'_>,
+) -> (Bound<Bytes>, Bound<Bytes>) {
+    let first = Bytes::from(FsKey::new_annotation(
+        inode,
+        match scope {
+            AnnotationScope::Portable => AnnotationKey::Portable(&[]),
+            AnnotationScope::Platform(platform) => AnnotationKey::Platform {
+                platform,
+                name: &[],
+            },
+        },
+    ));
+    // every key in the scope starts with the scope's empty name key, less that name's terminator
+    let after_every_name = after_every_key_starting_with(&first[..first.len() - 1]);
+    (Bound::Included(first), Bound::Excluded(after_every_name))
 }
 
 pub(crate) fn directory_entries_after(dir: Inode, after: u64) -> (Bound<Bytes>, Bound<Bytes>) {
@@ -135,16 +169,19 @@ pub(crate) fn every_key_of(inode: Inode) -> (Bound<Bytes>, Bound<Bytes>) {
     )
 }
 
-pub(crate) fn extended_attribute_name(key: &Bytes) -> Result<Bytes, CorruptValue> {
+pub(crate) fn annotation_name(key: &Bytes) -> Result<Bytes, CorruptValue> {
     match storekey::decode_borrow::<FsKey>(key) {
         Ok(FsKey {
-            kind: KeyKind::ExtendedAttribute(Cow::Borrowed(name)),
+            kind:
+                KeyKind::Annotation(
+                    StoredAnnotationKey::Portable(name)
+                    | StoredAnnotationKey::Platform { name, .. },
+                ),
             ..
-        }) => Ok(key.slice_ref(name)),
-        Ok(FsKey {
-            kind: KeyKind::ExtendedAttribute(Cow::Owned(name)),
-            ..
-        }) => Ok(Bytes::from(name)),
+        }) => Ok(match name {
+            Cow::Borrowed(name) => key.slice_ref(name),
+            Cow::Owned(name) => Bytes::from(name),
+        }),
         Ok(_) => Err(CorruptValue::UnexpectedKey),
         Err(error) => Err(CorruptValue::UndecodableKey(error)),
     }

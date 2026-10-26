@@ -5,8 +5,7 @@
 #![allow(clippy::manual_async_fn, clippy::type_complexity)]
 
 use bitflags::bitflags;
-use bytes::{Buf, Bytes};
-use futures_util::future::join;
+use bytes::Bytes;
 use stratafs_serialized::serialized_value;
 use stratafs_store::content::ContentStore;
 use stratafs_store::error::StoreError;
@@ -14,13 +13,10 @@ use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 use zerocopy::little_endian::{I64, U16, U32, U64};
 use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 
-use crate::attributes::error::{
-    GetxattrError, ListxattrError, RemovexattrError, SetattrError, SetxattrError,
-};
+use crate::attributes::error::SetattrError;
 use crate::error::{CorruptValue, IoFailure, refused_or_failed};
-use crate::key::{FsKey, extended_attribute_name, extended_attributes_range};
-use crate::spillable::{SpillableContent, SpillableValue};
-use crate::{FsConfig, FsTransaction, Inode, LARGEST_NAME_LENGTH, Timestamp};
+use crate::key::FsKey;
+use crate::{FsConfig, FsTransaction, Inode, Timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable)]
 #[repr(u8)]
@@ -76,13 +72,6 @@ pub struct Attributes {
 pub struct Ownership {
     pub user_id: u32,
     pub group_id: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetXattrMode {
-    CreateOrReplace,
-    Create,
-    Replace,
 }
 
 impl Attributes {
@@ -179,71 +168,6 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
                 .map_err(IoFailure::Corrupt)
         }
     }
-
-    pub fn getxattr(
-        &self,
-        inode: Inode,
-        name: &[u8],
-    ) -> impl Future<
-        Output = Result<
-            Option<SpillableContent<C::Content>>,
-            GetxattrError<T::Failure, C::Failure>,
-        >,
-    > + Send {
-        async move {
-            if name.is_empty() {
-                return Err(GetxattrError::InvalidInput);
-            }
-            if name.len() > LARGEST_NAME_LENGTH {
-                return Err(GetxattrError::FileNameTooLong);
-            }
-            let (attributes, content) = join(self.getattr(inode), async {
-                let Some(stored) = self
-                    .metadata
-                    .get(FsKey::new_extended_attribute(inode, name).into())
-                    .await
-                    .map_err(IoFailure::Metadata)?
-                else {
-                    return Ok(None);
-                };
-                let value = SpillableValue::from_stored(stored).map_err(IoFailure::Corrupt)?;
-                let content = self
-                    .read_spillable(value)
-                    .await
-                    .map_err(IoFailure::ContentRead)?;
-                Ok::<_, IoFailure<T::Failure, C::Failure>>(Some(content))
-            })
-            .await;
-            if attributes?.is_none() {
-                return Err(GetxattrError::StaleFileHandle);
-            }
-            Ok(content?)
-        }
-    }
-
-    pub fn listxattr(
-        &self,
-        inode: Inode,
-    ) -> impl Future<Output = Result<Vec<Bytes>, ListxattrError<T::Failure, C::Failure>>> + Send
-    {
-        async move {
-            let (attributes, stored) = join(
-                self.getattr(inode),
-                self.metadata
-                    .get_range(extended_attributes_range(inode), usize::MAX),
-            )
-            .await;
-            if attributes?.is_none() {
-                return Err(ListxattrError::StaleFileHandle);
-            }
-            let names = stored
-                .map_err(IoFailure::Metadata)?
-                .map(|(key, _)| extended_attribute_name(&key))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(IoFailure::Corrupt)?;
-            Ok(names)
-        }
-    }
 }
 
 impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sync, S: FsConfig>
@@ -331,73 +255,6 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             attributes.record_change(now);
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)
-        }
-    }
-
-    pub fn setxattr(
-        &mut self,
-        inode: Inode,
-        name: &[u8],
-        value: impl Buf + Send,
-        mode: SetXattrMode,
-    ) -> impl Future<Output = Result<(), SetxattrError<T::Failure, T::Rejection, C::Failure>>> + Send
-    {
-        async move {
-            if name.is_empty() {
-                return Err(SetxattrError::InvalidInput);
-            }
-            if name.len() > LARGEST_NAME_LENGTH {
-                return Err(SetxattrError::FileNameTooLong);
-            }
-            let key = Bytes::from(FsKey::new_extended_attribute(inode, name));
-            let (attributes, existing) =
-                join(self.getattr(inode), self.metadata.get(key.clone())).await;
-            let mut attributes = attributes?.ok_or(SetxattrError::StaleFileHandle)?;
-            let exists = existing.map_err(IoFailure::Metadata)?.is_some();
-            match (mode, exists) {
-                (SetXattrMode::Create, true) => return Err(SetxattrError::AlreadyExists),
-                (SetXattrMode::Replace, false) => return Err(SetxattrError::AttributeNotFound),
-                (SetXattrMode::CreateOrReplace, _)
-                | (SetXattrMode::Create, false)
-                | (SetXattrMode::Replace, true) => {}
-            }
-            let value = self
-                .make_spillable(&key, 0, value)
-                .await
-                .map_err(IoFailure::ContentWrite)?;
-            self.metadata
-                .set(key, value.to_stored())
-                .map_err(refused_or_failed)?;
-            attributes.record_change(self.now());
-            self.write_attributes(inode, &attributes)?;
-            Ok(())
-        }
-    }
-
-    pub fn removexattr(
-        &mut self,
-        inode: Inode,
-        name: &[u8],
-    ) -> impl Future<Output = Result<(), RemovexattrError<T::Failure, T::Rejection, C::Failure>>> + Send
-    {
-        async move {
-            if name.is_empty() {
-                return Err(RemovexattrError::InvalidInput);
-            }
-            if name.len() > LARGEST_NAME_LENGTH {
-                return Err(RemovexattrError::FileNameTooLong);
-            }
-            let key = Bytes::from(FsKey::new_extended_attribute(inode, name));
-            let (attributes, existing) =
-                join(self.getattr(inode), self.metadata.get(key.clone())).await;
-            let mut attributes = attributes?.ok_or(RemovexattrError::StaleFileHandle)?;
-            if existing.map_err(IoFailure::Metadata)?.is_none() {
-                return Err(RemovexattrError::AttributeNotFound);
-            }
-            self.metadata.clear(key).map_err(IoFailure::Metadata)?;
-            attributes.record_change(self.now());
-            self.write_attributes(inode, &attributes)?;
-            Ok(())
         }
     }
 }

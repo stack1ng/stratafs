@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::ops::RangeBounds;
 
 use super::*;
@@ -18,34 +17,57 @@ fn attributes_keys_are_the_inode_in_big_endian_then_the_attributes_tag() {
     );
 }
 
+fn portable(inode: u64, name: &[u8]) -> Bytes {
+    Bytes::from(FsKey::new_annotation(
+        Inode(inode),
+        AnnotationKey::Portable(name),
+    ))
+}
+
+fn platform(inode: u64, platform: &[u8], name: &[u8]) -> Bytes {
+    Bytes::from(FsKey::new_annotation(
+        Inode(inode),
+        AnnotationKey::Platform { platform, name },
+    ))
+}
+
 #[test]
-fn extended_attribute_keys_end_with_the_name_and_a_terminator() {
+fn portable_annotation_keys_end_with_the_name_and_a_terminator() {
     assert_eq!(
-        encoded(0x0102, KeyKind::ExtendedAttribute(Cow::Borrowed(b"user.a")))[..],
-        [
-            0, 0, 0, 0, 0, 0, 0x01, 0x02, 3, b'u', b's', b'e', b'r', b'.', b'a', 0
-        ]
+        portable(0x0102, b"a")[..],
+        [0, 0, 0, 0, 0, 0, 0x01, 0x02, 3, 2, b'a', 0]
+    );
+}
+
+#[test]
+fn platform_annotation_keys_end_with_the_platform_then_the_name_each_terminated() {
+    assert_eq!(
+        platform(0x0102, b"os", b"a")[..],
+        [0, 0, 0, 0, 0, 0, 0x01, 0x02, 3, 3, b'o', b's', 0, b'a', 0]
     );
 }
 
 #[test]
 fn zero_and_one_bytes_in_names_are_escaped() {
     assert_eq!(
-        encoded(1, KeyKind::ExtendedAttribute(Cow::Borrowed(&[0, 1, 2])))[..],
-        [0, 0, 0, 0, 0, 0, 0, 1, 3, 1, 0, 1, 1, 2, 0]
+        portable(1, &[0, 1, 2])[..],
+        [0, 0, 0, 0, 0, 0, 0, 1, 3, 2, 1, 0, 1, 1, 2, 0]
     );
 }
 
 #[test]
-fn keys_group_by_inode_with_attributes_first_then_names_in_byte_order() {
+fn keys_group_by_inode_with_attributes_first_then_portable_then_platform_names_in_byte_order() {
     let ordered = [
-        encoded(255, KeyKind::ExtendedAttribute(Cow::Borrowed(b"z"))),
+        platform(255, b"z", b"z"),
         encoded(256, KeyKind::Attributes),
-        encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(&[0]))),
-        encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(&[1]))),
-        encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(b"user.a"))),
-        encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(b"user.ab"))),
-        encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(b"user.b"))),
+        portable(256, &[0]),
+        portable(256, &[1]),
+        portable(256, b"a"),
+        portable(256, b"ab"),
+        portable(256, &[0xff; 255]),
+        platform(256, b"a", b"z"),
+        platform(256, b"a\0", b""),
+        platform(256, b"ab", b"a"),
         encoded(257, KeyKind::Attributes),
     ];
     let mut sorted = ordered.to_vec();
@@ -55,33 +77,16 @@ fn keys_group_by_inode_with_attributes_first_then_names_in_byte_order() {
 }
 
 #[test]
-fn the_extended_attribute_range_holds_exactly_the_inodes_extended_attribute_keys() {
-    let range = extended_attributes_range(Inode(256));
+fn the_portable_annotation_range_holds_exactly_the_inodes_portable_keys() {
+    let range = annotations_in(Inode(256), AnnotationScope::Portable);
     for (key, inside) in [
-        (
-            encoded(
-                255,
-                KeyKind::ExtendedAttribute(Cow::Borrowed(&[0xff, 0xff])),
-            ),
-            false,
-        ),
+        (platform(255, &[0xff], &[0xff, 0xff]), false),
         (encoded(256, KeyKind::Attributes), false),
-        (
-            encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(&[0]))),
-            true,
-        ),
-        (
-            encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(&[1]))),
-            true,
-        ),
-        (
-            encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(b"user.a"))),
-            true,
-        ),
-        (
-            encoded(256, KeyKind::ExtendedAttribute(Cow::Borrowed(&[0xff; 255]))),
-            true,
-        ),
+        (portable(256, &[0]), true),
+        (portable(256, &[1]), true),
+        (portable(256, b"a"), true),
+        (portable(256, &[0xff; 255]), true),
+        (platform(256, &[0], &[0]), false),
         (encoded(257, KeyKind::Attributes), false),
     ] {
         assert_eq!(range.contains(&key), inside, "{key:?}");
@@ -89,10 +94,30 @@ fn the_extended_attribute_range_holds_exactly_the_inodes_extended_attribute_keys
 }
 
 #[test]
-fn extended_attribute_names_decode_from_their_keys() {
-    for name in [&b"user.a"[..], &[0, 1, 2], &[0xff; 255]] {
-        let key = Bytes::from(FsKey::new_extended_attribute(Inode(256), name));
-        assert_eq!(extended_attribute_name(&key).unwrap(), name);
+fn a_platform_annotation_range_holds_exactly_the_inodes_keys_of_that_platform() {
+    let range = annotations_in(Inode(256), AnnotationScope::Platform(b"os"));
+    for (key, inside) in [
+        (platform(255, b"os", &[0xff; 255]), false),
+        (portable(256, &[0xff; 255]), false),
+        (platform(256, b"o", &[0xff; 255]), false),
+        (platform(256, b"os", &[0]), true),
+        (platform(256, b"os", &[1]), true),
+        (platform(256, b"os", b"a"), true),
+        (platform(256, b"os", &[0xff; 255]), true),
+        (platform(256, b"os\0", b""), false),
+        (platform(256, b"os\x01", b""), false),
+        (platform(256, b"osx", b""), false),
+        (encoded(257, KeyKind::Attributes), false),
+    ] {
+        assert_eq!(range.contains(&key), inside, "{key:?}");
+    }
+}
+
+#[test]
+fn annotation_names_decode_from_their_keys() {
+    for name in [&b"a"[..], &[0, 1, 2], &[0xff; 255]] {
+        assert_eq!(annotation_name(&portable(256, name)).unwrap(), name);
+        assert_eq!(annotation_name(&platform(256, b"os", name)).unwrap(), name);
     }
 }
 
@@ -100,7 +125,7 @@ fn extended_attribute_names_decode_from_their_keys() {
 fn decoding_a_name_from_an_attributes_key_is_an_unexpected_key() {
     let key = Bytes::from(FsKey::new_attributes(Inode(256)));
     assert!(matches!(
-        extended_attribute_name(&key),
+        annotation_name(&key),
         Err(CorruptValue::UnexpectedKey)
     ));
 }
@@ -110,7 +135,8 @@ fn every_kind_of_key_sorts_together_under_its_inode_in_declaration_order() {
     let ordered = [
         Bytes::from(FsKey::new_symbolic_link_target(Inode(255))),
         Bytes::from(FsKey::new_attributes(Inode(256))),
-        Bytes::from(FsKey::new_extended_attribute(Inode(256), b"user.a")),
+        portable(256, b"a"),
+        platform(256, b"os", b"a"),
         Bytes::from(FsKey::new_directory_entry(Inode(256), 3)),
         Bytes::from(FsKey::new_directory_entry(Inode(256), 0x0100)),
         Bytes::from(FsKey::new_directory_entry(Inode(256), u64::MAX >> 1)),
@@ -133,10 +159,7 @@ fn directory_entry_ranges_hold_exactly_the_requested_positions() {
     let entry = |dir, position| Bytes::from(FsKey::new_directory_entry(Inode(dir), position));
     let after = directory_entries_after(Inode(256), 5);
     for (key, inside) in [
-        (
-            Bytes::from(FsKey::new_extended_attribute(Inode(256), &[0xff; 255])),
-            false,
-        ),
+        (platform(256, &[0xff], &[0xff; 255]), false),
         (entry(256, 5), false),
         (entry(256, 6), true),
         (entry(256, u64::MAX >> 1), true),
@@ -196,10 +219,8 @@ fn every_key_of_an_inode_holds_all_its_kinds_and_no_neighbours() {
             false,
         ),
         (Bytes::from(FsKey::new_attributes(Inode(256))), true),
-        (
-            Bytes::from(FsKey::new_extended_attribute(Inode(256), &[0xff; 255])),
-            true,
-        ),
+        (portable(256, &[0xff; 255]), true),
+        (platform(256, &[0xff], &[0xff; 255]), true),
         (
             Bytes::from(FsKey::new_directory_entry(Inode(256), u64::MAX)),
             true,

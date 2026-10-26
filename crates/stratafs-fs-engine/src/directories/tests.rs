@@ -5,7 +5,7 @@ use futures_lite::future::block_on;
 use stratafs_opendal::OpendalError;
 
 use super::*;
-use crate::attributes::SetXattrMode;
+use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::content::error::ReadSymbolicLinkError;
 use crate::test_support::{InMemoryEngine, MetadataFailure, aborted, new_test_engine, set_clock};
 
@@ -421,7 +421,12 @@ fn hard_unlinking_the_last_name_deletes_the_inode_and_all_its_keys() {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
             let result = txn
-                .setxattr(a, b"user.x", &b"1"[..], SetXattrMode::Create)
+                .set_annotation(
+                    a,
+                    AnnotationKey::Portable(b"x"),
+                    &b"1"[..],
+                    SetAnnotationMode::Create,
+                )
                 .await;
             result.map(|result| (result, txn))
         })
