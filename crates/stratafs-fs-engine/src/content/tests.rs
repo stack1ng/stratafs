@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use futures_lite::future::block_on;
 use futures_util::future::try_join_all;
-use stratafs_opendal::OpendalError;
+use stratafs_object_store::ObjectStoreError;
 
 use super::*;
 use crate::Timestamp;
@@ -154,7 +154,7 @@ fn plan(
     inode: Inode,
     offset: u64,
     size: u64,
-) -> Result<ContentLoadPlan, ReadError<MetadataFailure, OpendalError>> {
+) -> Result<ContentLoadPlan, ReadError<MetadataFailure, ObjectStoreError>> {
     block_on(
         engine.read_transact(|txn| Box::pin(async move { txn.read(inode, offset, size).await })),
     )
@@ -410,7 +410,7 @@ fn slicing_past_the_inline_bytes_is_an_invalid_extent() {
     ));
 }
 
-type Write = WriteError<MetadataFailure, Infallible, OpendalError>;
+type Write = WriteError<MetadataFailure, Infallible, ObjectStoreError>;
 
 fn write(
     engine: &InMemoryEngine,
@@ -842,7 +842,7 @@ fn a_write_ending_past_the_largest_offset_is_too_large() {
     ));
 }
 
-type Setattr = SetattrError<MetadataFailure, Infallible, OpendalError>;
+type Setattr = SetattrError<MetadataFailure, Infallible, ObjectStoreError>;
 
 fn setattr(
     engine: &InMemoryEngine,

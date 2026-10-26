@@ -38,6 +38,12 @@
               pkgs.nodejs
               pkgs.taplo
               pkgs.wasm-bindgen-cli_0_2_129
+              # the benchmark's load and the file systems it compares against
+              pkgs.fio
+              pkgs.go
+              pkgs.hyperfine
+              pkgs.ripgrep
+              pkgs.vmtouch
             ];
           };
 

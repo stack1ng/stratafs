@@ -73,6 +73,13 @@ define_class!(
         fn truncates_long_names(&self) -> bool {
             false
         }
+
+        // maximumFileSize is the largest size a file can reach: a write fails only when its end would pass the
+        // largest offset.
+        #[unsafe(method(maximumFileSize))]
+        fn maximum_file_size(&self) -> u64 {
+            u64::MAX
+        }
     }
 
     // FSVolumeHandler re-declares the methods it shares with FSVolumeCommonOperations, so they are defined
@@ -137,9 +144,10 @@ define_class!(
         #[unsafe(method(synchronizeWithFlags:replyHandler:))]
         fn synchronize(
             &self,
-            _flags: FSSyncFlags,
+            flags: FSSyncFlags,
             reply: &SendableBlock<'static, fn(*mut NSError)>,
         ) {
+            tracing::info!(flags = flags.0, "synchronize");
             reply.call(null_mut());
         }
 
@@ -367,7 +375,8 @@ define_class!(
             &self,
             directory: &FSItem,
             cookie: FSDirectoryCookie,
-            verifier: FSDirectoryVerifier,
+            // Every listing has the same verifier, since a cookie never goes stale.
+            _verifier: FSDirectoryVerifier,
             attributes: Option<&FSItemGetAttributesRequest>,
             packer: &FSDirectoryEntryPacker,
             _context: &FSContext,
@@ -376,14 +385,7 @@ define_class!(
             let directory = *StrataItem::of(directory).inode();
             let (with_attributes, packer) = (attributes.is_some(), Handed(packer.retain()));
             self.forward(reply, |operations, reply| {
-                operations.enumerate_directory(
-                    directory,
-                    cookie,
-                    verifier,
-                    with_attributes,
-                    packer,
-                    reply,
-                )
+                operations.enumerate_directory(directory, cookie, with_attributes, packer, reply)
             });
         }
     }
@@ -506,8 +508,12 @@ impl StrataVolume {
         reply: &SendableBlock<'static, fn(*mut FSActivateResult, *mut NSError)>,
     ) {
         let opened = match open_volume(self.store(), arguments) {
-            Ok(opened) => opened,
+            Ok(opened) => {
+                tracing::info!(?arguments, store = %self.store().display(), "activated");
+                opened
+            }
             Err(error) => {
+                tracing::error!(?arguments, store = %self.store().display(), %error, "activate failed");
                 let error = posix_error(activate_errno(&error), &error.to_string());
                 return reply.call(null_mut(), Retained::as_ptr(&error).cast_mut());
             }
@@ -577,6 +583,10 @@ pub(crate) struct StoreAccess {
 }
 
 impl StoreAccess {
+    pub(crate) fn started(&self) -> bool {
+        self.started
+    }
+
     pub(crate) fn start(url: Retained<NSURL>) -> Self {
         // SAFETY: starting access reads the URL's security scope, if it has one.
         let started = unsafe { url.startAccessingSecurityScopedResource() };

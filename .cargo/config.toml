@@ -1,2 +1,6 @@
+[alias]
+# cargo xtask runs the repository's own build tasks, such as bundling the benchmark FSKit module.
+xtask = "run --package xtask --"
+
 [target.wasm32-unknown-unknown]
 runner = "wasm-bindgen-test-runner"

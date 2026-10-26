@@ -1,0 +1,32 @@
+# The benchmark run `stratafs-bench run crates/stratafs-bench/bench.toml` performs.
+# Relative paths are relative to this file. Run inside the repository's nix shell, which has hyperfine and fio.
+
+results = "../../target/bench/results"
+inputs = "../../target/bench/inputs"
+runs = 5
+# clear_caches clears every cache before each run. It needs `sudo -n /usr/sbin/purge` to work without a password.
+clear_caches = false
+# workloads = ["clone-small", "status-small"]
+
+# APFS on a case sensitive volume, like stratafs, so the large repository's names that differ only by case fit:
+# diskutil apfs addVolume disk3 "Case-sensitive APFS" StrataBench
+[[targets]]
+kind = "directory"
+name = "apfs"
+path = "/Volumes/StrataBench"
+
+# stratafs through the FSKit module `cargo xtask bundle` installs, mounted fresh for each run.
+[[targets]]
+kind = "stratafs"
+name = "stratafs"
+store = "/Volumes/StrataBench/stratafs-store"
+mount_point = "/Volumes/StrataBench/stratafs-mount"
+
+# JuiceFS through macFUSE's FSKit backend, which needs no kernel extension: install macFUSE 5.4 and enable its
+# File System Extensions. `cargo xtask juicefs` builds the juicefs this uses; the 1.4.2 release crashes on M5 Macs.
+# [[targets]]
+# kind = "juicefs"
+# name = "juicefs"
+# binary = "../../target/bench/juicefs"
+# store = "/Volumes/StrataBench/juicefs-store"
+# mount_point = "/Volumes/StrataBench/juicefs-mount"

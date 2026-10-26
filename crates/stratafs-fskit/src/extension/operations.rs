@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::ptr::null_mut;
 use std::sync::Arc;
+use std::task::{Context, Waker};
 
 use block2::RcBlock;
 use bytes::{Buf, Bytes};
@@ -120,7 +121,6 @@ pub(crate) trait VolumeOperations: Send + Sync {
         self: Arc<Self>,
         directory: Inode,
         cookie: FSDirectoryCookie,
-        verifier: FSDirectoryVerifier,
         with_attributes: bool,
         packer: Handed<FSDirectoryEntryPacker>,
         reply: Reply<FSEnumerateDirectoryResult>,
@@ -157,7 +157,8 @@ pub(crate) trait VolumeOperations: Send + Sync {
     fn list_xattrs(self: Arc<Self>, inode: Inode, reply: Reply<FSListXattrsResult>);
 }
 
-// Volume is a mounted volume's engine. Each operation runs on spawner and replies when it finishes.
+// Volume is a mounted volume's engine. Each operation replies when it finishes, on FSKit's thread unless it
+// has to wait, and then on spawner.
 pub(crate) struct Volume<M, C, A, N, S> {
     pub(crate) engine: FsEngine<M, C, A, N, S>,
     pub(crate) spawner: Arc<dyn Spawn + Send + Sync>,
@@ -188,6 +189,11 @@ impl<M, R, C> From<&RenameFailure<M, R, C>> for PosixError {
 
 // LISTING_BATCH is how many directory entries enumerate reads per transaction while it fills a packer.
 const LISTING_BATCH: usize = 64;
+
+// VERIFIER is every listing's verifier, nonzero as FSKit requires. A cookie is an entry's position, which never
+// moves while the entry exists, so a listing can carry on from its cookie however the directory changes, and
+// FSKit never needs to start it over.
+const VERIFIER: FSDirectoryVerifier = 1;
 
 impl<M, C, A, N, S> VolumeOperations for Volume<M, C, A, N, S>
 where
@@ -577,7 +583,6 @@ where
         self: Arc<Self>,
         directory: Inode,
         cookie: FSDirectoryCookie,
-        verifier: FSDirectoryVerifier,
         with_attributes: bool,
         packer: Handed<FSDirectoryEntryPacker>,
         reply: Reply<FSEnumerateDirectoryResult>,
@@ -585,7 +590,7 @@ where
         self.run(move |volume| async move {
             // Engine positions start at 3, which leaves cookie 0 for the start, 1 for "." and 2 for "..".
             let mut after = cookie;
-            let mut current_verifier = None;
+            let mut dots_packed = false;
             loop {
                 let batch = volume
                     .engine
@@ -616,13 +621,8 @@ where
                     Ok(batch) => batch,
                     Err(error) => return fail(&reply, failed(error)),
                 };
-                // The verifier is the directory's version, made nonzero as FSKit requires.
-                let directory_verifier = directory_attributes.change_version + 1;
-                if current_verifier.is_none() {
-                    if verifier != 0 && verifier != directory_verifier {
-                        return fail(&reply, invalid_cookie());
-                    }
-                    current_verifier = Some(directory_verifier);
+                if !dots_packed {
+                    dots_packed = true;
                     if !with_attributes {
                         let parent = match directory {
                             Inode::ROOT => Inode::ROOT,
@@ -647,7 +647,7 @@ where
                                         )
                                 }
                             {
-                                return listed(&reply, directory_verifier);
+                                return listed(&reply);
                             }
                         }
                     }
@@ -678,12 +678,12 @@ where
                         None => pack(None),
                     };
                     if !packed {
-                        return listed(&reply, directory_verifier);
+                        return listed(&reply);
                     }
                     after = entry.position;
                 }
                 if complete {
-                    return listed(&reply, directory_verifier);
+                    return listed(&reply);
                 }
             }
         });
@@ -915,15 +915,25 @@ where
 }
 
 impl<M, C, A, N, S> Volume<M, C, A, N, S> {
-    // run starts an operation on the spawner, handing it the volume.
+    // run runs an operation, handing it the volume, on FSKit's thread until it finishes or has to wait, such
+    // as on a commit that flushes. An operation that has to wait finishes on the spawner, so FSKit can hand
+    // over the next one meanwhile.
     fn run<O: Future<Output = ()> + Send + 'static>(
         self: Arc<Self>,
         operation: impl FnOnce(Arc<Self>) -> O,
     ) {
         let spawner = self.spawner.clone();
-        spawner
-            .spawn(operation(self))
-            .expect("the spawner accepts work while a volume is mounted");
+        let mut operation = Box::pin(operation(self));
+        // The spawner polls the operation again with a waker of its own, so this first poll needs none.
+        if operation
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+        {
+            spawner
+                .spawn(operation)
+                .expect("the spawner accepts work while a volume is mounted");
+        }
     }
 }
 
@@ -962,7 +972,15 @@ fn succeed<R: Message>(reply: &Reply<R>, result: Option<Retained<R>>) {
     }
 }
 
+// fail replies with error, and logs it. A name or extended attribute that does not exist is ordinary, so it is
+// only logged for debugging.
 fn fail<R: Message>(reply: &Reply<R>, error: Retained<NSError>) {
+    let (code, description) = (error.code(), error.localizedDescription());
+    if code == libc::ENOENT as isize || code == libc::ENOATTR as isize {
+        tracing::debug!(code, %description, "operation failed");
+    } else {
+        tracing::warn!(code, %description, "operation failed");
+    }
     reply.call(null_mut(), Retained::as_ptr(&error).cast_mut());
 }
 
@@ -970,17 +988,11 @@ fn stale() -> Retained<NSError> {
     posix_error(errno(PosixError::ESTALE), "the item no longer exists")
 }
 
-// invalid_cookie is FSKit's error for a listing whose directory changed since its previous batch.
-// FSKit asks for it in the POSIX domain, with FSKit's invalidDirectoryCookie code.
-fn invalid_cookie() -> Retained<NSError> {
-    posix_error(4506, "the directory changed while it was being listed")
-}
-
-// listed replies to an enumeration with the directory's current verifier.
-fn listed(reply: &Reply<FSEnumerateDirectoryResult>, verifier: FSDirectoryVerifier) {
+// listed replies to an enumeration, with the one verifier every listing has.
+fn listed(reply: &Reply<FSEnumerateDirectoryResult>) {
     // SAFETY: initWithVerifier: takes a plain value. The bindings lack it, though the macOS 27.2 SDK has it.
     let result: Option<Retained<FSEnumerateDirectoryResult>> =
-        unsafe { msg_send![FSEnumerateDirectoryResult::alloc(), initWithVerifier: verifier] };
+        unsafe { msg_send![FSEnumerateDirectoryResult::alloc(), initWithVerifier: VERIFIER] };
     succeed(reply, result);
 }
 

@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use futures_lite::future::block_on;
-use stratafs_opendal::OpendalError;
+use stratafs_object_store::ObjectStoreError;
 use stratafs_store::content::ContentHash;
 
 use super::*;
@@ -20,7 +20,7 @@ fn get_annotation(
     engine: &InMemoryEngine,
     inode: Inode,
     key: AnnotationKey<'_>,
-) -> Result<Option<Bytes>, GetAnnotationError<MetadataFailure, OpendalError>> {
+) -> Result<Option<Bytes>, GetAnnotationError<MetadataFailure, ObjectStoreError>> {
     block_on(engine.read_transact(|txn| {
         Box::pin(async move {
             let value = txn.get_annotation(inode, key).await?;
@@ -34,7 +34,7 @@ fn list_annotations(
     engine: &InMemoryEngine,
     inode: Inode,
     scope: AnnotationScope<'_>,
-) -> Result<Vec<Bytes>, ListAnnotationsError<MetadataFailure, OpendalError>> {
+) -> Result<Vec<Bytes>, ListAnnotationsError<MetadataFailure, ObjectStoreError>> {
     block_on(
         engine
             .read_transact(|txn| Box::pin(async move { txn.list_annotations(inode, scope).await })),
@@ -48,7 +48,7 @@ fn set_annotation(
     key: AnnotationKey<'_>,
     value: &[u8],
     mode: SetAnnotationMode,
-) -> Result<(), SetAnnotationError<MetadataFailure, Infallible, OpendalError>> {
+) -> Result<(), SetAnnotationError<MetadataFailure, Infallible, ObjectStoreError>> {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
             let result = txn.set_annotation(inode, key, value, mode).await;
@@ -62,7 +62,7 @@ fn remove_annotation(
     engine: &InMemoryEngine,
     inode: Inode,
     key: AnnotationKey<'_>,
-) -> Result<(), RemoveAnnotationError<MetadataFailure, Infallible, OpendalError>> {
+) -> Result<(), RemoveAnnotationError<MetadataFailure, Infallible, ObjectStoreError>> {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
             let result = txn.remove_annotation(inode, key).await;

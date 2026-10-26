@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +23,7 @@ event-listener = "5.4"
 foldhash = "0.2"
 futures-channel = "0.3.34"
 futures-core = "0.3.34"
+futures-executor = { version = "0.3.34", default-features = false, features = ["std", "thread-pool"] }
 futures-lite = "2.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hex = "0.4"
@@ -30,19 +31,23 @@ libc = "0.2"
 objc2 = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
 objc2-foundation = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
 objc2-fs-kit = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
-opendal = { version = "0.59.4", default-features = false }
+object_store = { version = "0.14", default-features = false }
 proptest = { version = "1.5", default-features = false, features = ["std"] }
+rand = "0.10"
 rangemap = "1.8"
-send_wrapper = { version = "0.6", features = ["futures"] }
+rustix = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 shuttle = "0.9.7"
 # TODO: move to smallvec 2 once it is stable, for the SmallVec<T, N> syntax (2.0.0-beta.3 as of 2026-10-23)
 smallvec = { version = "1.16", features = ["union"] }
 stateright = "0.31"
 stratafs-content-conformance = { path = "crates/stratafs-content-conformance" }
 stratafs-fs-engine = { path = "crates/stratafs-fs-engine" }
+stratafs-fskit = { path = "crates/stratafs-fskit" }
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
-stratafs-opendal = { path = "crates/stratafs-opendal" }
+stratafs-object-store = { path = "crates/stratafs-object-store" }
 stratafs-range-bounds-map = { path = "crates/stratafs-range-bounds-map" }
 stratafs-redb = { path = "crates/stratafs-redb" }
 stratafs-serialized = { path = "crates/stratafs-serialized" }
@@ -50,7 +55,12 @@ stratafs-store = { path = "crates/stratafs-store" }
 stratafs-tree = { path = "crates/stratafs-tree" }
 storekey = "0.11"
 thiserror = "2.0"
+toml = "0.9"
+tracing = "0.1"
+tracing-oslog = "0.3"
+tracing-subscriber = "0.3"
 uuid = "1"
+web-time = "1"
 weak-table = "0.4"
 xxhash-rust = { version = "0.8", features = ["const_xxh32"] }
 zerocopy = { version = "0.8", features = ["alloc", "derive"] }

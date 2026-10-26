@@ -59,8 +59,9 @@ define_class!(
         ) {
             match store_of(resource) {
                 Ok((url, store)) => {
-                    let volume =
-                        Retained::into_super(StrataVolume::new(store, StoreAccess::start(url)));
+                    let access = StoreAccess::start(url);
+                    tracing::info!(store = %store.display(), access = access.started(), "loaded");
+                    let volume = Retained::into_super(StrataVolume::new(store, access));
                     // SAFETY: setting the container status to ready is what FSKit expects before the reply.
                     unsafe { self.setContainerStatus(&FSContainerStatus::ready()) };
                     reply.call(Retained::as_ptr(&volume).cast_mut(), ptr::null_mut());

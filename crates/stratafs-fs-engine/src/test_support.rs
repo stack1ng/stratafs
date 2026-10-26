@@ -3,10 +3,10 @@ use std::convert::Infallible;
 use std::fmt::Debug;
 
 use futures_lite::future::block_on;
-use opendal::Operator;
+use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
-use stratafs_opendal::OpendalContentStore;
-use stratafs_redb::{Inline, RedbFailure, RedbStore};
+use stratafs_object_store::ObjectStoreContentStore;
+use stratafs_redb::{CommitDurability, Inline, RedbFailure, RedbStore};
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::TransactError;
 use stratafs_tree::error::TreeFailure;
@@ -36,7 +36,7 @@ pub(crate) type MetadataStore = TreeVolume<RedbStore<Inline>, fn() -> u128, Test
 pub(crate) type MetadataFailure = TreeFailure<RedbFailure, Infallible>;
 
 pub(crate) type InMemoryEngine =
-    FsEngine<MetadataStore, OpendalContentStore, fn() -> u64, fn() -> Timestamp, OneKibInline>;
+    FsEngine<MetadataStore, ObjectStoreContentStore, fn() -> u64, fn() -> Timestamp, OneKibInline>;
 
 thread_local! {
     static CLOCK: Cell<i64> = const { Cell::new(0) };
@@ -70,13 +70,16 @@ pub(crate) fn new_test_engine() -> InMemoryEngine {
     let allocate_node: fn() -> u128 = next_node;
     let now: fn() -> Timestamp = clock;
     block_on(async {
-        let tree = Tree::new(RedbStore::new(database, Inline).unwrap(), allocate_node)
-            .await
-            .unwrap();
+        let tree = Tree::new(
+            RedbStore::new(database, Inline, CommitDurability::EveryCommit, || Ok(())).unwrap(),
+            allocate_node,
+        )
+        .await
+        .unwrap();
         let volume = tree.open(tree.create().await.unwrap()).await.unwrap();
         FsEngine::new(
             volume,
-            OpendalContentStore::new(Operator::new(opendal::services::Memory::default()).unwrap()),
+            ObjectStoreContentStore::new(InMemory::new()),
             allocate_inode,
             now,
         )

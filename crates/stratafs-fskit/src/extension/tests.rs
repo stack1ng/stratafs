@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex, Once};
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use block2::RcBlock;
@@ -16,14 +17,14 @@ use objc2_fs_kit::{
     FSItemSetAttributesRequest, FSItemType, FSPathURLResource, FSResource, FSSetAttributesResult,
     FSTaskOptions, FSUnaryFileSystemOperations, FSVolume, FSVolumeHandler,
 };
-use opendal::Operator;
+use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
 use stratafs_fs_engine::attributes::{
     Attributes, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
 };
 use stratafs_fs_engine::{FsConfig, FsEngine, Inode, Timestamp};
-use stratafs_opendal::OpendalContentStore;
-use stratafs_redb::{Inline, RedbStore};
+use stratafs_object_store::ObjectStoreContentStore;
+use stratafs_redb::{CommitDurability, RedbStore, SpawnBlocking};
 
 use super::changes::attribute_change;
 use super::item::{StrataItem, file_name, flags_of, item_attributes, restrictions_and_hints};
@@ -36,8 +37,27 @@ impl FsConfig for TestConfig {
     const LARGEST_INLINE_ENTRY: usize = 1024;
 }
 
-type TestEngine =
-    FsEngine<RedbStore<Inline>, OpendalContentStore, fn() -> u64, fn() -> Timestamp, TestConfig>;
+type TestEngine = FsEngine<
+    RedbStore<SimulatedThreadPool>,
+    ObjectStoreContentStore,
+    fn() -> u64,
+    fn() -> Timestamp,
+    TestConfig,
+>;
+
+// SimulatedThreadPool yields before it does the work, as a thread pool does when the work is not done by the
+// first poll, so every commit that flushes makes its operation wait.
+struct SimulatedThreadPool;
+
+impl SpawnBlocking for SimulatedThreadPool {
+    async fn spawn_blocking<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        futures_lite::future::yield_now().await;
+        work()
+    }
+}
 
 async fn new_engine() -> Result<TestEngine, io::Error> {
     let database = redb::Database::builder()
@@ -46,10 +66,14 @@ async fn new_engine() -> Result<TestEngine, io::Error> {
     let allocate_inode: fn() -> u64 = || 7;
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
     FsEngine::new(
-        RedbStore::new(database, Inline).map_err(io::Error::other)?,
-        OpendalContentStore::new(
-            Operator::new(opendal::services::Memory::default()).map_err(io::Error::other)?,
-        ),
+        RedbStore::new(
+            database,
+            SimulatedThreadPool,
+            CommitDurability::EveryCommit,
+            || Ok(()),
+        )
+        .map_err(io::Error::other)?,
+        ObjectStoreContentStore::new(InMemory::new()),
         allocate_inode,
         now,
     )
@@ -57,7 +81,7 @@ async fn new_engine() -> Result<TestEngine, io::Error> {
     .map_err(io::Error::other)
 }
 
-// ThreadSpawner runs each operation on a thread of its own, which is enough for tests.
+// ThreadSpawner finishes each operation that has to wait on a thread of its own, which is enough for tests.
 struct ThreadSpawner;
 
 impl Spawn for ThreadSpawner {
@@ -188,6 +212,15 @@ fn reply<R: RefEncode + 'static>() -> (Reply<R>, Receiver<Replied>) {
             Ok(())
         };
         replied.send(result).unwrap();
+    });
+    (reply, received)
+}
+
+// replying_thread is a reply block for an FSKit operation, and a receiver that gets the thread it was called on.
+fn replying_thread<R: RefEncode + 'static>() -> (Reply<R>, Receiver<ThreadId>) {
+    let (replied, received) = channel();
+    let reply = Reply::<R>::new(move |_result: *mut R, _error: *mut NSError| {
+        replied.send(thread::current().id()).unwrap();
     });
     (reply, received)
 }
@@ -563,5 +596,37 @@ fn set_attributes_and_create_refuse_flags_the_volume_does_not_store() {
     assert_eq!(
         replied(set_attributes(&volume, Inode::ROOT, &stored)),
         Ok(())
+    );
+}
+
+#[test]
+fn an_operation_replies_on_fskits_thread_unless_it_waits_on_a_flushing_commit() {
+    let volume = mounted("ab04");
+    // getAttributes only reads, so it replies before the call returns, on the thread that called it.
+    let (reply, replied) = replying_thread::<FSGetAttributesResult>();
+    // SAFETY: the request, item, context and reply are all valid for the call.
+    unsafe {
+        strata_volume(&volume).getAttributes_ofItem_context_replyHandler(
+            &FSItemGetAttributesRequest::new(),
+            &StrataItem::new(Inode::ROOT, FileType::Directory),
+            &context(),
+            &reply,
+        );
+    }
+    assert_eq!(replied.try_recv(), Ok(thread::current().id()));
+    // setAttributes commits, and every commit flushes in the test store, so it finishes on the spawner.
+    let (reply, replied) = replying_thread::<FSSetAttributesResult>();
+    // SAFETY: the request, item, context and reply are all valid for the call.
+    unsafe {
+        strata_volume(&volume).setAttributes_onItem_context_replyHandler(
+            &FSItemSetAttributesRequest::new(),
+            &StrataItem::new(Inode::ROOT, FileType::Directory),
+            &context(),
+            &reply,
+        );
+    }
+    assert_ne!(
+        replied.recv_timeout(Duration::from_secs(10)).unwrap(),
+        thread::current().id()
     );
 }

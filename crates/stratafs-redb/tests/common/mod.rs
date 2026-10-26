@@ -1,6 +1,6 @@
 use futures_lite::future::yield_now;
 use redb::{Database, StorageBackend};
-use stratafs_redb::{RedbStore, SpawnBlocking};
+use stratafs_redb::{CommitDurability, RedbStore, SpawnBlocking};
 
 pub struct SimulatedThreadPool;
 
@@ -19,9 +19,20 @@ impl SpawnBlocking for SimulatedThreadPool {
 }
 
 pub fn open_store(backend: impl StorageBackend) -> RedbStore<SimulatedThreadPool> {
+    open_store_with(backend, CommitDurability::EveryCommit)
+}
+
+// open_store_with opens a store whose commits reach the disk as durability says. Only the commits that flush
+// go through the spawner; the rest commit in place.
+pub fn open_store_with(
+    backend: impl StorageBackend,
+    durability: CommitDurability,
+) -> RedbStore<SimulatedThreadPool> {
     RedbStore::new(
         Database::builder().create_with_backend(backend).unwrap(),
         SimulatedThreadPool,
+        durability,
+        || Ok(()),
     )
     .unwrap()
 }

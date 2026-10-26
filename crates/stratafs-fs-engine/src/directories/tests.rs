@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 
 use futures_lite::future::block_on;
-use stratafs_opendal::OpendalError;
+use stratafs_object_store::ObjectStoreError;
 
 use super::*;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
@@ -11,11 +11,11 @@ use crate::test_support::{
     InMemoryEngine, MetadataFailure, aborted, new_test_engine, restrict, set_clock,
 };
 
-type Create = CreateError<MetadataFailure, Infallible, OpendalError>;
-type HardLink = HardLinkError<MetadataFailure, Infallible, OpendalError>;
-type HardUnlink = HardUnlinkError<MetadataFailure, Infallible, OpendalError>;
-type Rmdir = RmdirError<MetadataFailure, Infallible, OpendalError>;
-type Rename = RenameError<MetadataFailure, Infallible, OpendalError>;
+type Create = CreateError<MetadataFailure, Infallible, ObjectStoreError>;
+type HardLink = HardLinkError<MetadataFailure, Infallible, ObjectStoreError>;
+type HardUnlink = HardUnlinkError<MetadataFailure, Infallible, ObjectStoreError>;
+type Rmdir = RmdirError<MetadataFailure, Infallible, ObjectStoreError>;
+type Rename = RenameError<MetadataFailure, Infallible, ObjectStoreError>;
 
 fn create(
     engine: &InMemoryEngine,
@@ -51,7 +51,7 @@ fn lookup(
     engine: &InMemoryEngine,
     dir: Inode,
     name: &[u8],
-) -> Result<Option<(Inode, Attributes)>, LookupError<MetadataFailure, OpendalError>> {
+) -> Result<Option<(Inode, Attributes)>, LookupError<MetadataFailure, ObjectStoreError>> {
     block_on(engine.read_transact(|txn| Box::pin(async move { txn.lookup(dir, name).await })))
         .map_err(aborted)
 }
@@ -65,7 +65,7 @@ fn readdir(
     dir: Inode,
     after: u64,
     limit: usize,
-) -> Result<Vec<DirectoryEntry>, ReaddirError<MetadataFailure, OpendalError>> {
+) -> Result<Vec<DirectoryEntry>, ReaddirError<MetadataFailure, ObjectStoreError>> {
     block_on(
         engine.read_transact(|txn| Box::pin(async move { txn.readdir(dir, after, limit).await })),
     )
@@ -140,7 +140,7 @@ fn rename(
 fn read_symbolic_link(
     engine: &InMemoryEngine,
     inode: Inode,
-) -> Result<Bytes, ReadSymbolicLinkError<MetadataFailure, OpendalError>> {
+) -> Result<Bytes, ReadSymbolicLinkError<MetadataFailure, ObjectStoreError>> {
     block_on(engine.read_transact(|txn| {
         Box::pin(async move {
             let mut target = txn.read_symbolic_link(inode).await?;

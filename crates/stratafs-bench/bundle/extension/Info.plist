@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>stratafs benchmark</string>
+	<key>CFBundleExecutable</key>
+	<string>stratafs-bench-extension</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.stratafs.bench.extension</string>
+	<key>CFBundleName</key>
+	<string>StrataBenchExtension</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>DTPlatformName</key>
+	<string>macosx</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>27.0</string>
+	<key>EXAppExtensionAttributes</key>
+	<dict>
+		<key>EXExtensionPointIdentifier</key>
+		<string>com.apple.fskit.fsmodule</string>
+		<key>EXExtensionPrincipalClass</key>
+		<string>StrataFileSystem</string>
+		<key>FSShortName</key>
+		<string>stratafs</string>
+		<key>FSPersonalities</key>
+		<dict>
+			<key>stratafs</key>
+			<dict>
+				<key>FSName</key>
+				<string>stratafs</string>
+			</dict>
+		</dict>
+		<key>FSActivateOptionSyntax</key>
+		<dict>
+			<key>shortOptions</key>
+			<string>o:</string>
+		</dict>
+		<key>FSMediaTypes</key>
+		<dict/>
+		<key>FSSupportsBlockResources</key>
+		<false/>
+		<key>FSSupportsGenericURLResources</key>
+		<false/>
+		<key>FSSupportsPathURLs</key>
+		<true/>
+		<key>FSRequiresSecurityScopedPathURLResources</key>
+		<true/>
+		<key>FSSupportsServerURLs</key>
+		<false/>
+	</dict>
+</dict>
+</plist>

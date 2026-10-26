@@ -1,7 +1,7 @@
 use bytes::{Buf, BytesMut};
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
-use stratafs_redb::{Inline, RedbStore};
+use stratafs_redb::{CommitDurability, Inline, RedbStore};
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
@@ -65,7 +65,7 @@ fn three_level_volume() -> Volume<RedbStore<Inline>> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
-    let store = RedbStore::new(database, Inline).unwrap();
+    let store = RedbStore::new(database, Inline, CommitDurability::EveryCommit, || Ok(())).unwrap();
     store_three_levels(&store);
     let tree = block_on(Tree::<_, fn() -> u128, SmallConfig>::new(store, || 1)).unwrap();
     block_on(tree.open(VOLUME)).unwrap()

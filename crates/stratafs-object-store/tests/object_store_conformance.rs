@@ -1,8 +1,8 @@
-use opendal::Operator;
-use stratafs_opendal::OpendalContentStore;
+use object_store::memory::InMemory;
+use stratafs_object_store::ObjectStoreContentStore;
 
-fn memory_store() -> OpendalContentStore {
-    OpendalContentStore::new(Operator::new(opendal::services::Memory::default()).unwrap())
+fn memory_store() -> ObjectStoreContentStore {
+    ObjectStoreContentStore::new(InMemory::new())
 }
 
 #[test]

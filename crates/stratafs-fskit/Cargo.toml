@@ -19,6 +19,7 @@ extension = [
     "dep:objc2-fs-kit",
     "dep:stratafs-fs-engine",
     "dep:stratafs-store",
+    "dep:tracing",
     "dep:uuid",
 ]
 
@@ -37,12 +38,13 @@ objc2-fs-kit = { workspace = true, optional = true }
 stratafs-fs-engine = { workspace = true, optional = true }
 stratafs-store = { workspace = true, optional = true }
 thiserror.workspace = true
+tracing = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
-opendal = { workspace = true, features = ["services-memory"] }
+object_store.workspace = true
 redb = "4.4.0"
-stratafs-opendal.workspace = true
+stratafs-object-store.workspace = true
 stratafs-redb.workspace = true
 stratafs-tree.workspace = true
 

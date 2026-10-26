@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use futures_lite::future::block_on;
-use stratafs_opendal::OpendalError;
+use stratafs_object_store::ObjectStoreError;
 use stratafs_serialized::FINGERPRINT_LENGTH;
 use zerocopy::IntoBytes;
 
@@ -20,7 +20,7 @@ fn setattr(
     engine: &InMemoryEngine,
     inode: Inode,
     update: impl Fn(&mut SettableAttributes) + Send + Sync,
-) -> Result<Attributes, SetattrError<MetadataFailure, Infallible, OpendalError>> {
+) -> Result<Attributes, SetattrError<MetadataFailure, Infallible, ObjectStoreError>> {
     let update = &update;
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {

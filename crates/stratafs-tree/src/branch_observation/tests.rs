@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_lite::future::{block_on, poll_once};
 use redb::backends::InMemoryBackend;
-use stratafs_redb::{Inline, RedbStore};
+use stratafs_redb::{CommitDurability, Inline, RedbStore};
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueTransaction, SetRejection};
@@ -26,9 +26,12 @@ fn open_volume() -> TreeVolume<RedbStore<Inline>, impl Fn() -> u128, SmallNodeCo
     let next_id = AtomicU64::new(1);
     let allocate_id = move || u128::from(next_id.fetch_add(1, Ordering::Relaxed));
     block_on(async {
-        let tree = Tree::new(RedbStore::new(database, Inline).unwrap(), allocate_id)
-            .await
-            .unwrap();
+        let tree = Tree::new(
+            RedbStore::new(database, Inline, CommitDurability::EveryCommit, || Ok(())).unwrap(),
+            allocate_id,
+        )
+        .await
+        .unwrap();
         let id = tree.create().await.unwrap();
         tree.open(id).await.unwrap()
     })

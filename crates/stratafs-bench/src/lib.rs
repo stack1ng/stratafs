@@ -1,0 +1,225 @@
+// stratafs-bench is a stratafs build for benchmarking: one store directory on this machine, holding every
+// volume, with the tuning constants this build was made with.
+
+pub mod suite;
+
+use std::io;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use stratafs_fs_engine::error::PosixError;
+use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
+use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
+use stratafs_redb::{CommitDurability, RedbStore, ThreadPool};
+use stratafs_store::error::StoreError;
+use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
+use stratafs_store::kv::{KeyValueStore, TransactError};
+use stratafs_tree::header::TreeVolumeId;
+use stratafs_tree::tree::PinnedConfigError;
+use stratafs_tree::tree::{Tree, TreeConfig};
+use stratafs_tree::volume::TreeVolume;
+
+// The tuning constants come from the build's environment, so the benchmark builds once per configuration.
+// A store remembers the tree constants it was made with, and refuses to open with others.
+pub struct BenchTreeConfig;
+
+impl TreeConfig for BenchTreeConfig {
+    type Range = u16;
+    const NODE_CAPACITY: usize = number(option_env!("STRATAFS_BENCH_NODE_CAPACITY"), 16 * 1024);
+    const MERGE_BELOW_PERCENT: u8 =
+        number(option_env!("STRATAFS_BENCH_MERGE_BELOW_PERCENT"), 25) as u8;
+}
+
+pub struct BenchFsConfig;
+
+impl FsConfig for BenchFsConfig {
+    const LARGEST_INLINE_ENTRY: usize =
+        number(option_env!("STRATAFS_BENCH_LARGEST_INLINE_ENTRY"), 4 * 1024);
+}
+
+// DURABILITY is how often commits reach the disk: every-commit, never, or a number of milliseconds to flush at
+// most once in.
+pub const DURABILITY: CommitDurability = durability(option_env!("STRATAFS_BENCH_DURABILITY"));
+
+type Metadata = RedbStore<ThreadPool>;
+type MetadataRejection = <Metadata as KeyValueStore>::Rejection;
+type MetadataFailure = <Metadata as KeyValueStore>::Failure;
+
+pub type BenchTree = Tree<Metadata, fn() -> u128, BenchTreeConfig>;
+
+pub type BenchVolume = TreeVolume<Metadata, fn() -> u128, BenchTreeConfig>;
+type VolumeRejection = <BenchVolume as KeyValueStore>::Rejection;
+type VolumeFailure = <BenchVolume as KeyValueStore>::Failure;
+
+pub type BenchEngine =
+    FsEngine<BenchVolume, ObjectStoreContentStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig>;
+
+// Store is the store directory opened: the tree holding every volume, and the content of every file.
+pub struct Store {
+    pub tree: BenchTree,
+    pub content: ObjectStoreContentStore,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenStoreError {
+    #[error("the store directory could not be made")]
+    Directory(#[source] io::Error),
+    #[error("the store is open in another mount")]
+    AlreadyOpen,
+    #[error("the store's database could not be opened")]
+    Database(#[source] redb::DatabaseError),
+    #[error("the store's table could not be made")]
+    Table(#[source] redb::Error),
+    #[error("the store's tree could not be opened")]
+    Tree(
+        #[source]
+        TransactError<
+            MetadataRejection,
+            MetadataFailure,
+            PinnedConfigError<MetadataRejection, MetadataFailure>,
+        >,
+    ),
+    #[error("the store's content could not be opened")]
+    Content(#[source] ObjectStoreError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenVolumeError {
+    #[error(transparent)]
+    Store(#[from] OpenStoreError),
+    #[error("the store has no such volume")]
+    UnknownVolume,
+    #[error("the volume could not be opened")]
+    Volume(#[source] <BenchTree as ForkableKeyValueStore>::Failure),
+    #[error("the volume's root directory could not be made")]
+    Root(
+        #[source]
+        TransactError<VolumeRejection, VolumeFailure, StoreError<VolumeRejection, VolumeFailure>>,
+    ),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CreateVolumeError {
+    #[error(transparent)]
+    Store(#[from] OpenStoreError),
+    #[error("the volume could not be created")]
+    Create(#[source] <BenchTree as ForkableKeyValueStore>::CreateError),
+    #[error(transparent)]
+    Open(#[from] OpenVolumeError),
+}
+
+impl From<&OpenVolumeError> for PosixError {
+    fn from(error: &OpenVolumeError) -> Self {
+        match error {
+            OpenVolumeError::Store(OpenStoreError::AlreadyOpen) => PosixError::EBUSY,
+            OpenVolumeError::UnknownVolume => PosixError::ENOENT,
+            OpenVolumeError::Store(_) | OpenVolumeError::Volume(_) | OpenVolumeError::Root(_) => {
+                PosixError::EIO
+            }
+        }
+    }
+}
+
+// open_store opens the store in directory, making it first if the directory holds none.
+pub async fn open_store(directory: &Path) -> Result<Store, OpenStoreError> {
+    std::fs::create_dir_all(directory).map_err(OpenStoreError::Directory)?;
+    let content = ObjectStoreContentStore::local(directory.join("content"))
+        .map_err(OpenStoreError::Content)?;
+    let database =
+        redb::Database::create(directory.join("metadata.redb")).map_err(|error| match error {
+            redb::DatabaseError::DatabaseAlreadyOpen => OpenStoreError::AlreadyOpen,
+            error => OpenStoreError::Database(error),
+        })?;
+    // Content reaches the disk on the metadata's cadence, just before the metadata that names it.
+    let flushed_content = content.clone();
+    let metadata = RedbStore::new(database, ThreadPool, DURABILITY, move || {
+        flushed_content.flush()
+    })
+    .map_err(OpenStoreError::Table)?;
+    let allocate_node: fn() -> u128 = rand::random;
+    let tree = Tree::new(metadata, allocate_node)
+        .await
+        .map_err(OpenStoreError::Tree)?;
+    Ok(Store { tree, content })
+}
+
+// open_volume opens volume from the store in directory.
+pub async fn open_volume(
+    directory: &Path,
+    volume: TreeVolumeId,
+) -> Result<BenchEngine, OpenVolumeError> {
+    let store = open_store(directory).await?;
+    engine(store, volume).await
+}
+
+// create_volume makes a new, empty volume in the store in directory, and returns its id.
+pub async fn create_volume(directory: &Path) -> Result<TreeVolumeId, CreateVolumeError> {
+    let store = open_store(directory).await?;
+    let volume = store
+        .tree
+        .create()
+        .await
+        .map_err(CreateVolumeError::Create)?;
+    // Opening the engine makes the volume's root directory, so a mount finds it ready.
+    engine(store, volume).await?;
+    Ok(volume)
+}
+
+async fn engine(store: Store, volume: TreeVolumeId) -> Result<BenchEngine, OpenVolumeError> {
+    let metadata = store.tree.open(volume).await.map_err(|error| match error {
+        StoreError::Rejected(UnknownVolume) => OpenVolumeError::UnknownVolume,
+        StoreError::Failed(failure) => OpenVolumeError::Volume(failure),
+    })?;
+    let allocate_inode: fn() -> u64 = rand::random;
+    FsEngine::new(
+        metadata,
+        store.content,
+        allocate_inode,
+        now as fn() -> Timestamp,
+    )
+    .await
+    .map_err(OpenVolumeError::Root)
+}
+
+// now is the time in nanoseconds since the Unix epoch.
+fn now() -> Timestamp {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after 1970");
+    Timestamp(i64::try_from(since_epoch.as_nanos()).expect("the clock is before 2262"))
+}
+
+// number reads a decimal build setting, or default when the build does not set it. A setting that is not a
+// number stops the build.
+const fn number(setting: Option<&str>, default: usize) -> usize {
+    let Some(setting) = setting else {
+        return default;
+    };
+    let digits = setting.as_bytes();
+    assert!(!digits.is_empty(), "a numeric build setting is empty");
+    let mut value = 0;
+    let mut index = 0;
+    while index < digits.len() {
+        let digit = digits[index];
+        assert!(
+            digit.is_ascii_digit(),
+            "a numeric build setting is not a number"
+        );
+        value = value * 10 + (digit - b'0') as usize;
+        index += 1;
+    }
+    value
+}
+
+const fn durability(setting: Option<&str>) -> CommitDurability {
+    match setting {
+        None => CommitDurability::EveryCommit,
+        Some(setting) => match setting.as_bytes() {
+            b"every-commit" => CommitDurability::EveryCommit,
+            b"never" => CommitDurability::Never,
+            _ => CommitDurability::AtMostEvery(Duration::from_millis(
+                number(Some(setting), 0) as u64
+            )),
+        },
+    }
+}

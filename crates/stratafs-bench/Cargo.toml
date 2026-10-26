@@ -1,0 +1,34 @@
+[package]
+name = "stratafs-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+futures-lite.workspace = true
+hex.workspace = true
+rand.workspace = true
+redb = "4.4.0"
+serde.workspace = true
+serde_json.workspace = true
+stratafs-fs-engine.workspace = true
+stratafs-object-store.workspace = true
+stratafs-redb.workspace = true
+stratafs-store.workspace = true
+stratafs-tree.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+futures-executor.workspace = true
+stratafs-fskit = { workspace = true, features = ["extension"] }
+tracing.workspace = true
+tracing-oslog.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
