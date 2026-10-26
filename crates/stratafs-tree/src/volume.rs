@@ -6,6 +6,7 @@ use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
 use smallvec::SmallVec;
 use stratafs_range_bounds_map::RangeBoundsMap;
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkingTransaction;
 use stratafs_store::kv::{
@@ -192,8 +193,8 @@ where
     }
 
     // ensure_durable makes the whole store durable, since every volume shares it.
-    async fn ensure_durable(&self) -> Result<(), Self::Failure> {
-        Ok(self.shared.store.ensure_durable().await?)
+    async fn ensure_durable(&self, against: DurableAgainst) -> Result<(), Self::Failure> {
+        Ok(self.shared.store.ensure_durable(against).await?)
     }
 }
 

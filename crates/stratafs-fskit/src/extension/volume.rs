@@ -26,6 +26,7 @@ use stratafs_fs_engine::attributes::FileType;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{Inode, LARGEST_NAME_LENGTH};
+use stratafs_store::durability::DurableAgainst;
 
 use super::changes::attribute_change;
 use super::item::{StrataItem, file_name, name_bytes};
@@ -141,6 +142,10 @@ define_class!(
         }
 
         // synchronize makes every committed operation durable, replying at once when FSKit asks it not to wait.
+        // A sync nothing waits on can afford to survive a power failure; one that is waited on survives a software
+        // failure.
+        // TODO: FSKit gives an app's F_FULLFSYNC the same flags as the other syncs that are waited on, so it only
+        // survives a software failure. Once FSKit tells it apart, make it durable against a power failure.
         #[unsafe(method(synchronizeWithFlags:replyHandler:))]
         fn synchronize(
             &self,
@@ -148,10 +153,14 @@ define_class!(
             reply: &SendableBlock<'static, fn(*mut NSError)>,
         ) {
             let reply = reply.copy();
+            let waits = flags.0 & FSSyncFlags::NoWait.0 == 0;
+            let against = if waits {
+                DurableAgainst::SoftwareFailure
+            } else {
+                DurableAgainst::PowerFailure
+            };
             match self.active_operations() {
-                Some(operations) => {
-                    operations.ensure_durable(flags.0 & FSSyncFlags::NoWait.0 == 0, reply)
-                }
+                Some(operations) => operations.ensure_durable(against, waits, reply),
                 // With no engine open, nothing committed waits to be made durable.
                 None => reply.call(null_mut()),
             }

@@ -1599,8 +1599,8 @@ dependencies = [
  "cfg_aliases",
  "futures-lite",
  "futures-util",
+ "nix",
  "object_store",
- "rustix",
  "stratafs-content-conformance",
  "stratafs-store",
  "tempfile",
@@ -1625,10 +1625,12 @@ dependencies = [
  "futures-core",
  "futures-lite",
  "futures-util",
+ "nix",
  "redb",
  "stratafs-keyed-notify",
  "stratafs-kv-conformance",
  "stratafs-store",
+ "tempfile",
  "thiserror",
 ]
 

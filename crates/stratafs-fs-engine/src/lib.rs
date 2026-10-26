@@ -4,6 +4,7 @@ use async_lock::RwLock;
 use futures_core::future::BoxFuture;
 use storekey::{BorrowDecode, Encode};
 use stratafs_store::content::ContentStore;
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
 
@@ -119,21 +120,22 @@ where
 }
 
 impl<M: KeyValueStore, C: ContentStore, A: Sync, N: Sync, S: Sync> FsEngine<M, C, A, N, S> {
-    // ensure_durable makes every transaction committed before it is called durable, and resolves once they are.
-    // The content goes first, so durable metadata never names content that is not.
+    // ensure_durable makes every transaction committed before it is called durable against a failure, and
+    // resolves once they are. The content goes first, so durable metadata never names content that is not.
     // It returns `impl Future + Send` instead of being `async fn` for the reason spillable.rs gives.
     #[allow(clippy::manual_async_fn)]
     pub fn ensure_durable(
         &self,
+        against: DurableAgainst,
     ) -> impl Future<Output = Result<(), IoFailure<M::Failure, C::Failure>>> + Send {
         async move {
             let _alone = self.writing.write().await;
             self.content
-                .ensure_durable()
+                .ensure_durable(against)
                 .await
                 .map_err(IoFailure::ContentWrite)?;
             self.metadata
-                .ensure_durable()
+                .ensure_durable(against)
                 .await
                 .map_err(IoFailure::Metadata)
         }

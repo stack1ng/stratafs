@@ -29,6 +29,7 @@ futures-lite = "2.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hex = "0.4"
 libc = "0.2"
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 objc2 = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
 objc2-foundation = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
 objc2-fs-kit = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
@@ -36,7 +37,6 @@ object_store = { version = "0.14", default-features = false }
 proptest = { version = "1.5", default-features = false, features = ["std"] }
 rand = "0.10"
 rangemap = "1.8"
-rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shuttle = "0.9.7"

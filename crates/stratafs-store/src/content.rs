@@ -1,6 +1,7 @@
 use bytes::Buf;
 use thiserror::Error;
 
+use crate::durability::DurableAgainst;
 use crate::error::StoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,7 +42,10 @@ pub trait ContentStore: Send + Sync {
         size: u64,
     ) -> impl Future<Output = Result<Self::Content, StoreError<GetRejection, Self::Failure>>> + Send;
 
-    // ensure_durable makes every put that finished before it is called durable, and resolves once they are.
-    // A store whose puts are durable when put returns has nothing to do.
-    fn ensure_durable(&self) -> impl Future<Output = Result<(), Self::Failure>> + Send;
+    // ensure_durable makes every put that finished before it is called durable against a failure, and resolves
+    // once they are.
+    fn ensure_durable(
+        &self,
+        against: DurableAgainst,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }

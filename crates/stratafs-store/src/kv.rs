@@ -4,6 +4,7 @@ use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
 
+use crate::durability::DurableAgainst;
 use crate::error::StoreError;
 
 #[derive(Debug, thiserror::Error)]
@@ -68,8 +69,12 @@ pub trait KeyValueStore: Send + Sync + 'static {
         seen: Option<Bytes>,
     ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 
-    // ensure_durable makes every transaction committed before it is called durable, and resolves once they are.
-    fn ensure_durable(&self) -> impl Future<Output = Result<(), Self::Failure>> + Send;
+    // ensure_durable makes every transaction committed before it is called durable against a failure, and
+    // resolves once they are.
+    fn ensure_durable(
+        &self,
+        against: DurableAgainst,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }
 
 // TransactionHandle gives work its transaction by value, so a store can wrap another store's transaction in its own without allocating.

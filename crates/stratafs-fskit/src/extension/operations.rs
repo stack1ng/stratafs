@@ -27,6 +27,7 @@ use stratafs_fs_engine::directories::{NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, IoFailure, PosixError};
 use stratafs_fs_engine::{FsConfig, FsEngine, Inode, Timestamp};
 use stratafs_store::content::ContentStore;
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::{KeyValueStore, TransactError};
 
 use super::changes::AttributeChange;
@@ -160,9 +161,10 @@ pub(crate) trait VolumeOperations: Send + Sync {
 
     fn list_xattrs(self: Arc<Self>, inode: Inode, reply: Reply<FSListXattrsResult>);
 
-    // ensure_durable makes every committed operation durable. With wait it replies once they are; without it,
+    // ensure_durable makes every committed operation durable against a failure. With wait it replies once they
+    // are; without it,
     // it replies at once and lets that finish on its own.
-    fn ensure_durable(self: Arc<Self>, wait: bool, reply: ErrorReply);
+    fn ensure_durable(self: Arc<Self>, against: DurableAgainst, wait: bool, reply: ErrorReply);
 }
 
 // Volume is a mounted volume's engine. Each operation replies when it finishes, on FSKit's thread unless it
@@ -191,7 +193,7 @@ where
     S: FsConfig,
 {
     fn drop(&mut self) {
-        if let Err(error) = block_on(self.engine.ensure_durable()) {
+        if let Err(error) = block_on(self.engine.ensure_durable(DurableAgainst::PowerFailure)) {
             tracing::warn!(%error, "making the volume durable before closing it failed");
         }
     }
@@ -945,12 +947,12 @@ where
         });
     }
 
-    fn ensure_durable(self: Arc<Self>, wait: bool, reply: ErrorReply) {
+    fn ensure_durable(self: Arc<Self>, against: DurableAgainst, wait: bool, reply: ErrorReply) {
         if !wait {
             reply.call(null_mut());
         }
         self.run(move |volume| async move {
-            match (volume.engine.ensure_durable().await, wait) {
+            match (volume.engine.ensure_durable(against).await, wait) {
                 (Ok(()), true) => reply.call(null_mut()),
                 (Err(error), true) => {
                     let error = posix_error(errno(PosixError::EIO), &error.to_string());

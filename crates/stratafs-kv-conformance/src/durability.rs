@@ -2,6 +2,7 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use proptest::test_runner::TestCaseError;
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction, TransactError};
 
 use crate::activity::{SimulatedCall, SimulatedRead, SimulatedStop, SimulatedTransaction};
@@ -245,7 +246,7 @@ async fn run_client_until_crash<S: KeyValueStore, C: CrashableStorage>(
         match result {
             Ok(outcome) => {
                 // A store only promises a transaction survives once ensure_durable returns after it.
-                let durable = store.ensure_durable().await;
+                let durable = store.ensure_durable(DurableAgainst::PowerFailure).await;
                 if crashed() {
                     return Ok(());
                 }

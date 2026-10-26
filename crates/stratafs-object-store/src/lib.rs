@@ -9,6 +9,7 @@ use futures_util::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use thiserror::Error;
 
@@ -144,15 +145,17 @@ impl ContentStore for ObjectStoreContentStore {
         self.load(*hash, offset, size)
     }
 
-    async fn ensure_durable(&self) -> Result<(), Self::Failure> {
+    async fn ensure_durable(&self, against: DurableAgainst) -> Result<(), Self::Failure> {
         #[cfg(disk)]
         if let Some(unflushed) = &self.unflushed {
             // The flush waits on the disk, so it runs on a thread of its own while this yields.
             let unflushed = Arc::clone(unflushed);
-            blocking::unblock(move || unflushed.flush())
+            blocking::unblock(move || unflushed.flush(against))
                 .await
                 .map_err(ObjectStoreError::Flush)?;
         }
+        #[cfg(not(disk))]
+        let _ = against;
         Ok(())
     }
 }

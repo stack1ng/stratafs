@@ -7,8 +7,9 @@ use bytes::Bytes;
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
 use redb::{Database, StorageBackend};
-use stratafs_redb::{RedbStore, SpawnBlocking};
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction};
+use stratafs_redb::{Inline, RedbStore, SpawnBlocking};
+use stratafs_store::durability::DurableAgainst;
+use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
 
 // CountedFlushes is an in memory backend that counts each flush to the disk.
 #[derive(Debug)]
@@ -88,13 +89,56 @@ fn ensure_durable_flushes_what_was_committed_once() {
     assert_eq!(flushes.load(Ordering::SeqCst), 0);
     assert_eq!(spawns.load(Ordering::SeqCst), 0);
 
-    block_on(store.ensure_durable()).unwrap();
+    block_on(store.ensure_durable(DurableAgainst::PowerFailure)).unwrap();
     assert!(flushes.load(Ordering::SeqCst) > 0);
     assert_eq!(spawns.load(Ordering::SeqCst), 1);
 
     // Nothing was committed since, so there is nothing to take to the disk.
     flushes.store(0, Ordering::SeqCst);
-    block_on(store.ensure_durable()).unwrap();
+    block_on(store.ensure_durable(DurableAgainst::PowerFailure)).unwrap();
     assert_eq!(flushes.load(Ordering::SeqCst), 0);
     assert_eq!(spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn ensure_durable_flushes_only_what_is_not_yet_durable_against_the_failure() {
+    let (store, flushes, _) = open();
+    let flushed_by = |against| {
+        flushes.store(0, Ordering::SeqCst);
+        block_on(store.ensure_durable(against)).unwrap();
+        flushes.load(Ordering::SeqCst) > 0
+    };
+    commit(&store, b"a");
+    assert!(flushed_by(DurableAgainst::SoftwareFailure));
+    assert!(!flushed_by(DurableAgainst::SoftwareFailure));
+    // Surviving a software failure does not make the commit survive a power failure.
+    assert!(flushed_by(DurableAgainst::PowerFailure));
+    assert!(!flushed_by(DurableAgainst::SoftwareFailure));
+    assert!(!flushed_by(DurableAgainst::PowerFailure));
+}
+
+#[test]
+fn a_local_store_keeps_its_commits_in_its_file_and_refuses_a_second_opening() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("metadata.redb");
+    let store = RedbStore::local(&path, Inline).unwrap();
+    assert!(matches!(
+        RedbStore::local(&path, Inline),
+        Err(redb::Error::DatabaseAlreadyOpen)
+    ));
+    commit(&store, b"a");
+    block_on(store.ensure_durable(DurableAgainst::SoftwareFailure)).unwrap();
+    commit(&store, b"b");
+    block_on(store.ensure_durable(DurableAgainst::PowerFailure)).unwrap();
+    drop(store);
+    let reopened = RedbStore::local(&path, Inline).unwrap();
+    for key in [&b"a"[..], b"b"] {
+        let value = block_on(reopened.read_transact(|transaction| {
+            Box::pin(async move {
+                Ok::<_, Infallible>(transaction.get(Bytes::from_static(key)).await.unwrap())
+            })
+        }))
+        .unwrap();
+        assert_eq!(value, Some(Bytes::from_static(b"value")), "{key:?}");
+    }
 }

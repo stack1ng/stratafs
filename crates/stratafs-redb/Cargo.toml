@@ -16,6 +16,7 @@ thiserror.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 blocking.workspace = true
+nix.workspace = true
 
 [build-dependencies]
 cfg_aliases.workspace = true
@@ -26,3 +27,4 @@ workspace = true
 [dev-dependencies]
 futures-lite.workspace = true
 stratafs-kv-conformance.workspace = true
+tempfile = "3"

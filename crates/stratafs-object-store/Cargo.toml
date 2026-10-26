@@ -24,7 +24,7 @@ tempfile = "3"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 blocking.workspace = true
 object_store = { workspace = true, features = ["fs"] }
-rustix.workspace = true
+nix.workspace = true
 
 [build-dependencies]
 cfg_aliases.workspace = true

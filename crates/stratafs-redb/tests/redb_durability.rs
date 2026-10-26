@@ -11,6 +11,7 @@ use redb::StorageBackend;
 use stratafs_kv_conformance::durability::CrashableStorage;
 use stratafs_kv_conformance::runtime::seeded;
 use stratafs_redb::RedbStore;
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
 
 #[test]
@@ -127,7 +128,7 @@ fn what_ensure_durable_made_durable_survives_a_crash() {
     let storage = CrashableMemory::default();
     let store = common::open_store(storage.clone());
     set(&store, b"made durable");
-    block_on(store.ensure_durable()).unwrap();
+    block_on(store.ensure_durable(DurableAgainst::PowerFailure)).unwrap();
     set(&store, b"left unflushed");
     let reopened = reopen_crashed_store(storage);
     assert_eq!(

@@ -1,15 +1,22 @@
+#[cfg(disk)]
+use std::io;
+#[cfg(disk)]
+use std::ops::Bound;
 use std::ops::RangeBounds;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
 use futures_util::lock::Mutex;
+#[cfg(disk)]
+use redb::BackendError;
 use redb::{
     CommitError, Database, Durability, Error, ReadOnlyTable, ReadableDatabase, ReadableTable,
     StorageError, Table, TableDefinition, TableError, TransactionError,
 };
 
 use stratafs_keyed_notify::KeyedNotify;
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
@@ -66,13 +73,15 @@ pub struct RedbStore<S> {
     writer: Mutex<Writer>,
     notify: Arc<KeyedNotify>,
     spawner: S,
+    // syncs is the failure the store's file syncs a durable commit against, when the store opened its own file.
+    syncs: Option<Arc<std::sync::Mutex<DurableAgainst>>>,
 }
 
 // Writer is what the one write transaction at a time keeps between commits.
 struct Writer {
     written: Vec<Bytes>,
-    // unflushed_commits is whether a commit since the last ensure_durable has not reached the disk.
-    unflushed_commits: bool,
+    // current_durable_against is what every commit so far is durable against, or None while one is only in memory.
+    current_durable_against: Option<DurableAgainst>,
 }
 
 impl<S> RedbStore<S> {
@@ -84,12 +93,116 @@ impl<S> RedbStore<S> {
             database,
             writer: Mutex::new(Writer {
                 written: Vec::new(),
-                unflushed_commits: false,
+                current_durable_against: Some(DurableAgainst::PowerFailure),
             }),
             notify: Arc::new(KeyedNotify::new()),
             spawner,
+            syncs: None,
         })
     }
+
+    // local keeps the store in a database file at path on this machine's disk, flushing the disk's own cache
+    // only when ensure_durable is against a power failure.
+    #[cfg(disk)]
+    pub fn local(path: impl AsRef<std::path::Path>, spawner: S) -> Result<Self, Error> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let syncs = Arc::new(std::sync::Mutex::new(DurableAgainst::PowerFailure));
+        let database = Database::builder().create_with_backend(SyncedFile {
+            file: file.try_clone()?,
+            backend: redb::backends::FileBackend::new(file)?,
+            syncs: Arc::clone(&syncs),
+        })?;
+        let mut store = Self::new(database, spawner)?;
+        store.syncs = Some(syncs);
+        Ok(store)
+    }
+}
+
+// SyncedFile is redb's file backend, syncing each commit that reaches the disk against the failure its store
+// asks for.
+#[cfg(disk)]
+#[derive(Debug)]
+struct SyncedFile {
+    backend: redb::backends::FileBackend,
+    file: std::fs::File,
+    syncs: Arc<std::sync::Mutex<DurableAgainst>>,
+}
+
+#[cfg(disk)]
+impl redb::StorageBackend for SyncedFile {
+    fn len(&self) -> io::Result<u64> {
+        self.backend.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.backend.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.backend.set_len(len)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        match *self.syncs.lock().unwrap_or_else(PoisonError::into_inner) {
+            DurableAgainst::SoftwareFailure => sync_in_order(&self.file),
+            DurableAgainst::PowerFailure => self.backend.sync_data(),
+        }
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.backend.write(offset, data)
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.backend.close()
+    }
+
+    fn try_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        self.backend.try_lock_range(start, end)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.backend.try_lock_shared_range(start, end)
+    }
+
+    fn lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.backend.lock_range(start, end)
+    }
+
+    fn lock_shared_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.backend.lock_shared_range(start, end)
+    }
+
+    fn unlock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.backend.unlock_range(start, end)
+    }
+
+    fn query_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        self.backend.query_lock_range(start, end)
+    }
+}
+
+// sync_in_order hands file to the disk with a barrier, so nothing written after it reaches the disk before it,
+// without waiting for the disk to flush its own cache. Elsewhere than Apple's systems a sync always flushes it.
+#[cfg(all(disk, target_vendor = "apple"))]
+fn sync_in_order(file: &std::fs::File) -> io::Result<()> {
+    nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_BARRIERFSYNC)
+        .map(|_| ())
+        .map_err(io::Error::from)
+}
+
+#[cfg(all(disk, not(target_vendor = "apple")))]
+fn sync_in_order(file: &std::fs::File) -> io::Result<()> {
+    file.sync_data()
 }
 
 impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
@@ -133,7 +246,7 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
                 }
             };
             transaction.commit()?;
-            writer.unflushed_commits = true;
+            writer.current_durable_against = None;
             self.notify.notify_waiters(&writer.written);
             Ok(Ok(output))
         }
@@ -181,10 +294,13 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
             .await
     }
 
-    async fn ensure_durable(&self) -> Result<(), Self::Failure> {
+    async fn ensure_durable(&self, against: DurableAgainst) -> Result<(), Self::Failure> {
         let mut writer = self.writer.lock().await;
-        if !writer.unflushed_commits {
+        if matches!(writer.current_durable_against, Some(durable) if durable >= against) {
             return Ok(());
+        }
+        if let Some(syncs) = &self.syncs {
+            *syncs.lock().unwrap_or_else(PoisonError::into_inner) = against;
         }
         // An empty commit that reaches the disk takes every commit before it there too. It waits on the disk,
         // so it goes to the spawner.
@@ -195,7 +311,7 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for RedbStore<S> {
         self.spawner
             .spawn_blocking(move || transaction.commit())
             .await?;
-        writer.unflushed_commits = false;
+        writer.current_durable_against = Some(against);
         Ok(())
     }
 }

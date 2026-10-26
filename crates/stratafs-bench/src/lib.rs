@@ -63,9 +63,7 @@ pub enum OpenStoreError {
     #[error("the store is open in another mount")]
     AlreadyOpen,
     #[error("the store's database could not be opened")]
-    Database(#[source] redb::DatabaseError),
-    #[error("the store's table could not be made")]
-    Table(#[source] redb::Error),
+    Database(#[source] redb::Error),
     #[error("the store's tree could not be opened")]
     Tree(
         #[source]
@@ -121,12 +119,12 @@ pub async fn open_store(directory: &Path) -> Result<Store, OpenStoreError> {
     std::fs::create_dir_all(directory).map_err(OpenStoreError::Directory)?;
     let content = ObjectStoreContentStore::local(directory.join("content"))
         .map_err(OpenStoreError::Content)?;
-    let database =
-        redb::Database::create(directory.join("metadata.redb")).map_err(|error| match error {
-            redb::DatabaseError::DatabaseAlreadyOpen => OpenStoreError::AlreadyOpen,
+    let metadata = RedbStore::local(directory.join("metadata.redb"), ThreadPool).map_err(
+        |error| match error {
+            redb::Error::DatabaseAlreadyOpen => OpenStoreError::AlreadyOpen,
             error => OpenStoreError::Database(error),
-        })?;
-    let metadata = RedbStore::new(database, ThreadPool).map_err(OpenStoreError::Table)?;
+        },
+    )?;
     let allocate_node: fn() -> u128 = rand::random;
     let tree = Tree::new(metadata, allocate_node)
         .await

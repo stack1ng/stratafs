@@ -15,6 +15,7 @@ use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
 use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
 use stratafs_redb::{Inline, RedbStore};
 use stratafs_store::content::{ContentHash, ContentStore, GetRejection};
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 
 // Durable is which store made itself durable, or that a write transaction ran, in order.
@@ -56,7 +57,7 @@ impl ContentStore for LoggedContent {
         self.store.get(hash, offset, size)
     }
 
-    async fn ensure_durable(&self) -> Result<(), Self::Failure> {
+    async fn ensure_durable(&self, _against: DurableAgainst) -> Result<(), Self::Failure> {
         self.log.lock().unwrap().push(Durable::Content);
         if let Some(resume) = &self.resume {
             resume.lock().unwrap().recv().unwrap();
@@ -141,7 +142,7 @@ fn engine(content_fails: bool, resume: Option<Receiver<()>>) -> (TestEngine, Log
 #[test]
 fn ensure_durable_makes_the_content_durable_before_the_metadata() {
     let (engine, log) = engine(false, None);
-    block_on(engine.ensure_durable()).unwrap();
+    block_on(engine.ensure_durable(DurableAgainst::PowerFailure)).unwrap();
     let durable = log.lock().unwrap().clone();
     assert!(
         matches!(&durable[..], [Durable::Content, rest @ ..] if !rest.is_empty() && rest.iter().all(|store| *store == Durable::Metadata)),
@@ -153,7 +154,7 @@ fn ensure_durable_makes_the_content_durable_before_the_metadata() {
 fn ensure_durable_leaves_the_metadata_alone_when_the_content_fails() {
     let (engine, log) = engine(true, None);
     assert!(matches!(
-        block_on(engine.ensure_durable()),
+        block_on(engine.ensure_durable(DurableAgainst::PowerFailure)),
         Err(IoFailure::ContentWrite(ObjectStoreError::Flush(_)))
     ));
     assert_eq!(*log.lock().unwrap(), [Durable::Content]);
@@ -164,7 +165,7 @@ fn no_write_commits_between_the_content_and_the_metadata_becoming_durable() {
     let (resume, resumed) = channel();
     let (engine, log) = engine(false, Some(resumed));
     thread::scope(|scope| {
-        let durable = scope.spawn(|| block_on(engine.ensure_durable()));
+        let durable = scope.spawn(|| block_on(engine.ensure_durable(DurableAgainst::PowerFailure)));
         while !log.lock().unwrap().contains(&Durable::Content) {
             thread::yield_now();
         }
