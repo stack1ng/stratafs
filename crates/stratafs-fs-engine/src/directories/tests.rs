@@ -7,7 +7,9 @@ use stratafs_opendal::OpendalError;
 use super::*;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::content::error::ReadSymbolicLinkError;
-use crate::test_support::{InMemoryEngine, MetadataFailure, aborted, new_test_engine, set_clock};
+use crate::test_support::{
+    InMemoryEngine, MetadataFailure, aborted, new_test_engine, restrict, set_clock,
+};
 
 type Create = CreateError<MetadataFailure, Infallible, OpendalError>;
 type HardLink = HardLinkError<MetadataFailure, Infallible, OpendalError>;
@@ -915,4 +917,153 @@ fn hard_link_reports_an_existing_name_before_a_directory_source() {
         hard_link(&engine, d, Inode::ROOT, b"f"),
         Err(HardLinkError::AlreadyExists)
     ));
+}
+
+#[test]
+fn an_immutable_directory_neither_gains_nor_loses_entries() {
+    let engine = new_test_engine();
+    let d = directory(&engine, Inode::ROOT, b"d");
+    file(&engine, d, b"f");
+    directory(&engine, d, b"sub");
+    let other = file(&engine, Inode::ROOT, b"other");
+    for restriction in [
+        Restrictions::OWNER_IMMUTABLE,
+        Restrictions::ADMINISTRATOR_IMMUTABLE,
+    ] {
+        restrict(&engine, d, restriction);
+        assert!(matches!(
+            create(&engine, d, b"new", NewItem::File),
+            Err(CreateError::OperationNotPermitted)
+        ));
+        assert!(matches!(
+            hard_link(&engine, other, d, b"link"),
+            Err(HardLinkError::OperationNotPermitted)
+        ));
+        assert!(matches!(
+            hard_unlink(&engine, d, b"f", None),
+            Err(HardUnlinkError::OperationNotPermitted)
+        ));
+        assert!(matches!(
+            rmdir(&engine, d, b"sub"),
+            Err(RmdirError::OperationNotPermitted)
+        ));
+        for (dir, name, new_dir, new_name) in [
+            (d, &b"f"[..], Inode::ROOT, &b"g"[..]),
+            (Inode::ROOT, b"other", d, b"other"),
+            (d, b"f", d, b"g"),
+        ] {
+            assert!(matches!(
+                rename(&engine, dir, name, new_dir, new_name, RenameMode::Replace),
+                Err(RenameError::OperationNotPermitted)
+            ));
+        }
+    }
+    restrict(&engine, d, Restrictions::empty());
+    create(&engine, d, b"new", NewItem::File).unwrap();
+}
+
+#[test]
+fn an_append_only_directory_gains_entries_but_never_loses_them() {
+    for restriction in [
+        Restrictions::OWNER_APPEND_ONLY,
+        Restrictions::ADMINISTRATOR_APPEND_ONLY,
+    ] {
+        let engine = new_test_engine();
+        let d = directory(&engine, Inode::ROOT, b"d");
+        file(&engine, d, b"f");
+        directory(&engine, d, b"sub");
+        let other = file(&engine, Inode::ROOT, b"other");
+        file(&engine, Inode::ROOT, b"moved");
+        file(&engine, Inode::ROOT, b"renamed");
+        file(&engine, Inode::ROOT, b"replacing");
+        restrict(&engine, d, restriction);
+        create(&engine, d, b"new", NewItem::File).unwrap();
+        hard_link(&engine, other, d, b"link").unwrap();
+        rename(
+            &engine,
+            Inode::ROOT,
+            b"moved",
+            d,
+            b"moved",
+            RenameMode::NoReplace,
+        )
+        .unwrap();
+        rename(
+            &engine,
+            Inode::ROOT,
+            b"renamed",
+            d,
+            b"renamed",
+            RenameMode::Replace,
+        )
+        .unwrap();
+        assert_eq!(
+            names(&engine, d),
+            BTreeSet::from(["f", "sub", "new", "link", "moved", "renamed"].map(Bytes::from))
+        );
+        assert!(matches!(
+            hard_unlink(&engine, d, b"f", None),
+            Err(HardUnlinkError::OperationNotPermitted)
+        ));
+        assert!(matches!(
+            rmdir(&engine, d, b"sub"),
+            Err(RmdirError::OperationNotPermitted)
+        ));
+        for (dir, name, new_dir, new_name, mode) in [
+            (d, &b"f"[..], Inode::ROOT, &b"g"[..], RenameMode::Replace),
+            (d, b"f", d, b"g", RenameMode::Replace),
+            (Inode::ROOT, b"replacing", d, b"f", RenameMode::Replace),
+            (Inode::ROOT, b"replacing", d, b"f", RenameMode::Exchange),
+        ] {
+            assert!(
+                matches!(
+                    rename(&engine, dir, name, new_dir, new_name, mode),
+                    Err(RenameError::OperationNotPermitted)
+                ),
+                "{restriction:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_restricted_item_cannot_be_linked_unlinked_renamed_or_replaced() {
+    let engine = new_test_engine();
+    let a = file(&engine, Inode::ROOT, b"a");
+    let d = directory(&engine, Inode::ROOT, b"d");
+    file(&engine, Inode::ROOT, b"t");
+    for restriction in Restrictions::all() {
+        restrict(&engine, a, restriction);
+        restrict(&engine, d, restriction);
+        assert!(matches!(
+            hard_link(&engine, a, Inode::ROOT, b"a2"),
+            Err(HardLinkError::OperationNotPermitted)
+        ));
+        assert!(matches!(
+            hard_unlink(&engine, Inode::ROOT, b"a", None),
+            Err(HardUnlinkError::OperationNotPermitted)
+        ));
+        assert!(matches!(
+            rmdir(&engine, Inode::ROOT, b"d"),
+            Err(RmdirError::OperationNotPermitted)
+        ));
+        for (name, new_name, mode) in [
+            (&b"a"[..], &b"b"[..], RenameMode::Replace),
+            (b"d", b"e", RenameMode::Replace),
+            (b"t", b"a", RenameMode::Replace),
+            (b"t", b"a", RenameMode::Exchange),
+        ] {
+            assert!(
+                matches!(
+                    rename(&engine, Inode::ROOT, name, Inode::ROOT, new_name, mode),
+                    Err(RenameError::OperationNotPermitted)
+                ),
+                "{restriction:?}"
+            );
+        }
+        restrict(&engine, a, Restrictions::empty());
+        restrict(&engine, d, Restrictions::empty());
+    }
+    hard_unlink(&engine, Inode::ROOT, b"a", None).unwrap();
+    rmdir(&engine, Inode::ROOT, b"d").unwrap();
 }

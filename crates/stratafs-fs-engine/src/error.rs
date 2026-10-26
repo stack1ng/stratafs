@@ -54,6 +54,10 @@ pub enum CorruptValue {
     UnknownFileType,
     #[error("the stored mode has bits that are not mode bits")]
     UnknownModeBits,
+    #[error("the stored restrictions have bits that are not restrictions")]
+    UnknownRestrictionBits,
+    #[error("the stored hints have bits that are not hints")]
+    UnknownHintBits,
     #[error("a stored key could not be decoded")]
     UndecodableKey(#[source] storekey::DecodeError),
     #[error("a stored key is not the kind of key its position in the store implies")]

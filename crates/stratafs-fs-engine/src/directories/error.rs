@@ -36,6 +36,8 @@ pub enum CreateError<M, R, C> {
     StaleFileHandle,
     #[error("ENOTDIR: Not a directory")]
     NotADirectory,
+    #[error("EPERM: Operation not permitted")]
+    OperationNotPermitted,
     #[error("EEXIST: File exists")]
     AlreadyExists,
     #[error("EMLINK: Too many links")]
@@ -82,6 +84,8 @@ pub enum HardUnlinkError<M, R, C> {
     StaleFileHandle,
     #[error("ENOTDIR: Not a directory")]
     NotADirectory,
+    #[error("EPERM: Operation not permitted")]
+    OperationNotPermitted,
     #[error("ENOENT: No such file or directory")]
     NotFound,
     #[error("EISDIR: Is a directory")]
@@ -102,6 +106,8 @@ pub enum RmdirError<M, R, C> {
     StaleFileHandle,
     #[error("ENOTDIR: Not a directory")]
     NotADirectory,
+    #[error("EPERM: Operation not permitted")]
+    OperationNotPermitted,
     #[error("ENOENT: No such file or directory")]
     NotFound,
     #[error("ENOTEMPTY: Directory not empty")]
@@ -122,6 +128,8 @@ pub enum RenameError<M, R, C> {
     StaleFileHandle,
     #[error("ENOTDIR: Not a directory")]
     NotADirectory,
+    #[error("EPERM: Operation not permitted")]
+    OperationNotPermitted,
     #[error("EISDIR: Is a directory")]
     IsADirectory,
     #[error("ENOENT: No such file or directory")]
@@ -214,6 +222,7 @@ impl<M, R, C> From<&CreateError<M, R, C>> for PosixError {
             CreateError::FileNameTooLong => PosixError::ENAMETOOLONG,
             CreateError::StaleFileHandle => PosixError::ESTALE,
             CreateError::NotADirectory => PosixError::ENOTDIR,
+            CreateError::OperationNotPermitted => PosixError::EPERM,
             CreateError::AlreadyExists => PosixError::EEXIST,
             CreateError::TooManyLinks => PosixError::EMLINK,
             CreateError::StorageFull => PosixError::ENOSPC,
@@ -245,6 +254,7 @@ impl<M, R, C> From<&HardUnlinkError<M, R, C>> for PosixError {
             HardUnlinkError::FileNameTooLong => PosixError::ENAMETOOLONG,
             HardUnlinkError::StaleFileHandle => PosixError::ESTALE,
             HardUnlinkError::NotADirectory => PosixError::ENOTDIR,
+            HardUnlinkError::OperationNotPermitted => PosixError::EPERM,
             HardUnlinkError::NotFound => PosixError::ENOENT,
             HardUnlinkError::IsADirectory => PosixError::EISDIR,
             HardUnlinkError::Refused(_) | HardUnlinkError::InputOutputError(_) => PosixError::EIO,
@@ -259,6 +269,7 @@ impl<M, R, C> From<&RmdirError<M, R, C>> for PosixError {
             RmdirError::FileNameTooLong => PosixError::ENAMETOOLONG,
             RmdirError::StaleFileHandle => PosixError::ESTALE,
             RmdirError::NotADirectory => PosixError::ENOTDIR,
+            RmdirError::OperationNotPermitted => PosixError::EPERM,
             RmdirError::NotFound => PosixError::ENOENT,
             RmdirError::DirectoryNotEmpty => PosixError::ENOTEMPTY,
             RmdirError::Refused(_) | RmdirError::InputOutputError(_) => PosixError::EIO,
@@ -273,6 +284,7 @@ impl<M, R, C> From<&RenameError<M, R, C>> for PosixError {
             RenameError::FileNameTooLong => PosixError::ENAMETOOLONG,
             RenameError::StaleFileHandle => PosixError::ESTALE,
             RenameError::NotADirectory => PosixError::ENOTDIR,
+            RenameError::OperationNotPermitted => PosixError::EPERM,
             RenameError::IsADirectory => PosixError::EISDIR,
             RenameError::NotFound => PosixError::ENOENT,
             RenameError::AlreadyExists => PosixError::EEXIST,

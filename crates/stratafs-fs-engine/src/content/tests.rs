@@ -7,10 +7,10 @@ use stratafs_opendal::OpendalError;
 use super::*;
 use crate::Timestamp;
 use crate::attributes::error::SetattrError;
-use crate::attributes::{Mode, Ownership, SettableAttributes};
+use crate::attributes::{Hints, Mode, Ownership, Restrictions, SettableAttributes};
 use crate::directories::NewItem;
 use crate::test_support::{
-    InMemoryEngine, MetadataFailure, OneKibInline, aborted, new_test_engine, set_clock,
+    InMemoryEngine, MetadataFailure, OneKibInline, aborted, new_test_engine, restrict, set_clock,
 };
 
 fn stored(extent: &ExtentValue) -> Bytes {
@@ -88,6 +88,8 @@ fn file_of_size(engine: &InMemoryEngine, inode: Inode, size: u64) {
                 user_id: 0,
                 group_id: 0,
             },
+            restrictions: Restrictions::empty(),
+            hints: Hints::empty(),
             size,
             last_accessed_at: Timestamp(0),
             content_changed_at: Timestamp(0),
@@ -482,6 +484,66 @@ fn a_write_stores_one_extent_and_records_the_change() {
     assert_eq!(attributes.attribute_changed_at, Timestamp(5));
     assert_eq!(attributes.change_version, 1);
     assert_eq!(getattr(&engine, inode), Some(attributes));
+}
+
+#[test]
+fn an_immutable_file_refuses_every_write() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"abc").unwrap();
+    for restriction in [
+        Restrictions::OWNER_IMMUTABLE,
+        Restrictions::ADMINISTRATOR_IMMUTABLE,
+        Restrictions::OWNER_IMMUTABLE | Restrictions::OWNER_APPEND_ONLY,
+    ] {
+        restrict(&engine, inode, restriction);
+        for offset in [0, 3] {
+            assert!(
+                matches!(
+                    write(&engine, inode, offset, b"x"),
+                    Err(WriteError::OperationNotPermitted)
+                ),
+                "{restriction:?} at {offset}"
+            );
+        }
+    }
+    assert_eq!(
+        extents(&engine, inode),
+        vec![(0..3, Bytes::from_static(b"abc"))]
+    );
+}
+
+#[test]
+fn an_append_only_file_only_takes_writes_at_its_end() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    write(&engine, inode, 0, b"abc").unwrap();
+    for restriction in [
+        Restrictions::OWNER_APPEND_ONLY,
+        Restrictions::ADMINISTRATOR_APPEND_ONLY,
+    ] {
+        restrict(&engine, inode, restriction);
+        for offset in [0, 2, 10] {
+            assert!(
+                matches!(
+                    write(&engine, inode, offset, b"x"),
+                    Err(WriteError::OperationNotPermitted)
+                ),
+                "{restriction:?} at {offset}"
+            );
+        }
+    }
+    let attributes = write(&engine, inode, 3, b"de").unwrap();
+    assert_eq!(attributes.settable.size, 5);
+    assert_eq!(
+        extents(&engine, inode),
+        vec![
+            (0..3, Bytes::from_static(b"abc")),
+            (3..5, Bytes::from_static(b"de")),
+        ]
+    );
 }
 
 #[test]

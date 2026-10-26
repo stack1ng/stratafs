@@ -26,6 +26,8 @@ pub enum ListAnnotationsError<M, C> {
 pub enum SetAnnotationError<M, R, C> {
     #[error("ESTALE: Stale file handle")]
     StaleFileHandle,
+    #[error("EPERM: Operation not permitted")]
+    OperationNotPermitted,
     #[error("EINVAL: Invalid argument")]
     InvalidInput,
     #[error("ENAMETOOLONG: File name too long")]
@@ -44,6 +46,8 @@ pub enum SetAnnotationError<M, R, C> {
 pub enum RemoveAnnotationError<M, R, C> {
     #[error("ESTALE: Stale file handle")]
     StaleFileHandle,
+    #[error("EPERM: Operation not permitted")]
+    OperationNotPermitted,
     #[error("EINVAL: Invalid argument")]
     InvalidInput,
     #[error("ENAMETOOLONG: File name too long")]
@@ -98,6 +102,7 @@ impl<M, R, C> From<&SetAnnotationError<M, R, C>> for PosixError {
     fn from(error: &SetAnnotationError<M, R, C>) -> Self {
         match error {
             SetAnnotationError::StaleFileHandle => PosixError::ESTALE,
+            SetAnnotationError::OperationNotPermitted => PosixError::EPERM,
             SetAnnotationError::InvalidInput => PosixError::EINVAL,
             SetAnnotationError::FileNameTooLong => PosixError::ENAMETOOLONG,
             SetAnnotationError::AlreadyExists => PosixError::EEXIST,
@@ -113,6 +118,7 @@ impl<M, R, C> From<&RemoveAnnotationError<M, R, C>> for PosixError {
     fn from(error: &RemoveAnnotationError<M, R, C>) -> Self {
         match error {
             RemoveAnnotationError::StaleFileHandle => PosixError::ESTALE,
+            RemoveAnnotationError::OperationNotPermitted => PosixError::EPERM,
             RemoveAnnotationError::InvalidInput => PosixError::EINVAL,
             RemoveAnnotationError::FileNameTooLong => PosixError::ENAMETOOLONG,
             RemoveAnnotationError::AttributeNotFound => PosixError::ENOATTR,

@@ -6,6 +6,8 @@ use crate::error::{IoFailure, PosixError};
 pub enum SetattrError<M, R, C> {
     #[error("ESTALE: Stale file handle")]
     StaleFileHandle,
+    #[error("EPERM: Operation not permitted")]
+    OperationNotPermitted,
     #[error(transparent)]
     Refused(R),
     #[error("EIO: Input/output error")]
@@ -25,6 +27,7 @@ impl<M, R, C> From<&SetattrError<M, R, C>> for PosixError {
     fn from(error: &SetattrError<M, R, C>) -> Self {
         match error {
             SetattrError::StaleFileHandle => PosixError::ESTALE,
+            SetattrError::OperationNotPermitted => PosixError::EPERM,
             SetattrError::Refused(_) | SetattrError::InputOutputError(_) => PosixError::EIO,
         }
     }

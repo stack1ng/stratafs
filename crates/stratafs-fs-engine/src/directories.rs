@@ -13,7 +13,9 @@ use xxhash_rust::xxh3::xxh3_64;
 use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
-use crate::attributes::{Attributes, FileType, Mode, Ownership, SettableAttributes};
+use crate::attributes::{
+    Attributes, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
+};
 use crate::directories::error::{
     CreateError, HardLinkError, HardUnlinkError, LookupError, ReaddirError, RenameError, RmdirError,
 };
@@ -432,6 +434,9 @@ where
                 NameSearch::Full => return Err(CreateError::StorageFull),
                 NameSearch::Free(position) => position,
             };
+            if directory.settable.restrictions.immutable() {
+                return Err(CreateError::OperationNotPermitted);
+            }
             let hard_link_count = match kind {
                 FileType::Directory => {
                     directory.hard_link_count = directory
@@ -451,6 +456,8 @@ where
                         user_id: 0,
                         group_id: 0,
                     },
+                    restrictions: Restrictions::empty(),
+                    hints: Hints::empty(),
                     size,
                     last_accessed_at: now,
                     content_changed_at: now,
@@ -519,6 +526,10 @@ where
                 FileType::Directory => return Err(HardLinkError::OperationNotPermitted),
                 FileType::File | FileType::SymbolicLink => {}
             }
+            if !item.settable.restrictions.is_empty() || directory.settable.restrictions.immutable()
+            {
+                return Err(HardLinkError::OperationNotPermitted);
+            }
             let position = position.ok_or(HardLinkError::StorageFull)?;
             item.hard_link_count = item
                 .hard_link_count
@@ -571,6 +582,10 @@ where
                 .getattr(entry.inode)
                 .await?
                 .ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
+            if !directory.settable.restrictions.is_empty() || !item.settable.restrictions.is_empty()
+            {
+                return Err(HardUnlinkError::OperationNotPermitted);
+            }
             let now = self.now();
             if !self
                 .release_name(dir, entry.position, entry.inode, &mut item, now)
@@ -618,6 +633,10 @@ where
             )
             .await;
             let mut item = item?.ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
+            if !directory.settable.restrictions.is_empty() || !item.settable.restrictions.is_empty()
+            {
+                return Err(RmdirError::OperationNotPermitted);
+            }
             if !empty? {
                 return Err(RmdirError::DirectoryNotEmpty);
             }
@@ -713,6 +732,18 @@ where
                     replaced: None,
                 });
             }
+            // the source directory loses an entry, and the destination gains one, losing any it replaces
+            let replaces_an_entry = match target {
+                RenameTarget::Replaced(_) | RenameTarget::Exchanged(_) => true,
+                RenameTarget::Free(_) | RenameTarget::Full => false,
+            };
+            if !from.settable.restrictions.is_empty()
+                || !item.settable.restrictions.is_empty()
+                || to.settable.restrictions.immutable()
+                || to.settable.restrictions.append_only() && replaces_an_entry
+            {
+                return Err(RenameError::OperationNotPermitted);
+            }
             let moves_between_directories = dir != new_dir;
             let mut from_hard_links: i32 = 0;
             let mut to_hard_links: i32 = 0;
@@ -749,6 +780,9 @@ where
                         .getattr(target.inode)
                         .await?
                         .ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
+                    if !other.settable.restrictions.is_empty() {
+                        return Err(RenameError::OperationNotPermitted);
+                    }
                     if moves_between_directories && other.kind == FileType::Directory {
                         to_hard_links -= 1;
                         from_hard_links += 1;
@@ -787,6 +821,9 @@ where
                             FileType::File | FileType::SymbolicLink,
                             FileType::File | FileType::SymbolicLink,
                         ) => {}
+                    }
+                    if !replaced.settable.restrictions.is_empty() {
+                        return Err(RenameError::OperationNotPermitted);
                     }
                     self.remove_name(dir, source.position, source.inode, item.kind)
                         .map_err(IoFailure::Metadata)?;

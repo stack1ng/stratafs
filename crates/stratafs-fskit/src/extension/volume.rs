@@ -84,6 +84,7 @@ define_class!(
                 capabilities.setSupportsHardLinks(true);
                 capabilities.setSupportsSymbolicLinks(true);
                 capabilities.setSupportsSparseFiles(true);
+                capabilities.setSupportsHiddenFiles(true);
                 capabilities.setSupports2TBFiles(true);
                 capabilities.setSupportsFastStatFS(true);
                 capabilities.setCaseFormat(FSVolumeCaseFormat::Sensitive);
@@ -202,7 +203,11 @@ define_class!(
             _context: &FSContext,
             reply: &SendableBlock<'static, fn(*mut FSSetAttributesResult, *mut NSError)>,
         ) {
-            let (inode, change) = (*StrataItem::of(item).inode(), attribute_change(request));
+            let inode = *StrataItem::of(item).inode();
+            let change = match attribute_change(request) {
+                Ok(change) => change,
+                Err(error) => return reply.call(null_mut(), Retained::as_ptr(&error).cast_mut()),
+            };
             self.forward(reply, |operations, reply| {
                 operations.set_attributes(inode, change, reply)
             });
@@ -255,7 +260,10 @@ define_class!(
                 }
             };
             let (directory, name) = (*StrataItem::of(directory).inode(), name_bytes(name));
-            let change = attribute_change(attributes);
+            let change = match attribute_change(attributes) {
+                Ok(change) => change,
+                Err(error) => return reply.call(null_mut(), Retained::as_ptr(&error).cast_mut()),
+            };
             self.forward(reply, |operations, reply| {
                 operations.create(directory, name, item, change, reply)
             });
@@ -272,7 +280,11 @@ define_class!(
             reply: &SendableBlock<'static, fn(*mut FSCreateSymlinkResult, *mut NSError)>,
         ) {
             let (directory, name) = (*StrataItem::of(directory).inode(), name_bytes(name));
-            let (target, change) = (name_bytes(contents), attribute_change(attributes));
+            let target = name_bytes(contents);
+            let change = match attribute_change(attributes) {
+                Ok(change) => change,
+                Err(error) => return reply.call(null_mut(), Retained::as_ptr(&error).cast_mut()),
+            };
             self.forward(reply, |operations, reply| {
                 operations.create_symbolic_link(directory, name, target, change, reply)
             });

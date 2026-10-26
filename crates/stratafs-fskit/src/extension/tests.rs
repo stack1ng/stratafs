@@ -6,21 +6,27 @@ use std::time::Duration;
 use block2::RcBlock;
 use futures_util::future::FutureObj;
 use futures_util::task::SpawnError;
+use objc2::encode::RefEncode;
 use objc2::{AllocAnyThread, msg_send};
 use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_fs_kit::{
-    FSContext, FSDeactivateOptions, FSGenericURLResource, FSGetAttributesResult,
-    FSItemGetAttributesRequest, FSItemID, FSItemType, FSTaskOptions, FSUnaryFileSystemOperations,
-    FSVolume, FSVolumeHandler,
+    FSContext, FSCreateItemResult, FSDeactivateOptions, FSGenericURLResource,
+    FSGetAttributesResult, FSItemAttribute, FSItemGetAttributesRequest, FSItemID,
+    FSItemSetAttributesRequest, FSItemType, FSSetAttributesResult, FSTaskOptions,
+    FSUnaryFileSystemOperations, FSVolume, FSVolumeHandler,
 };
 use opendal::Operator;
 use redb::backends::InMemoryBackend;
-use stratafs_fs_engine::attributes::{Attributes, FileType, Mode, Ownership, SettableAttributes};
+use stratafs_fs_engine::attributes::{
+    Attributes, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
+};
 use stratafs_fs_engine::{FsConfig, FsEngine, Inode, Timestamp};
 use stratafs_opendal::OpendalContentStore;
 use stratafs_redb::{Inline, RedbStore};
 
-use super::item::{StrataItem, item_attributes};
+use super::changes::attribute_change;
+use super::item::{StrataItem, file_name, flags_of, item_attributes, restrictions_and_hints};
+use super::operations::Reply;
 use super::*;
 
 struct TestConfig;
@@ -123,35 +129,92 @@ fn load(file_system: &StrataFileSystem, url: &str) -> Result<Retained<FSVolume>,
     result.map(|volume| unsafe { Retained::from_raw(volume as *mut FSVolume) }.unwrap())
 }
 
-// get_attributes calls getAttributes on an inode, and returns a receiver that gets whether a result
-// came back, or the error's code and description.
-fn get_attributes(volume: &FSVolume, inode: Inode) -> Receiver<Result<(), (isize, String)>> {
-    let (replied, reply_received) = channel();
-    let reply = RcBlock::<fn(*mut FSGetAttributesResult, *mut NSError), dyn Send + Sync>::new(
-        move |result: *mut FSGetAttributesResult, error: *mut NSError| {
-            let result = if result.is_null() {
-                Err(error_of(error))
-            } else {
-                Ok(())
-            };
-            replied.send(result).unwrap();
-        },
-    );
-    let volume = volume
+// Replied is whether an FSKit operation replied with a result, or the error's code and description.
+type Replied = Result<(), (isize, String)>;
+
+// reply is a reply block for an FSKit operation, and a receiver that gets what the operation replied.
+fn reply<R: RefEncode + 'static>() -> (Reply<R>, Receiver<Replied>) {
+    let (replied, received) = channel();
+    let reply = Reply::<R>::new(move |result: *mut R, error: *mut NSError| {
+        let result = if result.is_null() {
+            Err(error_of(error))
+        } else {
+            Ok(())
+        };
+        replied.send(result).unwrap();
+    });
+    (reply, received)
+}
+
+fn strata_volume(volume: &FSVolume) -> &StrataVolume {
+    volume
         .downcast_ref::<StrataVolume>()
-        .expect("loadResource replies with our volume");
-    // SAFETY: the request, item, context and reply are all valid for the call. FSContext has no public
-    // initializer, so the test makes one with NSObject's.
+        .expect("loadResource replies with our volume")
+}
+
+// context is an FSContext for a call. FSContext has no public initializer, so the test makes one with
+// NSObject's.
+fn context() -> Retained<FSContext> {
+    // SAFETY: init is NSObject's initializer, which FSContext inherits.
+    unsafe { msg_send![FSContext::alloc(), init] }
+}
+
+// get_attributes calls getAttributes on an inode, and returns a receiver that gets what it replied.
+fn get_attributes(volume: &FSVolume, inode: Inode) -> Receiver<Replied> {
+    let (reply, replied) = reply::<FSGetAttributesResult>();
+    // SAFETY: the request, item, context and reply are all valid for the call.
     unsafe {
-        let context: Retained<FSContext> = msg_send![FSContext::alloc(), init];
-        volume.getAttributes_ofItem_context_replyHandler(
+        strata_volume(volume).getAttributes_ofItem_context_replyHandler(
             &FSItemGetAttributesRequest::new(),
-            &StrataItem::new(inode, stratafs_fs_engine::attributes::FileType::File),
-            &context,
+            &StrataItem::new(inode, FileType::File),
+            &context(),
             &reply,
         );
     }
-    reply_received
+    replied
+}
+
+// set_attributes calls setAttributes with request on a directory, and returns a receiver that gets what it
+// replied.
+fn set_attributes(
+    volume: &FSVolume,
+    directory: Inode,
+    request: &FSItemSetAttributesRequest,
+) -> Receiver<Replied> {
+    let (reply, replied) = reply::<FSSetAttributesResult>();
+    // SAFETY: the request, item, context and reply are all valid for the call.
+    unsafe {
+        strata_volume(volume).setAttributes_onItem_context_replyHandler(
+            request,
+            &StrataItem::new(directory, FileType::Directory),
+            &context(),
+            &reply,
+        );
+    }
+    replied
+}
+
+// create_file calls createItem for a file named name in directory with attributes, and returns a receiver
+// that gets what it replied.
+fn create_file(
+    volume: &FSVolume,
+    directory: Inode,
+    name: &[u8],
+    attributes: &FSItemSetAttributesRequest,
+) -> Receiver<Replied> {
+    let (reply, replied) = reply::<FSCreateItemResult>();
+    // SAFETY: the name, item, attributes, context and reply are all valid for the call.
+    unsafe {
+        strata_volume(volume).createItemNamed_type_inDirectory_attributes_context_replyHandler(
+            &file_name(name),
+            FSItemType::File,
+            &StrataItem::new(directory, FileType::Directory),
+            attributes,
+            &context(),
+            &reply,
+        );
+    }
+    replied
 }
 
 #[test]
@@ -186,12 +249,10 @@ fn get_attributes_replies_until_the_volume_is_deactivated() {
     assert!(matches!(replied(Inode(5000)), Err((code, _)) if code == libc::ESTALE as isize));
 
     let deactivated = RcBlock::<fn(*mut NSError), dyn Send + Sync>::new(|_error: *mut NSError| {});
-    let strata_volume = volume
-        .downcast_ref::<StrataVolume>()
-        .expect("loadResource replies with our volume");
     // SAFETY: the options and reply are valid for the call.
     unsafe {
-        strata_volume.deactivateVolumeWithOptions_replyHandler(FSDeactivateOptions(0), &deactivated)
+        strata_volume(&volume)
+            .deactivateVolumeWithOptions_replyHandler(FSDeactivateOptions(0), &deactivated)
     };
     assert!(matches!(replied(Inode::ROOT), Err((code, _)) if code == libc::ENXIO as isize));
 }
@@ -205,6 +266,8 @@ fn item_attributes_give_fskit_the_root_as_a_directory_under_its_own_parent() {
                 user_id: 501,
                 group_id: 20,
             },
+            restrictions: Restrictions::OWNER_IMMUTABLE | Restrictions::ADMINISTRATOR_APPEND_ONLY,
+            hints: Hints::HIDDEN,
             size: 10,
             last_accessed_at: Timestamp(1_500_000_000),
             content_changed_at: Timestamp(-1),
@@ -227,5 +290,168 @@ fn item_attributes_give_fskit_the_root_as_a_directory_under_its_own_parent() {
         assert_eq!(attributes.uid(), 501);
         assert_eq!(attributes.size(), 10);
         assert_eq!(attributes.allocSize(), 4096);
+        assert_eq!(
+            attributes.flags(),
+            libc::UF_IMMUTABLE | libc::SF_APPEND | libc::UF_HIDDEN
+        );
     }
+}
+
+#[test]
+fn every_restriction_and_hint_round_trips_through_st_flags() {
+    for restrictions in Restrictions::all()
+        .iter_names()
+        .map(|(_, restriction)| restriction)
+    {
+        for hints in [Hints::empty(), Hints::HIDDEN] {
+            assert_eq!(
+                restrictions_and_hints(flags_of(restrictions, hints)),
+                Some((restrictions, hints))
+            );
+        }
+    }
+    assert_eq!(
+        restrictions_and_hints(
+            libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND
+        ),
+        Some((Restrictions::all(), Hints::empty()))
+    );
+    assert_eq!(
+        restrictions_and_hints(0),
+        Some((Restrictions::empty(), Hints::empty()))
+    );
+}
+
+#[test]
+fn st_flags_with_any_bit_the_volume_does_not_store_are_refused() {
+    // libc names only some bits, so the rest are by value: datavault, two undefined owner bits, restricted,
+    // nounlink, firmlink and dataless.
+    for refused in [
+        libc::UF_NODUMP,
+        libc::UF_OPAQUE,
+        libc::UF_COMPRESSED,
+        libc::UF_TRACKED,
+        libc::SF_ARCHIVED,
+        0x80,
+        0x100,
+        0x4000,
+        0x80000,
+        0x100000,
+        0x800000,
+        0x40000000,
+    ] {
+        assert_eq!(restrictions_and_hints(refused), None, "{refused:#x}");
+        assert_eq!(
+            restrictions_and_hints(refused | libc::UF_HIDDEN),
+            None,
+            "{refused:#x}"
+        );
+    }
+}
+
+fn append_only_settable() -> SettableAttributes {
+    SettableAttributes {
+        mode: Mode::OWNER_READ,
+        ownership: Ownership {
+            user_id: 501,
+            group_id: 20,
+        },
+        restrictions: Restrictions::OWNER_APPEND_ONLY,
+        hints: Hints::empty(),
+        size: 3,
+        last_accessed_at: Timestamp(1),
+        content_changed_at: Timestamp(2),
+        created_at: Timestamp(3),
+    }
+}
+
+#[test]
+fn an_attribute_change_refuses_flags_the_volume_does_not_store_and_applies_the_rest() {
+    // SAFETY: the request is a plain value object, and its setters take plain values.
+    unsafe {
+        let request = FSItemSetAttributesRequest::new();
+        request.setMode(0o644);
+        request.setFlags(libc::UF_NODUMP);
+        let error = attribute_change(&request).err().expect("nodump is refused");
+        assert_eq!(error.code(), libc::ENOTSUP as isize);
+        assert!(!request.wasAttributeConsumed(FSItemAttribute::Mode));
+        assert!(!request.wasAttributeConsumed(FSItemAttribute::Flags));
+
+        let request = FSItemSetAttributesRequest::new();
+        request.setFlags(libc::SF_IMMUTABLE | libc::UF_HIDDEN);
+        let change = attribute_change(&request).expect("immutable and hidden are stored");
+        assert!(request.wasAttributeConsumed(FSItemAttribute::Flags));
+        let mut settable = append_only_settable();
+        change(&mut settable);
+        assert_eq!(
+            settable,
+            SettableAttributes {
+                restrictions: Restrictions::ADMINISTRATOR_IMMUTABLE,
+                hints: Hints::HIDDEN,
+                ..append_only_settable()
+            }
+        );
+    }
+}
+
+#[test]
+fn an_attribute_change_without_flags_keeps_the_restrictions_and_hints() {
+    // SAFETY: the request is a plain value object, and its setters take plain values.
+    unsafe {
+        let request = FSItemSetAttributesRequest::new();
+        request.setMode(0o644);
+        let change = attribute_change(&request).expect("a mode change is applied");
+        assert!(!request.wasAttributeConsumed(FSItemAttribute::Flags));
+        let hidden = SettableAttributes {
+            hints: Hints::HIDDEN,
+            ..append_only_settable()
+        };
+        let mut settable = hidden.clone();
+        change(&mut settable);
+        assert_eq!(
+            settable,
+            SettableAttributes {
+                mode: Mode::from_bits_truncate(0o644),
+                ..hidden
+            }
+        );
+    }
+}
+
+#[test]
+fn set_attributes_and_create_refuse_flags_the_volume_does_not_store() {
+    let file_system = new_file_system();
+    let volume = load(&file_system, "stratavolume://ab03").expect("the volume loads");
+    let replied =
+        |replies: Receiver<Replied>| replies.recv_timeout(Duration::from_secs(10)).unwrap();
+    let not_supported =
+        |replied: Replied| matches!(replied, Err((code, _)) if code == libc::ENOTSUP as isize);
+    // SAFETY: the requests are plain value objects, and their setters take plain values.
+    let (refused, stored, plain) = unsafe {
+        let refused = FSItemSetAttributesRequest::new();
+        refused.setFlags(libc::UF_NODUMP);
+        let stored = FSItemSetAttributesRequest::new();
+        stored.setFlags(libc::UF_HIDDEN);
+        (refused, stored, FSItemSetAttributesRequest::new())
+    };
+    assert!(not_supported(replied(set_attributes(
+        &volume,
+        Inode::ROOT,
+        &refused
+    ))));
+    assert!(not_supported(replied(create_file(
+        &volume,
+        Inode::ROOT,
+        b"made",
+        &refused
+    ))));
+    // the refused create made nothing, so the name is still free
+    assert_eq!(
+        replied(create_file(&volume, Inode::ROOT, b"made", &plain)),
+        Ok(())
+    );
+    assert_eq!(
+        replied(set_attributes(&volume, Inode::ROOT, &stored)),
+        Ok(())
+    );
 }

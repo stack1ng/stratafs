@@ -22,6 +22,8 @@ pub enum WriteError<M, R, C> {
     IsADirectory,
     #[error("EINVAL: Invalid argument")]
     InvalidInput,
+    #[error("EPERM: Operation not permitted")]
+    OperationNotPermitted,
     #[error("EFBIG: File too large")]
     FileTooLarge,
     #[error(transparent)]
@@ -66,6 +68,7 @@ impl<M, R, C> From<&WriteError<M, R, C>> for PosixError {
             WriteError::StaleFileHandle => PosixError::ESTALE,
             WriteError::IsADirectory => PosixError::EISDIR,
             WriteError::InvalidInput => PosixError::EINVAL,
+            WriteError::OperationNotPermitted => PosixError::EPERM,
             WriteError::FileTooLarge => PosixError::EFBIG,
             WriteError::Refused(_) | WriteError::InputOutputError(_) => PosixError::EIO,
         }

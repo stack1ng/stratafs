@@ -13,7 +13,8 @@ use stratafs_tree::error::TreeFailure;
 use stratafs_tree::tree::{Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
 
-use crate::{FsConfig, FsEngine, Timestamp};
+use crate::attributes::Restrictions;
+use crate::{FsConfig, FsEngine, Inode, Timestamp};
 
 pub(crate) struct OneKibInline;
 
@@ -92,4 +93,18 @@ pub(crate) fn aborted<R: Debug, F: Debug, E>(error: TransactError<R, F, E>) -> E
         }
         TransactError::Failed(failure) => panic!("the transaction failed: {failure:?}"),
     }
+}
+
+// restrict sets inode's restrictions, which a setattr may change whatever they were before.
+pub(crate) fn restrict(engine: &InMemoryEngine, inode: Inode, restrictions: Restrictions) {
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn
+                .setattr(inode, |settable| settable.restrictions = restrictions)
+                .await;
+            result.map(|result| (result, txn))
+        })
+    }))
+    .map_err(aborted)
+    .unwrap();
 }

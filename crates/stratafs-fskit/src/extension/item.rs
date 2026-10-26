@@ -5,7 +5,7 @@ use objc2::runtime::NSObjectProtocol;
 use objc2::{AllocAnyThread, Encode, Encoding, Ivars, define_class, msg_send};
 use objc2_foundation::{NSData, NSObject};
 use objc2_fs_kit::{FSFileName, FSItem, FSItemAttributes, FSItemID, FSItemType};
-use stratafs_fs_engine::attributes::{Attributes, FileType};
+use stratafs_fs_engine::attributes::{Attributes, FileType, Hints, Restrictions};
 use stratafs_fs_engine::{Inode, Timestamp};
 
 define_class!(
@@ -71,7 +71,7 @@ pub(crate) fn item_attributes(inode: Inode, attributes: &Attributes) -> Retained
         item.setAllocSize(settable.size.next_multiple_of(4096));
         item.setFileID(item_id(inode));
         item.setParentID(parent);
-        item.setFlags(0);
+        item.setFlags(flags_of(settable.restrictions, settable.hints));
         // The bindings have no setters for the times, so they are sent by hand.
         let _: () = msg_send![&*item, setAccessTime: time(settable.last_accessed_at)];
         let _: () = msg_send![&*item, setModifyTime: time(settable.content_changed_at)];
@@ -79,6 +79,47 @@ pub(crate) fn item_attributes(inode: Inode, attributes: &Attributes) -> Retained
         let _: () = msg_send![&*item, setBirthTime: time(settable.created_at)];
         item
     }
+}
+
+// RESTRICTION_FLAGS and HINT_FLAGS are the st_flags bits the volume stores, each with the restriction or
+// hint it stands for. The volume refuses every other bit.
+const RESTRICTION_FLAGS: [(u32, Restrictions); 4] = [
+    (libc::UF_IMMUTABLE, Restrictions::OWNER_IMMUTABLE),
+    (libc::SF_IMMUTABLE, Restrictions::ADMINISTRATOR_IMMUTABLE),
+    (libc::UF_APPEND, Restrictions::OWNER_APPEND_ONLY),
+    (libc::SF_APPEND, Restrictions::ADMINISTRATOR_APPEND_ONLY),
+];
+const HINT_FLAGS: [(u32, Hints); 1] = [(libc::UF_HIDDEN, Hints::HIDDEN)];
+
+// flags_of are restrictions and hints as st_flags bits.
+pub(crate) fn flags_of(restrictions: Restrictions, hints: Hints) -> u32 {
+    let restriction_flags = RESTRICTION_FLAGS
+        .into_iter()
+        .filter(|&(_, restriction)| restrictions.contains(restriction))
+        .map(|(flag, _)| flag);
+    let hint_flags = HINT_FLAGS
+        .into_iter()
+        .filter(|&(_, hint)| hints.contains(hint))
+        .map(|(flag, _)| flag);
+    restriction_flags
+        .chain(hint_flags)
+        .fold(0, |flags, flag| flags | flag)
+}
+
+// restrictions_and_hints are what st_flags bits stand for, or None if any bit is one the volume refuses.
+pub(crate) fn restrictions_and_hints(flags: u32) -> Option<(Restrictions, Hints)> {
+    let restrictions = RESTRICTION_FLAGS
+        .into_iter()
+        .filter(|&(flag, _)| flags & flag != 0)
+        .fold(Restrictions::empty(), |restrictions, (_, restriction)| {
+            restrictions | restriction
+        });
+    let hints = HINT_FLAGS
+        .into_iter()
+        .filter(|&(flag, _)| flags & flag != 0)
+        .fold(Hints::empty(), |hints, (_, hint)| hints | hint);
+    // a refused bit has no restriction or hint to come back as
+    (flags_of(restrictions, hints) == flags).then_some((restrictions, hints))
 }
 
 #[repr(transparent)]

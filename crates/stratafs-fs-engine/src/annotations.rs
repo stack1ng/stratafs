@@ -138,6 +138,9 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             let (attributes, existing) =
                 join(self.getattr(inode), self.metadata.get(key.clone())).await;
             let mut attributes = attributes?.ok_or(SetAnnotationError::StaleFileHandle)?;
+            if !attributes.settable.restrictions.is_empty() {
+                return Err(SetAnnotationError::OperationNotPermitted);
+            }
             let exists = existing.map_err(IoFailure::Metadata)?.is_some();
             match (mode, exists) {
                 (SetAnnotationMode::Create, true) => return Err(SetAnnotationError::AlreadyExists),
@@ -179,6 +182,9 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             let (attributes, existing) =
                 join(self.getattr(inode), self.metadata.get(key.clone())).await;
             let mut attributes = attributes?.ok_or(RemoveAnnotationError::StaleFileHandle)?;
+            if !attributes.settable.restrictions.is_empty() {
+                return Err(RemoveAnnotationError::OperationNotPermitted);
+            }
             if existing.map_err(IoFailure::Metadata)?.is_none() {
                 return Err(RemoveAnnotationError::AttributeNotFound);
             }

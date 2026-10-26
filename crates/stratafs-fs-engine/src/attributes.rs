@@ -44,10 +44,44 @@ bitflags! {
     }
 }
 
+bitflags! {
+    // Restrictions forbid changing an item. The engine enforces them in terms of how a file can be changed,
+    // but it is still up to the caller to properly grant permission to actually modify them.
+    // An immutable item cannot change at all (outside of its restrictions/hints fields). An append only item behaves the same, except that a file may
+    // grow at its end and a directory may gain entries.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Restrictions: u8 {
+        const OWNER_IMMUTABLE = 1;
+        const ADMINISTRATOR_IMMUTABLE = 1 << 1;
+        const OWNER_APPEND_ONLY = 1 << 2;
+        const ADMINISTRATOR_APPEND_ONLY = 1 << 3;
+    }
+}
+
+impl Restrictions {
+    pub fn immutable(self) -> bool {
+        self.intersects(Restrictions::OWNER_IMMUTABLE | Restrictions::ADMINISTRATOR_IMMUTABLE)
+    }
+
+    pub fn append_only(self) -> bool {
+        self.intersects(Restrictions::OWNER_APPEND_ONLY | Restrictions::ADMINISTRATOR_APPEND_ONLY)
+    }
+}
+
+bitflags! {
+    // Hints tell the platforms how to present an item. The engine only stores them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Hints: u8 {
+        const HIDDEN = 1;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettableAttributes {
     pub mode: Mode,
     pub ownership: Ownership,
+    pub restrictions: Restrictions,
+    pub hints: Hints,
 
     pub size: u64,
 
@@ -85,6 +119,8 @@ serialized_value! {
     pub(crate) struct StoredAttributes {
         kind: u8,
         mode: U16,
+        restrictions: u8,
+        hints: u8,
         hard_link_count: U32,
         user_id: U32,
         group_id: U32,
@@ -104,6 +140,8 @@ impl From<&Attributes> for StoredAttributes {
         StoredAttributes {
             kind: attributes.kind as u8,
             mode: U16::new(settable.mode.bits()),
+            restrictions: settable.restrictions.bits(),
+            hints: settable.hints.bits(),
             hard_link_count: U32::new(attributes.hard_link_count),
             user_id: U32::new(settable.ownership.user_id),
             group_id: U32::new(settable.ownership.group_id),
@@ -129,6 +167,9 @@ impl TryFrom<&StoredAttributes> for Attributes {
                     user_id: stored.user_id.get(),
                     group_id: stored.group_id.get(),
                 },
+                restrictions: Restrictions::from_bits(stored.restrictions)
+                    .ok_or(CorruptValue::UnknownRestrictionBits)?,
+                hints: Hints::from_bits(stored.hints).ok_or(CorruptValue::UnknownHintBits)?,
                 size: stored.size.get(),
                 last_accessed_at: Timestamp(stored.last_accessed_at.get()),
                 content_changed_at: Timestamp(stored.content_changed_at.get()),
@@ -210,6 +251,8 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                         user_id: 0,
                         group_id: 0,
                     },
+                    restrictions: Restrictions::empty(),
+                    hints: Hints::empty(),
                     size: 0,
                     last_accessed_at: now,
                     content_changed_at: now,
@@ -236,19 +279,25 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 .getattr(inode)
                 .await?
                 .ok_or(SetattrError::StaleFileHandle)?;
-            let (old_size, old_content_changed_at) = (
-                attributes.settable.size,
-                attributes.settable.content_changed_at,
-            );
+            let before = attributes.settable.clone();
             update(&mut attributes.settable);
+            // a restricted item may only change its restrictions and hints, which is how a restriction is removed
+            let with_old_restrictions_and_hints = SettableAttributes {
+                restrictions: before.restrictions,
+                hints: before.hints,
+                ..attributes.settable.clone()
+            };
+            if !before.restrictions.is_empty() && with_old_restrictions_and_hints != before {
+                return Err(SetattrError::OperationNotPermitted);
+            }
             let now = self.now();
-            if attributes.settable.size < old_size {
-                self.truncate_content(inode, attributes.settable.size, old_size)
+            if attributes.settable.size < before.size {
+                self.truncate_content(inode, attributes.settable.size, before.size)
                     .await?;
             }
             // a resize changes the content, unless the update set the content change time itself
-            if attributes.settable.size != old_size
-                && attributes.settable.content_changed_at == old_content_changed_at
+            if attributes.settable.size != before.size
+                && attributes.settable.content_changed_at == before.content_changed_at
             {
                 attributes.settable.content_changed_at = now;
             }

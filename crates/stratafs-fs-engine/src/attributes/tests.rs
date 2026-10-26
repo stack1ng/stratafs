@@ -6,7 +6,9 @@ use stratafs_serialized::FINGERPRINT_LENGTH;
 use zerocopy::IntoBytes;
 
 use super::*;
-use crate::test_support::{InMemoryEngine, MetadataFailure, aborted, new_test_engine, set_clock};
+use crate::test_support::{
+    InMemoryEngine, MetadataFailure, aborted, new_test_engine, restrict, set_clock,
+};
 
 fn getattr(engine: &InMemoryEngine, inode: Inode) -> Option<Attributes> {
     block_on(engine.read_transact(|txn| Box::pin(async move { txn.getattr(inode).await })))
@@ -43,6 +45,8 @@ fn root_created_at(at: i64) -> Attributes {
                 user_id: 0,
                 group_id: 0,
             },
+            restrictions: Restrictions::empty(),
+            hints: Hints::empty(),
             size: 0,
             last_accessed_at: Timestamp(at),
             content_changed_at: Timestamp(at),
@@ -127,6 +131,62 @@ fn setattr_of_a_missing_inode_is_a_stale_file_handle() {
 }
 
 #[test]
+fn a_restricted_item_only_changes_its_restrictions_and_hints() {
+    let engine = new_test_engine();
+    for restriction in Restrictions::all() {
+        restrict(&engine, Inode::ROOT, restriction);
+        let refused: [&(dyn Fn(&mut SettableAttributes) + Send + Sync); 5] = [
+            &|settable| settable.mode = Mode::OWNER_READ,
+            &|settable| settable.ownership.user_id = 501,
+            &|settable| settable.size = 1,
+            &|settable| settable.last_accessed_at = Timestamp(3),
+            &|settable| {
+                settable.restrictions = Restrictions::empty();
+                settable.mode = Mode::OWNER_READ;
+            },
+        ];
+        for update in refused {
+            assert!(
+                matches!(
+                    setattr(&engine, Inode::ROOT, update),
+                    Err(SetattrError::OperationNotPermitted)
+                ),
+                "{restriction:?}"
+            );
+        }
+        let hidden = setattr(&engine, Inode::ROOT, |settable| {
+            settable.hints = Hints::HIDDEN
+        })
+        .unwrap();
+        assert_eq!(hidden.settable.hints, Hints::HIDDEN);
+        let removed = setattr(&engine, Inode::ROOT, |settable| {
+            settable.restrictions = Restrictions::empty();
+            settable.hints = Hints::empty();
+        })
+        .unwrap();
+        assert_eq!(removed.settable.restrictions, Restrictions::empty());
+        setattr(&engine, Inode::ROOT, |settable| {
+            settable.last_accessed_at = Timestamp(4)
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn an_unrestricted_item_takes_a_restriction_together_with_other_changes() {
+    for restriction in Restrictions::all().iter() {
+        let engine = new_test_engine();
+        let restricted = setattr(&engine, Inode::ROOT, |settable| {
+            settable.restrictions = restriction;
+            settable.mode = Mode::OWNER_READ;
+        })
+        .unwrap();
+        assert_eq!(restricted.settable.restrictions, restriction);
+        assert_eq!(restricted.settable.mode, Mode::OWNER_READ);
+    }
+}
+
+#[test]
 fn stored_attributes_are_the_fingerprint_then_each_field_in_little_endian() {
     let mut attributes = root_created_at(-3);
     attributes.kind = FileType::SymbolicLink;
@@ -141,8 +201,12 @@ fn stored_attributes_are_the_fingerprint_then_each_field_in_little_endian() {
     attributes.settable.created_at = Timestamp(10);
     attributes.parent = Inode(11);
     attributes.change_version = 12;
+    attributes.settable.restrictions =
+        Restrictions::OWNER_IMMUTABLE | Restrictions::ADMINISTRATOR_APPEND_ONLY;
+    attributes.settable.hints = Hints::HIDDEN;
     let mut expected = vec![2];
     expected.extend_from_slice(&0o755u16.to_le_bytes());
+    expected.extend_from_slice(&[0b1001, 1]);
     expected.extend_from_slice(&1u32.to_le_bytes());
     expected.extend_from_slice(&501u32.to_le_bytes());
     expected.extend_from_slice(&20u32.to_le_bytes());
@@ -188,6 +252,18 @@ fn decoding_rejects_unknown_file_types_and_mode_bits() {
         Attributes::try_from(&stored),
         Err(CorruptValue::UnknownModeBits)
     ));
+    let mut stored = StoredAttributes::from(&root_created_at(0));
+    stored.restrictions = 1 << 4;
+    assert!(matches!(
+        Attributes::try_from(&stored),
+        Err(CorruptValue::UnknownRestrictionBits)
+    ));
+    let mut stored = StoredAttributes::from(&root_created_at(0));
+    stored.hints = 1 << 1;
+    assert!(matches!(
+        Attributes::try_from(&stored),
+        Err(CorruptValue::UnknownHintBits)
+    ));
     let stored = Bytes::from(&StoredAttributes::from(&root_created_at(0)));
     assert!(matches!(
         StoredAttributes::view(&stored[..stored.len() - 1]),
@@ -195,6 +271,6 @@ fn decoding_rejects_unknown_file_types_and_mode_bits() {
     ));
     assert_eq!(
         StoredAttributes::from(&root_created_at(0)).as_bytes().len(),
-        71
+        73
     );
 }

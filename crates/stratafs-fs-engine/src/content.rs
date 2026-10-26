@@ -395,6 +395,12 @@ where
                 FileType::Directory => return Err(WriteError::IsADirectory),
                 FileType::SymbolicLink => return Err(WriteError::InvalidInput),
             }
+            let restrictions = attributes.settable.restrictions;
+            if restrictions.immutable()
+                || restrictions.append_only() && write_start != attributes.settable.size
+            {
+                return Err(WriteError::OperationNotPermitted);
+            }
             if write_length == 0 {
                 return Ok(attributes);
             }

@@ -5,8 +5,10 @@ use stratafs_opendal::OpendalError;
 use stratafs_store::content::ContentHash;
 
 use super::*;
-use crate::attributes::Attributes;
-use crate::test_support::{InMemoryEngine, MetadataFailure, aborted, new_test_engine, set_clock};
+use crate::attributes::{Attributes, Restrictions};
+use crate::test_support::{
+    InMemoryEngine, MetadataFailure, aborted, new_test_engine, restrict, set_clock,
+};
 
 fn getattr(engine: &InMemoryEngine, inode: Inode) -> Option<Attributes> {
     block_on(engine.read_transact(|txn| Box::pin(async move { txn.getattr(inode).await })))
@@ -423,4 +425,44 @@ fn annotation_operations_on_a_missing_inode_are_stale_file_handles() {
         remove_annotation(&engine, MISSING, portable(b"a")),
         Err(RemoveAnnotationError::StaleFileHandle)
     ));
+}
+
+#[test]
+fn a_restricted_item_refuses_annotation_changes() {
+    let engine = new_test_engine();
+    set_annotation(
+        &engine,
+        Inode::ROOT,
+        portable(b"a"),
+        b"1",
+        SetAnnotationMode::Create,
+    )
+    .unwrap();
+    for restriction in Restrictions::all() {
+        restrict(&engine, Inode::ROOT, restriction);
+        assert!(
+            matches!(
+                set_annotation(
+                    &engine,
+                    Inode::ROOT,
+                    portable(b"b"),
+                    b"1",
+                    SetAnnotationMode::Create
+                ),
+                Err(SetAnnotationError::OperationNotPermitted)
+            ),
+            "{restriction:?}"
+        );
+        assert!(
+            matches!(
+                remove_annotation(&engine, Inode::ROOT, portable(b"a")),
+                Err(RemoveAnnotationError::OperationNotPermitted)
+            ),
+            "{restriction:?}"
+        );
+        assert_eq!(
+            get_annotation(&engine, Inode::ROOT, portable(b"a")).unwrap(),
+            Some(Bytes::from_static(b"1"))
+        );
+    }
 }
