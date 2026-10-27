@@ -1,6 +1,7 @@
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
-use stratafs_redb::{Inline, RedbStore};
+use stratafs_redb::RedbStore;
+use stratafs_store::spawn::Inline;
 
 use super::*;
 use crate::node::Node;

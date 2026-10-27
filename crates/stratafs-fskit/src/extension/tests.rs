@@ -24,7 +24,8 @@ use stratafs_fs_engine::attributes::{
 };
 use stratafs_fs_engine::{FsConfig, FsEngine, Inode, Timestamp};
 use stratafs_object_store::ObjectStoreContentStore;
-use stratafs_redb::{RedbStore, SpawnBlocking};
+use stratafs_redb::RedbStore;
+use stratafs_store::spawn::SpawnBlocking;
 
 use super::changes::attribute_change;
 use super::item::{StrataItem, file_name, flags_of, item_attributes, restrictions_and_hints};

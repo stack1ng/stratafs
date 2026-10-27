@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_lite::future::{block_on, poll_once};
 use redb::backends::InMemoryBackend;
-use stratafs_redb::{Inline, RedbFailure, RedbStore};
+use stratafs_redb::{RedbFailure, RedbStore};
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueTransaction, SetRejection};
+use stratafs_store::spawn::Inline;
 
 use super::*;
 use crate::tree::Tree;

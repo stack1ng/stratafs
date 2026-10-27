@@ -13,10 +13,11 @@ use redb::{Database, StorageBackend};
 use stratafs_fs_engine::error::IoFailure;
 use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
 use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
-use stratafs_redb::{Inline, RedbStore};
+use stratafs_redb::RedbStore;
 use stratafs_store::content::{ContentHash, ContentStore, GetRejection};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
+use stratafs_store::spawn::Inline;
 
 // Durable is which store made itself durable, or that a write transaction ran, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

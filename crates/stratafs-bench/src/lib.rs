@@ -10,10 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
 use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
-use stratafs_redb::{RedbStore, ThreadPool};
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::kv::{KeyValueStore, TransactError};
+use stratafs_store::spawn::ThreadPool;
 use stratafs_tree::header::TreeVolumeId;
 use stratafs_tree::tree::PinnedConfigError;
 use stratafs_tree::tree::{Tree, TreeConfig};
@@ -37,7 +37,15 @@ impl FsConfig for BenchFsConfig {
         number(option_env!("STRATAFS_BENCH_LARGEST_INLINE_ENTRY"), 4 * 1024);
 }
 
-type Metadata = RedbStore<ThreadPool>;
+// The metadata store comes from the build's environment too, as STRATAFS_BENCH_STORE: redb or sqlite.
+#[cfg(store = "redb")]
+type Metadata = stratafs_redb::RedbStore<ThreadPool>;
+#[cfg(store = "sqlite")]
+type Metadata = stratafs_sqlite::SqliteStore<ThreadPool>;
+#[cfg(store = "redb")]
+type DatabaseError = redb::Error;
+#[cfg(store = "sqlite")]
+type DatabaseError = MetadataFailure;
 type MetadataRejection = <Metadata as KeyValueStore>::Rejection;
 type MetadataFailure = <Metadata as KeyValueStore>::Failure;
 
@@ -63,7 +71,7 @@ pub enum OpenStoreError {
     #[error("the store is open in another mount")]
     AlreadyOpen,
     #[error("the store's database could not be opened")]
-    Database(#[source] redb::Error),
+    Database(#[source] DatabaseError),
     #[error("the store's tree could not be opened")]
     Tree(
         #[source]
@@ -119,17 +127,28 @@ pub async fn open_store(directory: &Path) -> Result<Store, OpenStoreError> {
     std::fs::create_dir_all(directory).map_err(OpenStoreError::Directory)?;
     let content = ObjectStoreContentStore::local(directory.join("content"))
         .map_err(OpenStoreError::Content)?;
-    let metadata = RedbStore::local(directory.join("metadata.redb"), ThreadPool).map_err(
-        |error| match error {
-            redb::Error::DatabaseAlreadyOpen => OpenStoreError::AlreadyOpen,
-            error => OpenStoreError::Database(error),
-        },
-    )?;
+    let metadata = open_metadata(directory)?;
     let allocate_node: fn() -> u128 = rand::random;
     let tree = Tree::new(metadata, allocate_node)
         .await
         .map_err(OpenStoreError::Tree)?;
     Ok(Store { tree, content })
+}
+
+#[cfg(store = "redb")]
+fn open_metadata(directory: &Path) -> Result<Metadata, OpenStoreError> {
+    stratafs_redb::RedbStore::local(directory.join("metadata.redb"), ThreadPool).map_err(|error| {
+        match error {
+            redb::Error::DatabaseAlreadyOpen => OpenStoreError::AlreadyOpen,
+            error => OpenStoreError::Database(error),
+        }
+    })
+}
+
+#[cfg(store = "sqlite")]
+fn open_metadata(directory: &Path) -> Result<Metadata, OpenStoreError> {
+    stratafs_sqlite::SqliteStore::local(directory.join("metadata.sqlite"), ThreadPool)
+        .map_err(OpenStoreError::Database)
 }
 
 // open_volume opens volume from the store in directory.

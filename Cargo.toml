@@ -52,6 +52,7 @@ stratafs-object-store = { path = "crates/stratafs-object-store" }
 stratafs-range-bounds-map = { path = "crates/stratafs-range-bounds-map" }
 stratafs-redb = { path = "crates/stratafs-redb" }
 stratafs-serialized = { path = "crates/stratafs-serialized" }
+stratafs-sqlite = { path = "crates/stratafs-sqlite" }
 stratafs-store = { path = "crates/stratafs-store" }
 stratafs-tree = { path = "crates/stratafs-tree" }
 storekey = "0.11"
@@ -68,7 +69,13 @@ zerocopy = { version = "0.8", features = ["alloc", "derive"] }
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
 [profile.dev.package.redb]
+opt-level = 3
+
+[profile.dev.package.rusqlite]
 opt-level = 3
 
 [profile.dev.package.shuttle]

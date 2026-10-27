@@ -15,7 +15,6 @@ stratafs-store.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-blocking.workspace = true
 nix.workspace = true
 
 [build-dependencies]

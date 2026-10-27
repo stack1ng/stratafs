@@ -1,10 +1,11 @@
 use bytes::{Buf, BytesMut};
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
-use stratafs_redb::{Inline, RedbStore};
+use stratafs_redb::RedbStore;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
+use stratafs_store::spawn::Inline;
 use zerocopy::little_endian::{U64, U128};
 
 use super::*;

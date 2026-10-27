@@ -22,39 +22,9 @@ use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
     TransactionHandle, assert_valid_range,
 };
+use stratafs_store::spawn::SpawnBlocking;
 
 const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
-
-pub trait SpawnBlocking: Send + Sync {
-    fn spawn_blocking<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> T + Send + 'static,
-    ) -> impl Future<Output = T> + Send;
-}
-
-#[cfg(threads)]
-pub struct ThreadPool;
-
-#[cfg(threads)]
-impl SpawnBlocking for ThreadPool {
-    fn spawn_blocking<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> T + Send + 'static,
-    ) -> impl Future<Output = T> + Send {
-        blocking::unblock(work)
-    }
-}
-
-pub struct Inline;
-
-impl SpawnBlocking for Inline {
-    async fn spawn_blocking<T: Send + 'static>(
-        &self,
-        work: impl FnOnce() -> T + Send + 'static,
-    ) -> T {
-        work()
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedbFailure {

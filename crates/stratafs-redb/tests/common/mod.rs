@@ -1,6 +1,7 @@
 use futures_lite::future::yield_now;
 use redb::{Database, StorageBackend};
-use stratafs_redb::{RedbStore, SpawnBlocking};
+use stratafs_redb::RedbStore;
+use stratafs_store::spawn::SpawnBlocking;
 
 pub struct SimulatedThreadPool;
 

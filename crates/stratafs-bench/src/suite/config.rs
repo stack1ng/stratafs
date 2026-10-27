@@ -15,6 +15,15 @@ pub struct Config {
     // runs is how many times each timed workload runs.
     #[serde(default = "five")]
     pub runs: u32,
+    // warmup is how many untimed runs each timed workload makes before its timed ones, unless caches are cleared.
+    #[serde(default = "one")]
+    pub warmup: u32,
+    // tree is the repository the search, unpack, copy and remove workloads use, by size: small, medium or large.
+    #[serde(default = "large")]
+    pub tree: String,
+    // files is how many files the create, stat and delete workloads make.
+    #[serde(default = "hundred_thousand")]
+    pub files: u32,
     // clear_caches clears the caches before every run, which needs `sudo -n /usr/sbin/purge` to work.
     #[serde(default)]
     pub clear_caches: bool,
@@ -51,6 +60,18 @@ pub enum TargetConfig {
 
 fn five() -> u32 {
     5
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn large() -> String {
+    "large".to_owned()
+}
+
+fn hundred_thousand() -> u32 {
+    100_000
 }
 
 impl Config {

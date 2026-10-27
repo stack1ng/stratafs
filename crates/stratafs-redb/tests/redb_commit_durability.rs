@@ -7,9 +7,10 @@ use bytes::Bytes;
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
 use redb::{Database, StorageBackend};
-use stratafs_redb::{Inline, RedbStore, SpawnBlocking};
+use stratafs_redb::RedbStore;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
+use stratafs_store::spawn::{Inline, SpawnBlocking};
 
 // CountedFlushes is an in memory backend that counts each flush to the disk.
 #[derive(Debug)]

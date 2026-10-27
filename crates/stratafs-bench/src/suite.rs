@@ -60,7 +60,7 @@ fn measure(
 ) -> Result<(), SuiteError> {
     make_directory(results)?;
     let work = target.directory.join("stratafs-bench");
-    for workload in workloads::selected(&config.workloads, &work, inputs)? {
+    for workload in workloads::selected(config, &work, inputs)? {
         println!("{}: {}", target.name, workload.name);
         let output = results.join(format!("{}.json", workload.name));
         let log = results.join(format!("{}.log", workload.name));
@@ -108,7 +108,14 @@ fn time(
         .args(["--style", "basic", "--runs"])
         .arg(config.runs.to_string())
         .arg("--warmup")
-        .arg(if config.clear_caches { "0" } else { "1" })
+        .arg(
+            if config.clear_caches {
+                0
+            } else {
+                config.warmup
+            }
+            .to_string(),
+        )
         .arg("--export-json")
         .arg(output);
     if let Some(setup) = setup {

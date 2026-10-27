@@ -18,6 +18,7 @@ serde_json.workspace = true
 stratafs-fs-engine.workspace = true
 stratafs-object-store.workspace = true
 stratafs-redb.workspace = true
+stratafs-sqlite.workspace = true
 stratafs-store.workspace = true
 stratafs-tree.workspace = true
 thiserror.workspace = true

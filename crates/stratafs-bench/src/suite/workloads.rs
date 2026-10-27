@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::suite::SuiteError;
+use crate::suite::config::Config;
 use crate::suite::inputs::{Inputs, REPOSITORIES};
 use crate::suite::quoted;
 
@@ -24,14 +25,20 @@ pub enum Load {
     },
 }
 
-// selected are the workloads names selects, or every one when it selects none, run in the directory work.
+// selected are the workloads the config names, or every one when it names none, run in the directory work.
 pub fn selected(
-    names: &Option<Vec<String>>,
+    config: &Config,
     work: &Path,
     inputs: &Inputs,
 ) -> Result<Vec<Workload>, SuiteError> {
-    let all = all(work, inputs);
-    let Some(names) = names else {
+    if !REPOSITORIES.iter().any(|(size, _)| *size == config.tree) {
+        return Err(SuiteError::Config(format!(
+            "tree is {}, which is not a repository size: small, medium or large",
+            config.tree
+        )));
+    }
+    let all = all(work, inputs, &config.tree, config.files);
+    let Some(names) = &config.workloads else {
         return Ok(all);
     };
     if let Some(unknown) = names
@@ -50,7 +57,7 @@ pub fn selected(
         .collect())
 }
 
-fn all(work: &Path, inputs: &Inputs) -> Vec<Workload> {
+fn all(work: &Path, inputs: &Inputs, tree: &str, files: u32) -> Vec<Workload> {
     let at = |name: &str| quoted(&work.join(name));
     let clone = |size: &str, into: &str| {
         format!(
@@ -84,6 +91,7 @@ fn all(work: &Path, inputs: &Inputs) -> Vec<Workload> {
                 .collect(),
         },
     };
+    let nrfiles = format!("--nrfiles={files}");
     let mut workloads = Vec::new();
     for (size, _) in REPOSITORIES {
         // Cloning writes the repository and checks out every file.
@@ -119,13 +127,13 @@ fn all(work: &Path, inputs: &Inputs) -> Vec<Workload> {
         at("build/target")
     );
     workloads.extend([
-        // Searching reads every file of the large checkout.
+        // Searching reads every file of a checkout.
         timed(
-            "search-large".to_owned(),
+            format!("search-{tree}"),
             Some(format!(
                 "rm -rf {} && {}",
                 at("search"),
-                clone("large", "search")
+                clone(tree, "search")
             )),
             None,
             format!("rg --count-matches TODO {}", at("search")),
@@ -146,15 +154,15 @@ fn all(work: &Path, inputs: &Inputs) -> Vec<Workload> {
         ),
         // Unpacking writes many files, as an install or an output bundle does.
         timed(
-            "unpack-large".to_owned(),
+            format!("unpack-{tree}"),
             None,
             Some(format!("rm -rf {}", at("unpack"))),
-            unpack("large", "unpack"),
+            unpack(tree, "unpack"),
         ),
         // Copying reads one tree and writes another on the same file system.
         timed(
-            "copy-large".to_owned(),
-            Some(unpack("large", "copy-source")),
+            format!("copy-{tree}"),
+            Some(unpack(tree, "copy-source")),
             Some(format!(
                 "rm -rf {} && mkdir {}",
                 at("copy-target"),
@@ -168,9 +176,9 @@ fn all(work: &Path, inputs: &Inputs) -> Vec<Workload> {
         ),
         // Removing deletes every file of a tree.
         timed(
-            "remove-large".to_owned(),
+            format!("remove-{tree}"),
             None,
-            Some(unpack("large", "remove")),
+            Some(unpack(tree, "remove")),
             format!("rm -rf {}", at("remove")),
         ),
         fio(
@@ -223,7 +231,7 @@ fn all(work: &Path, inputs: &Inputs) -> Vec<Workload> {
             "create-files",
             &[
                 "--ioengine=filecreate",
-                "--nrfiles=100000",
+                nrfiles.as_str(),
                 "--filesize=4k",
                 "--rw=write",
                 "--bs=4k",
@@ -233,7 +241,7 @@ fn all(work: &Path, inputs: &Inputs) -> Vec<Workload> {
             "stat-files",
             &[
                 "--ioengine=filestat",
-                "--nrfiles=100000",
+                nrfiles.as_str(),
                 "--filesize=4k",
                 "--rw=read",
                 "--bs=4k",
@@ -243,7 +251,7 @@ fn all(work: &Path, inputs: &Inputs) -> Vec<Workload> {
             "delete-files",
             &[
                 "--ioengine=filedelete",
-                "--nrfiles=100000",
+                nrfiles.as_str(),
                 "--filesize=4k",
                 "--rw=write",
                 "--bs=4k",

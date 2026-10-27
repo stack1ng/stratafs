@@ -1,0 +1,27 @@
+[package]
+name = "stratafs-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+rusqlite = { version = "0.41.0", default-features = false, features = ["bundled", "cache", "hooks"] }
+stratafs-keyed-notify.workspace = true
+stratafs-store.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+stratafs-kv-conformance.workspace = true
+tempfile = "3"
+
+# The workspace forbids unsafe code. The store reaches SQLite's C interface for its file syncs, which needs it,
+# so this crate denies it, and only the vfs module allows it.
+[lints.rust]
+unsafe_code = "deny"

@@ -32,6 +32,8 @@ struct Configuration {
     merge_below_percent: Option<u8>,
     #[arg(long, help = "The largest entry the engine keeps inline, in bytes")]
     largest_inline_entry: Option<u32>,
+    #[arg(long, help = "The metadata store: redb or sqlite")]
+    store: Option<String>,
 }
 
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister";
@@ -79,6 +81,7 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
                 .largest_inline_entry
                 .map(|value| value.to_string()),
         ),
+        ("STRATAFS_BENCH_STORE", configuration.store.clone()),
     ] {
         match value {
             Some(value) => build.env(variable, value),
