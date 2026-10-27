@@ -32,11 +32,14 @@ where
     A: Send + Sync + 'static,
     C: TreeConfig,
 {
-    // watch returns the watch on key for value, starting one unless a waiter already watches those bytes.
-    // A watch for different bytes takes over the key, while the waiters of the one it replaces keep theirs.
+    // watch returns the watch on key for value, starting one unless a watch on those bytes is still waiting.
+    // A new watch takes over the key, while the waiters of the one it replaces keep theirs.
     fn watch(self: &Arc<Self>, key: Bytes, value: Bytes) -> Arc<SharedWatch<S::Failure>> {
         let mut watches = self.watches.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(watch) = watches.get(&key).filter(|watch| watch.value == value) {
+        if let Some(watch) = watches
+            .get(&key)
+            .filter(|watch| watch.value == value && watch.changed.peek().is_none())
+        {
             return watch;
         }
         let (shared, watched_key, watched_value) = (self.clone(), key.clone(), value.clone());

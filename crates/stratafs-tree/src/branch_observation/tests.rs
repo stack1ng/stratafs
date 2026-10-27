@@ -1,9 +1,10 @@
+use std::convert::Infallible;
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_lite::future::{block_on, poll_once};
 use redb::backends::InMemoryBackend;
-use stratafs_redb::{Inline, RedbStore};
+use stratafs_redb::{Inline, RedbFailure, RedbStore};
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueTransaction, SetRejection};
@@ -88,4 +89,35 @@ fn waiters_on_the_same_key_share_its_watches() {
     set_every_key(&volume, b"after");
     assert!(block_on(first).is_ok());
     assert!(block_on(second).is_ok());
+}
+
+#[test]
+fn a_watch_that_fired_is_not_handed_out_again_when_its_bytes_come_back() {
+    let volume = open_volume();
+    let set_watched = |value: &'static [u8]| {
+        block_on(volume.shared.store.transact(|mut transaction| {
+            Box::pin(async move {
+                transaction.set(
+                    Bytes::from_static(b"\xffwatched"),
+                    Bytes::from_static(value),
+                )?;
+                Ok::<_, StoreError<SetRejection<Infallible>, RedbFailure>>(((), transaction))
+            })
+        }))
+        .unwrap();
+    };
+    let (key, before) = (
+        Bytes::from_static(b"\xffwatched"),
+        Bytes::from_static(b"before"),
+    );
+    set_watched(b"before");
+    let fired = volume.shared.watch(key.clone(), before.clone());
+    set_watched(b"after");
+    assert!(block_on(fired.changed.clone()).is_ok());
+    set_watched(b"before");
+    let again = volume.shared.watch(key, before);
+    assert!(
+        again.changed.peek().is_none(),
+        "a waiter on bytes that came back gets a watch that has not fired"
+    );
 }
