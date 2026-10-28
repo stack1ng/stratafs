@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-async-lock.workspace = true
 bitflags.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
@@ -22,6 +21,7 @@ zerocopy.workspace = true
 futures-lite.workspace = true
 object_store.workspace = true
 redb = "4.4.0"
+stratafs-lock-synchronized.workspace = true
 stratafs-object-store.workspace = true
 stratafs-redb.workspace = true
 stratafs-tree.workspace = true

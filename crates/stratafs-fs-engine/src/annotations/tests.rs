@@ -168,7 +168,7 @@ fn a_large_annotation_spills_to_the_content_store_and_reads_back() {
     assert!(
         block_on(
             engine
-                .content
+                .content()
                 .get(&ContentHash::of(&value), 0, value.len() as u64)
         )
         .is_ok()

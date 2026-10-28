@@ -1551,6 +1551,7 @@ dependencies = [
  "serde_json",
  "stratafs-fs-engine",
  "stratafs-fskit",
+ "stratafs-lock-synchronized",
  "stratafs-object-store",
  "stratafs-redb",
  "stratafs-sqlite",
@@ -1577,7 +1578,6 @@ dependencies = [
 name = "stratafs-fs-engine"
 version = "0.1.0"
 dependencies = [
- "async-lock",
  "bitflags",
  "bytes",
  "futures-core",
@@ -1586,6 +1586,7 @@ dependencies = [
  "object_store",
  "redb",
  "storekey",
+ "stratafs-lock-synchronized",
  "stratafs-object-store",
  "stratafs-redb",
  "stratafs-serialized",
@@ -1614,6 +1615,7 @@ dependencies = [
  "object_store",
  "redb",
  "stratafs-fs-engine",
+ "stratafs-lock-synchronized",
  "stratafs-object-store",
  "stratafs-redb",
  "stratafs-store",
@@ -1646,6 +1648,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-lock-synchronized"
+version = "0.1.0"
+dependencies = [
+ "async-lock",
+ "bytes",
+ "futures-core",
+ "futures-lite",
+ "object_store",
+ "redb",
+ "stratafs-object-store",
+ "stratafs-redb",
+ "stratafs-store",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "stratafs-object-store"
 version = "0.1.0"
 dependencies = [
@@ -1661,6 +1680,7 @@ dependencies = [
  "stratafs-store",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -1702,12 +1722,14 @@ dependencies = [
 name = "stratafs-sqlite"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "futures-core",
  "futures-lite",
  "futures-util",
  "nix",
  "rusqlite",
+ "stratafs-content-conformance",
  "stratafs-keyed-notify",
  "stratafs-kv-conformance",
  "stratafs-store",

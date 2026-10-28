@@ -11,7 +11,9 @@ use std::error::Error;
 use std::ffi::{CString, c_char, c_int};
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
+use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser;
@@ -26,13 +28,12 @@ use objc2_foundation::{
 };
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
-use stratafs_store::content::ContentStore;
-use stratafs_store::kv::KeyValueStore;
+use stratafs_store::store::Store;
 
 use crate::mount_options::MountOptions;
 use file_system::StrataFileSystem;
 use items::Items;
-use operations::{Volume, VolumeOperations};
+use operations::{Volume, VolumeOperations, make_durable_on_cadence};
 use volume::StrataVolume;
 
 // OpenedVolume is an activated volume: its id, and its operations on the engine the extension binary opened.
@@ -84,14 +85,13 @@ static OPEN_VOLUME: OnceLock<OpenVolume> = OnceLock::new();
 // finishes on spawner, so FSKit can hand over the next one. Store work that blocks without yielding, such as
 // file IO on this machine's disk, holds up that thread. spawner must run on threads of its own:
 // NSExtensionMain keeps the main thread.
-pub fn run<V, M, C, A, N, S, F>(
+pub fn run<V, St, A, N, S, F>(
     spawner: impl Spawn + Send + Sync + 'static,
-    open_volume: impl AsyncFn(&Path, V) -> Result<FsEngine<M, C, A, N, S>, F> + Send + Sync + 'static,
+    open_volume: impl AsyncFn(&Path, V) -> Result<FsEngine<St, A, N, S>, F> + Send + Sync + 'static,
 ) -> !
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
-    M: KeyValueStore,
-    C: ContentStore + 'static,
+    St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
@@ -118,16 +118,19 @@ where
     std::process::exit(status)
 }
 
+// DURABILITY_CADENCE is how often a volume makes every committed operation durable when its mount options leave it
+// out, the period FSKit's own periodic sync uses.
+const DURABILITY_CADENCE: Duration = Duration::from_secs(30);
+
 // opener wraps open_volume so it takes the store directory and activate's options, and returns the volume
 // as FSKit's classes hold it, running its operations on spawner.
-fn opener<V, M, C, A, N, S, F>(
+fn opener<V, St, A, N, S, F>(
     spawner: impl Spawn + Send + Sync + 'static,
-    open_volume: impl AsyncFn(&Path, V) -> Result<FsEngine<M, C, A, N, S>, F> + Send + Sync + 'static,
+    open_volume: impl AsyncFn(&Path, V) -> Result<FsEngine<St, A, N, S>, F> + Send + Sync + 'static,
 ) -> OpenVolume
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
-    M: KeyValueStore,
-    C: ContentStore + 'static,
+    St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
@@ -150,13 +153,21 @@ where
                 source: Box::new(error),
             }
         })?;
+        let (stops_durability_cadence, durability_cadence_stopped) = mpsc::channel();
+        let volume = Arc::new(Volume {
+            engine,
+            spawner: spawner.clone(),
+            items: Items::default(),
+            stops_durability_cadence,
+        });
+        make_durable_on_cadence(
+            Arc::downgrade(&volume),
+            durability_cadence_stopped,
+            options.durability_cadence.unwrap_or(DURABILITY_CADENCE),
+        );
         Ok(OpenedVolume {
             id,
-            operations: Arc::new(Volume {
-                engine,
-                spawner: spawner.clone(),
-                items: Items::default(),
-            }),
+            operations: volume,
         })
     })
 }

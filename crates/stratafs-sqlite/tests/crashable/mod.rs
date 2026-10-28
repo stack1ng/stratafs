@@ -12,7 +12,7 @@ use std::{ptr, slice};
 
 use rusqlite::ffi;
 use stratafs_kv_conformance::durability::CrashableStorage;
-use stratafs_sqlite::SqliteStore;
+use stratafs_sqlite::SqliteMetadata;
 use stratafs_store::durability::DurableAgainst;
 use tempfile::TempDir;
 
@@ -144,7 +144,7 @@ impl CrashableStores {
         }
     }
 
-    pub fn open<S>(&self, spawner: S) -> (SqliteStore<S>, CrashableMemory) {
+    pub fn open<S>(&self, spawner: S) -> (SqliteMetadata<S>, CrashableMemory) {
         let memory = CrashableMemory::default();
         (self.open_memory(memory.clone(), spawner), memory)
     }
@@ -154,7 +154,7 @@ impl CrashableStores {
         &self,
         first: S,
         second: S,
-    ) -> (SqliteStore<S>, SqliteStore<S>, CrashableMemory) {
+    ) -> (SqliteMetadata<S>, SqliteMetadata<S>, CrashableMemory) {
         let memory = CrashableMemory::default();
         let directory = self.directory_for(&memory);
         let open = |spawner| self.open_in(&directory, spawner);
@@ -166,7 +166,7 @@ impl CrashableStores {
         &self,
         memory: &CrashableMemory,
         spawner: S,
-    ) -> (SqliteStore<S>, CrashableMemory) {
+    ) -> (SqliteMetadata<S>, CrashableMemory) {
         let left = CrashableMemory(Arc::new(Mutex::new(CrashableMemoryState {
             files: memory.state().files.clone(),
             ..CrashableMemoryState::default()
@@ -175,13 +175,13 @@ impl CrashableStores {
     }
 
     // reopen_synced opens what a crash that loses every change since the last sync leaves of memory.
-    pub fn reopen_synced<S>(&self, memory: CrashableMemory, spawner: S) -> SqliteStore<S> {
+    pub fn reopen_synced<S>(&self, memory: CrashableMemory, spawner: S) -> SqliteMetadata<S> {
         self.open_memory(memory.crashed(|_, _| false), spawner)
     }
 
     // reopen_torn opens what a crash leaves of memory when the disk took some of the changes since the last sync,
     // chosen by a hash of the file, the change and how many storage operations there were.
-    pub fn reopen_torn<S>(&self, memory: CrashableMemory, spawner: S) -> SqliteStore<S> {
+    pub fn reopen_torn<S>(&self, memory: CrashableMemory, spawner: S) -> SqliteMetadata<S> {
         let operations = memory.storage_operations();
         self.open_memory(
             memory.crashed(|name, index| {
@@ -193,7 +193,7 @@ impl CrashableStores {
         )
     }
 
-    fn open_memory<S>(&self, memory: CrashableMemory, spawner: S) -> SqliteStore<S> {
+    fn open_memory<S>(&self, memory: CrashableMemory, spawner: S) -> SqliteMetadata<S> {
         let directory = self.directory_for(&memory);
         self.open_in(&directory, spawner)
     }
@@ -213,8 +213,8 @@ impl CrashableStores {
         directory
     }
 
-    fn open_in<S>(&self, directory: &Path, spawner: S) -> SqliteStore<S> {
-        SqliteStore::new(
+    fn open_in<S>(&self, directory: &Path, spawner: S) -> SqliteMetadata<S> {
+        SqliteMetadata::new(
             directory.join("metadata.sqlite"),
             register(),
             self.checkpoint_pages,

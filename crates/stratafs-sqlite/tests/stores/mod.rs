@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use stratafs_sqlite::SqliteStore;
+use stratafs_sqlite::SqliteMetadata;
 use tempfile::TempDir;
 
 use crate::common::SimulatedThreadPool;
@@ -19,12 +19,12 @@ impl Stores {
         }
     }
 
-    pub fn open(&self) -> SqliteStore<SimulatedThreadPool> {
+    pub fn open(&self) -> SqliteMetadata<SimulatedThreadPool> {
         let directory = self
             .directory
             .path()
             .join(self.opened.fetch_add(1, Ordering::Relaxed).to_string());
         std::fs::create_dir(&directory).unwrap();
-        SqliteStore::local(directory.join("metadata.sqlite"), SimulatedThreadPool).unwrap()
+        SqliteMetadata::local(directory.join("metadata.sqlite"), SimulatedThreadPool).unwrap()
     }
 }

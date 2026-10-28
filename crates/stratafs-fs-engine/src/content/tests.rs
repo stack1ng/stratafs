@@ -455,7 +455,8 @@ fn extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(Range<u64>, Bytes)> {
                 ),
                 SpillableValue::Overflow { hash, .. } => {
                     let mut content =
-                        block_on(engine.content.get(&hash, extent.content_offset, length)).unwrap();
+                        block_on(engine.content().get(&hash, extent.content_offset, length))
+                            .unwrap();
                     content.copy_to_bytes(content.remaining())
                 }
             };
@@ -994,7 +995,7 @@ fn a_resize_keeps_a_content_change_time_set_by_the_same_update() {
 
 fn loaded(engine: &InMemoryEngine, inode: Inode, offset: u64, size: u64) -> Vec<Bytes> {
     let plan = plan(engine, inode, offset, size).unwrap();
-    block_on(try_join_all(plan.load(&engine.content)))
+    block_on(try_join_all(plan.load(engine.content())))
         .unwrap()
         .into_iter()
         .map(|mut piece| piece.copy_to_bytes(piece.remaining()))

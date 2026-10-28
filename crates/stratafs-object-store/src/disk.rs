@@ -51,6 +51,16 @@ impl Unflushed {
     }
 }
 
+// Dropping the last handle of a store makes every put durable against a power failure, as closing a metadata
+// store does.
+impl Drop for Unflushed {
+    fn drop(&mut self) {
+        if let Err(error) = self.flush(DurableAgainst::PowerFailure) {
+            tracing::warn!(%error, "making the content durable on close failed");
+        }
+    }
+}
+
 impl ObjectStoreContentStore {
     // local keeps content as files under root on this machine's disk. Putting a blob does not flush it to the
     // disk; ensure_durable does, for every blob put since the last time.

@@ -1,10 +1,13 @@
 mod vfs;
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::ffi::{CStr, CString, c_int};
+use std::future::poll_fn;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
@@ -13,9 +16,10 @@ use futures_core::future::BoxFuture;
 use futures_util::lock::{Mutex, MutexGuard, OwnedMutexGuard};
 use rusqlite::hooks::Wal;
 use rusqlite::wal::CheckpointMode;
-use rusqlite::{Connection, ErrorCode, OpenFlags, ffi, params};
+use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, ffi, params};
 
 use stratafs_keyed_notify::KeyedNotify;
+use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
@@ -23,19 +27,28 @@ use stratafs_store::kv::{
     TransactionHandle, assert_valid_range,
 };
 use stratafs_store::spawn::SpawnBlocking;
+use stratafs_store::store::Store;
 
 // A local store checkpoints the write ahead log once a commit leaves it this many pages long, 256 MiB. A longer log
 // copies a node the tree rewrote often once, and syncs less often, for a longer wait at each checkpoint.
 const CHECKPOINT_PAGES: u32 = 16 * 1024;
 // SQLite refuses a row over a billion bytes, counting its header, which is at most 19 bytes for a key and a value.
 const LARGEST_ACCEPTED_ENTRY: usize = 1_000_000_000 - 19;
+// The store keeps content in chunks of 256 KiB, a row each, so reading a range reads only the chunks it covers.
+const CHUNK_SIZE: usize = 256 * 1024;
+// Each connection keeps every statement the store runs prepared.
+const PREPARED_STATEMENTS: usize = 32;
 
 // A rowid table keeps a value of up to its page size, less 35 bytes, in its leaf. A tree node is at most 16 KiB, so a
-// page that size holds nearly every node whole, and reading one reads one page.
+// page that size holds nearly every node whole, and reading one reads one page. A chunk of content keeps the rest of
+// itself on overflow pages, which a read reaches through the row's blob.
 const CREATE: &str = "
     PRAGMA page_size = 16384;
     PRAGMA journal_mode = WAL;
     CREATE TABLE IF NOT EXISTS kv (key BLOB NOT NULL UNIQUE, value BLOB NOT NULL);
+    CREATE TABLE IF NOT EXISTS content (
+        hash BLOB NOT NULL, chunk INTEGER NOT NULL, data BLOB NOT NULL, UNIQUE (hash, chunk)
+    );
 ";
 // The writer commits without a sync, and keeps the keys clear_range returns in memory. It reads the database mapped
 // into memory, as far as the bundled SQLite maps, with a cache. Another connection's commit drops both, so the
@@ -61,18 +74,41 @@ const SET: &str = "INSERT INTO kv (key, value) VALUES (?1, ?2)
 const CLEAR: &str = "DELETE FROM kv WHERE key = ?1";
 const CLEAR_BETWEEN: &str = "DELETE FROM kv WHERE key >= ?1 AND key < ?2 RETURNING key";
 const CLEAR_FROM: &str = "DELETE FROM kv WHERE key >= ?1 RETURNING key";
+// The last chunk of content gives its length.
+const CONTENT_END: &str =
+    "SELECT chunk, length(data) FROM content WHERE hash = ?1 ORDER BY chunk DESC LIMIT 1";
+const CHUNK_ROW: &str = "SELECT rowid FROM content WHERE hash = ?1 AND chunk = ?2";
+const PUT_CHUNK: &str = "INSERT INTO content (hash, chunk, data) VALUES (?1, ?2, ?3)";
 
-pub struct SqliteStore<S> {
+// SqliteStore keeps a file system's metadata and its content in one SQLite database, so the write ahead log orders
+// every commit of either.
+pub struct SqliteStore<M, S> {
+    metadata: M,
+    content: SqliteContent<S>,
+}
+
+// SqliteMetadata is the key value store of a SQLite database. Its handles share the database.
+pub struct SqliteMetadata<S>(Arc<Database<S>>);
+
+// SqliteContent is the content of a SQLite database.
+pub struct SqliteContent<S>(Arc<Database<S>>);
+
+// Database is the database a store's handles share.
+struct Database<S> {
     location: Location,
     checkpoint_pages: u32,
     // running is how many transactions are running, so a read takes the writer's connection only while it runs
-    // alone. A write or ensure_durable that starts meanwhile waits for that read, so one awaited inside the read's
-    // work never begins.
+    // alone. A write that starts meanwhile waits for that read, so one awaited inside the read's work never begins.
     running: AtomicUsize,
     writer: Arc<Mutex<Writer>>,
+    // writer_connection is the writer's connection, which a write transaction's work puts and gets content through.
+    writer_connection: Arc<std::sync::Mutex<Connection>>,
     // idle_readers are the connections reads use while the writer is busy, kept open between them. A commit drops
     // every page a reader cached, and a reader mapping the database would map it again, so they read with neither.
     idle_readers: std::sync::Mutex<Vec<std::sync::Mutex<Connection>>>,
+    syncer: Arc<Mutex<Syncer>>,
+    // syncs_started is how many syncs ensure_durable started.
+    syncs_started: AtomicU64,
     notify: KeyedNotify,
     spawner: S,
 }
@@ -85,18 +121,17 @@ struct Location {
 
 impl Location {
     fn connect(&self) -> rusqlite::Result<Connection> {
-        Connection::open_with_flags_and_vfs(&self.path, OpenFlags::default(), &*self.vfs)
+        let connection =
+            Connection::open_with_flags_and_vfs(&self.path, OpenFlags::default(), &*self.vfs)?;
+        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENTS);
+        Ok(connection)
     }
 }
 
 // Writer is the one write transaction at a time, and what it keeps between commits.
 struct Writer {
-    connection: std::sync::Mutex<Connection>,
+    connection: Arc<std::sync::Mutex<Connection>>,
     written: Vec<Bytes>,
-    // current_durable_against is what every commit so far is durable against, or None while one is only in memory.
-    current_durable_against: Option<DurableAgainst>,
-    // synced_data_version is the database's data version at the last sync. A commit on another connection changes it.
-    synced_data_version: i64,
     // log_pages is how long the write ahead log was after the last commit.
     log_pages: Arc<AtomicU32>,
     // checkpointed_pages is how long the log was at the last checkpoint. A reader using the log keeps it from
@@ -104,7 +139,43 @@ struct Writer {
     checkpointed_pages: u32,
 }
 
-impl<S> SqliteStore<S> {
+// Syncer is the connection ensure_durable syncs the write ahead log from, kept open for the store's life so a sync
+// never waits for the writer, and the last sync against each failure.
+struct Syncer {
+    connection: Connection,
+    against_software_failure: Option<Synced>,
+    against_power_failure: Option<Synced>,
+}
+
+// Synced is a sync that made every commit up to a data version of the database durable, and its number. Every
+// commit changes the data version the syncer's connection reads.
+#[derive(Clone, Copy)]
+struct Synced {
+    number: u64,
+    data_version: i64,
+}
+
+impl Syncer {
+    // last_against is the last sync that made commits durable against a failure. A sync against a power failure
+    // makes them durable against a software failure too.
+    fn last_against(&self, against: DurableAgainst) -> Option<Synced> {
+        match against {
+            DurableAgainst::SoftwareFailure => self.against_software_failure,
+            DurableAgainst::PowerFailure => self.against_power_failure,
+        }
+    }
+
+    // record keeps a sync that made commits durable against a failure.
+    fn record(&mut self, synced: Synced, against: DurableAgainst) {
+        self.against_software_failure = Some(synced);
+        match against {
+            DurableAgainst::SoftwareFailure => {}
+            DurableAgainst::PowerFailure => self.against_power_failure = Some(synced),
+        }
+    }
+}
+
+impl<S> SqliteMetadata<S> {
     // new keeps the store in the database at path, opened through the SQLite VFS named vfs, and checkpoints the
     // write ahead log once a commit leaves it checkpoint_pages long.
     pub fn new(
@@ -131,23 +202,30 @@ impl<S> SqliteStore<S> {
             hook_log_pages.store(pages.unsigned_abs(), Ordering::Relaxed);
             Ok(())
         }))?;
-        Ok(Self {
+        let connection = Arc::new(std::sync::Mutex::new(connection));
+        let syncer = Syncer {
+            connection: location.connect()?,
+            // The database may hold commits a killed process left only in memory.
+            against_software_failure: None,
+            against_power_failure: None,
+        };
+        Ok(Self(Arc::new(Database {
             location,
             checkpoint_pages,
             running: AtomicUsize::new(0),
             writer: Arc::new(Mutex::new(Writer {
-                connection: std::sync::Mutex::new(connection),
+                connection: Arc::clone(&connection),
                 written: Vec::new(),
-                // The database may hold commits a killed process left only in memory.
-                current_durable_against: None,
-                synced_data_version: 0,
                 log_pages,
                 checkpointed_pages: 0,
             })),
+            writer_connection: connection,
             idle_readers: std::sync::Mutex::new(Vec::new()),
+            syncer: Arc::new(Mutex::new(syncer)),
+            syncs_started: AtomicU64::new(0),
             notify: KeyedNotify::new(),
             spawner,
-        })
+        })))
     }
 
     // local keeps the store in a database file at path on this machine's disk, syncing it with the call each
@@ -155,7 +233,9 @@ impl<S> SqliteStore<S> {
     pub fn local(path: impl AsRef<Path>, spawner: S) -> rusqlite::Result<Self> {
         Self::new(path, vfs::local_disk()?, CHECKPOINT_PAGES, spawner)
     }
+}
 
+impl<S> Database<S> {
     // reading is the connection a read uses: the writer's, whose cache commits keep, while the read runs alone, or
     // else an idle reader, or a new one when every reader is in use. A read hands it back with done_reading, and a
     // read that fails or is cancelled closes a reader.
@@ -221,26 +301,26 @@ impl<S> SqliteStore<S> {
         lock(&self.idle_readers).push(connection);
         Ok(())
     }
-}
 
-impl<S: SpawnBlocking + 'static> KeyValueStore for SqliteStore<S> {
-    type Rejection = std::convert::Infallible;
-    // set reports entries over SQLite's limit as SetRejection::TooLarge, so Failure excludes SQLITE_TOOBIG.
-    type Failure = rusqlite::Error;
-    type ReadTransaction<'txn> = SqliteTransaction<'txn, ()>;
-    type Transaction<'txn> = SqliteTransaction<'txn, &'txn mut Vec<Bytes>>;
-
-    const LARGEST_ACCEPTED_ENTRY: usize = LARGEST_ACCEPTED_ENTRY;
-
+    // transact and read_transact are the store's, which its content runs transactions of its own through too.
     async fn transact<'store, T: Send, E: Send>(
         &'store self,
         mut work: impl for<'txn> FnMut(
-            TransactionHandle<'txn, 'store, Self::Transaction<'txn>>,
+            TransactionHandle<'txn, 'store, SqliteTransaction<'txn, &'txn mut Vec<Bytes>>>,
         ) -> BoxFuture<
             'txn,
-            Result<(T, TransactionHandle<'txn, 'store, Self::Transaction<'txn>>), E>,
+            Result<
+                (
+                    T,
+                    TransactionHandle<'txn, 'store, SqliteTransaction<'txn, &'txn mut Vec<Bytes>>>,
+                ),
+                E,
+            >,
         > + Send,
-    ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
+    ) -> Result<T, TransactError<std::convert::Infallible, rusqlite::Error, E>>
+    where
+        S: SpawnBlocking,
+    {
         let running = Running::start(&self.running);
         let writer = Arc::clone(&self.writer).lock_owned().await;
         let mut transaction = begin_write(writer, &self.spawner)
@@ -252,10 +332,15 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for SqliteStore<S> {
             written,
             ..
         } = &mut *transaction;
-        let output = work(TransactionHandle::new(SqliteTransaction {
+        let mut working = work(TransactionHandle::new(SqliteTransaction {
             connection,
             written,
-        }))
+        }));
+        // Content the work puts goes into the transaction, so each poll of the work marks the thread as running it.
+        let output = poll_fn(move |context| {
+            let _in_write_transaction = InWriteTransaction::start(self);
+            working.as_mut().poll(context)
+        })
         .await
         .map(|(output, _)| output);
         let output = match output {
@@ -266,7 +351,6 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for SqliteStore<S> {
             }
         };
         transaction.commit().map_err(TransactError::Failed)?;
-        transaction.current_durable_against = None;
         self.notify.notify_waiters(&transaction.written);
         let log_pages = transaction.log_pages.load(Ordering::Relaxed);
         // A log that started over is shorter than at the last checkpoint.
@@ -291,10 +375,13 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for SqliteStore<S> {
     async fn read_transact<'store, T: Send, E: Send>(
         &'store self,
         mut work: impl for<'txn> FnMut(
-            TransactionHandle<'txn, 'store, Self::ReadTransaction<'txn>>,
+            TransactionHandle<'txn, 'store, SqliteTransaction<'txn, ()>>,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
-    ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
+    ) -> Result<T, TransactError<std::convert::Infallible, rusqlite::Error, E>>
+    where
+        S: SpawnBlocking,
+    {
         let result: Result<Result<T, E>, rusqlite::Error> = async {
             let running = Running::start(&self.running);
             let reading = self.reading(&running)?;
@@ -318,59 +405,336 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for SqliteStore<S> {
         }
     }
 
+    // ensure_durable makes every commit made before it is called durable against a failure, and resolves once they
+    // are. Calls made while a sync runs share the next sync, and one sync runs at a time.
+    async fn ensure_durable(&self, against: DurableAgainst) -> rusqlite::Result<()>
+    where
+        S: SpawnBlocking,
+    {
+        let called = self.syncs_started.load(Ordering::SeqCst);
+        let syncer = Arc::clone(&self.syncer).lock_owned().await;
+        let last = syncer.last_against(against);
+        // A sync that started after the call made every commit before it durable.
+        if last.is_some_and(|last| last.number > called) {
+            return Ok(());
+        }
+        let data_version = syncer
+            .connection
+            .prepare_cached(DATA_VERSION)?
+            .query_row([], |row| row.get(0))?;
+        if last.is_some_and(|last| last.data_version == data_version) {
+            return Ok(());
+        }
+        let number = self.syncs_started.fetch_add(1, Ordering::SeqCst) + 1;
+        // A commit reaches the write ahead log first, and a checkpoint syncs the database before the log starts over,
+        // so syncing the log makes every commit before it durable, whichever connection made it. A sync against a
+        // power failure flushes the disk's whole cache, with what a checkpoint wrote in it. It waits on the disk, so
+        // it goes to the spawner.
+        let (mut syncer, synced) = self
+            .spawner
+            .spawn_blocking(move || {
+                let synced = vfs::sync_log(&syncer.connection, against);
+                (syncer, synced)
+            })
+            .await;
+        synced?;
+        syncer.record(
+            Synced {
+                number,
+                data_version,
+            },
+            against,
+        );
+        Ok(())
+    }
+}
+
+impl<M, S> SqliteStore<M, S> {
+    // new is a store of metadata and content. Making it durable syncs content's database, so metadata must be kept in
+    // that database too.
+    pub fn new(metadata: M, content: SqliteContent<S>) -> Self {
+        Self { metadata, content }
+    }
+}
+
+impl<S: SpawnBlocking + 'static> KeyValueStore for SqliteMetadata<S> {
+    type Rejection = std::convert::Infallible;
+    // set reports entries over SQLite's limit as SetRejection::TooLarge, so Failure excludes SQLITE_TOOBIG.
+    type Failure = rusqlite::Error;
+    type ReadTransaction<'txn> = SqliteTransaction<'txn, ()>;
+    type Transaction<'txn> = SqliteTransaction<'txn, &'txn mut Vec<Bytes>>;
+
+    const LARGEST_ACCEPTED_ENTRY: usize = LARGEST_ACCEPTED_ENTRY;
+
+    async fn transact<'store, T: Send, E: Send>(
+        &'store self,
+        work: impl for<'txn> FnMut(
+            TransactionHandle<'txn, 'store, Self::Transaction<'txn>>,
+        ) -> BoxFuture<
+            'txn,
+            Result<(T, TransactionHandle<'txn, 'store, Self::Transaction<'txn>>), E>,
+        > + Send,
+    ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
+        self.0.transact(work).await
+    }
+
+    async fn read_transact<'store, T: Send, E: Send>(
+        &'store self,
+        work: impl for<'txn> FnMut(
+            TransactionHandle<'txn, 'store, Self::ReadTransaction<'txn>>,
+        ) -> BoxFuture<'txn, Result<T, E>>
+        + Send,
+    ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
+        self.0.read_transact(work).await
+    }
+
     async fn changed(&self, key: Bytes, seen: Option<Bytes>) -> Result<(), Self::Failure> {
         let (key, seen) = (&key, &seen);
-        self.notify
+        self.0
+            .notify
             .wait_until(key, || async move {
-                let running = Running::start(&self.running);
-                let reading = self.reading(&running)?;
+                let running = Running::start(&self.0.running);
+                let reading = self.0.reading(&running)?;
                 let current = get(&lock(reading.connection()), key)?;
-                self.done_reading(reading);
+                self.0.done_reading(reading);
                 Ok(current != *seen)
             })
             .await
     }
 
-    async fn ensure_durable(&self, against: DurableAgainst) -> Result<(), Self::Failure> {
-        let mut writer = Arc::clone(&self.writer).lock_owned().await;
-        let data_version = get_mut(&mut writer.connection)
-            .prepare_cached(DATA_VERSION)?
-            .query_row([], |row| row.get(0))?;
-        if data_version == writer.synced_data_version
-            && matches!(writer.current_durable_against, Some(durable) if durable >= against)
-        {
-            return Ok(());
+    fn ensure_durable(
+        &self,
+        against: DurableAgainst,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        self.0.ensure_durable(against)
+    }
+}
+
+impl<M: KeyValueStore, S: SpawnBlocking + 'static> Store for SqliteStore<M, S> {
+    type Metadata = M;
+    type Content = SqliteContent<S>;
+    type Failure = rusqlite::Error;
+
+    fn metadata(&self) -> &M {
+        &self.metadata
+    }
+
+    fn content(&self) -> &SqliteContent<S> {
+        &self.content
+    }
+
+    fn ensure_durable(
+        &self,
+        against: DurableAgainst,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        self.content.0.ensure_durable(against)
+    }
+}
+
+impl<S> Clone for SqliteMetadata<S> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<S> SqliteContent<S> {
+    // of is the content of the database metadata is the key value store of.
+    pub fn of(metadata: &SqliteMetadata<S>) -> Self {
+        Self(Arc::clone(&metadata.0))
+    }
+}
+
+impl<S: SpawnBlocking + 'static> ContentStore for SqliteContent<S> {
+    type Failure = rusqlite::Error;
+    type Content = Bytes;
+
+    // A put the work of a write transaction makes goes into that transaction, which holds the writer meanwhile, so
+    // the content commits with the metadata naming it. Any other put commits on its own, through the writer.
+    async fn put(&self, content: impl Buf + Send) -> Result<ContentHash, Self::Failure> {
+        let (hash, chunks) = chunked(content);
+        if in_write_transaction(&self.0) {
+            store_chunks(&mut lock(&self.0.writer_connection), &hash, &chunks)?;
+            return Ok(hash);
         }
-        // A commit reaches the write ahead log first, and a checkpoint syncs the database before the log starts over,
-        // so syncing the log makes every commit before it durable, whichever connection made it. A sync against a
-        // power failure flushes the disk's whole cache, with what a checkpoint wrote in it. It waits on the disk, so
-        // it goes to the spawner.
-        let (mut writer, synced) = self
-            .spawner
-            .spawn_blocking(move || {
-                let synced = vfs::sync_log(get_mut(&mut writer.connection), against);
-                (writer, synced)
+        self.0
+            .transact(|transaction| {
+                let stored = store_chunks(&mut lock(transaction.connection), &hash, &chunks);
+                Box::pin(async move { stored.map(|()| ((), transaction)) })
             })
-            .await;
-        synced?;
-        writer.current_durable_against = Some(against);
-        writer.synced_data_version = data_version;
-        Ok(())
+            .await
+            .map_err(content_failure)?;
+        Ok(hash)
+    }
+
+    // A get the work of a write transaction makes reads inside that transaction, so it finds content the work put.
+    async fn get(
+        &self,
+        hash: &ContentHash,
+        offset: u64,
+        size: u64,
+    ) -> Result<Bytes, StoreError<GetRejection, Self::Failure>> {
+        if in_write_transaction(&self.0) {
+            let connection = lock(&self.0.writer_connection);
+            return read_content(begun(&connection)?, hash, offset, size)?
+                .map_err(StoreError::Rejected);
+        }
+        self.0
+            .read_transact(|transaction| {
+                let read = read_content(&lock(transaction.connection), hash, offset, size);
+                Box::pin(async move { read })
+            })
+            .await
+            .map_err(content_failure)?
+            .map_err(StoreError::Rejected)
+    }
+
+    fn ensure_durable(
+        &self,
+        against: DurableAgainst,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        self.0.ensure_durable(against)
+    }
+}
+
+impl<S> Clone for SqliteContent<S> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+thread_local! {
+    // IN_WRITE_TRANSACTION is the database whose write transaction's work this thread is running, or null.
+    static IN_WRITE_TRANSACTION: Cell<*const ()> = const { Cell::new(ptr::null()) };
+}
+
+// InWriteTransaction is this thread running the work of a write transaction on a database, until dropped.
+struct InWriteTransaction(*const ());
+
+impl InWriteTransaction {
+    fn start<S>(database: &Database<S>) -> Self {
+        Self(IN_WRITE_TRANSACTION.replace(ptr::from_ref(database).cast()))
+    }
+}
+
+impl Drop for InWriteTransaction {
+    fn drop(&mut self) {
+        IN_WRITE_TRANSACTION.set(self.0);
+    }
+}
+
+// in_write_transaction is whether this thread is running the work of a write transaction on database.
+fn in_write_transaction<S>(database: &Database<S>) -> bool {
+    ptr::eq(IN_WRITE_TRANSACTION.get(), ptr::from_ref(database).cast())
+}
+
+// chunked is content as the chunks the store keeps it in, with its hash. Empty content is one empty chunk.
+fn chunked(mut content: impl Buf) -> (ContentHash, Vec<Bytes>) {
+    let mut hasher = blake3::Hasher::new();
+    let mut chunks = Vec::with_capacity(content.remaining().div_ceil(CHUNK_SIZE).max(1));
+    loop {
+        let chunk = content.copy_to_bytes(content.remaining().min(CHUNK_SIZE));
+        hasher.update(&chunk);
+        chunks.push(chunk);
+        if !content.has_remaining() {
+            return (ContentHash(*hasher.finalize().as_bytes()), chunks);
+        }
+    }
+}
+
+// store_chunks keeps every chunk of content under its hash, or none when one fails, unless the store keeps that
+// content already.
+fn store_chunks(
+    connection: &mut Connection,
+    hash: &ContentHash,
+    chunks: &[Bytes],
+) -> rusqlite::Result<()> {
+    let stored = begun(connection)?
+        .prepare_cached(CHUNK_ROW)?
+        .query_row(params![&hash.0[..], 0], |_| Ok(()))
+        .optional()?;
+    if stored.is_some() {
+        return Ok(());
+    }
+    let storing = connection.savepoint()?;
+    let mut put = storing.prepare_cached(PUT_CHUNK)?;
+    for (index, chunk) in (0_i64..).zip(chunks) {
+        put.execute(params![&hash.0[..], index, &chunk[..]])?;
+    }
+    drop(put);
+    storing.commit()
+}
+
+// content_failure is why a transaction the store ran for content failed.
+fn content_failure(
+    failure: TransactError<std::convert::Infallible, rusqlite::Error, rusqlite::Error>,
+) -> rusqlite::Error {
+    match failure {
+        TransactError::Rejected(never) => match never {},
+        TransactError::Failed(failure) | TransactError::Aborted(failure) => failure,
+    }
+}
+
+// read_content reads size bytes of content from offset, through the blob of each chunk they are in.
+fn read_content(
+    connection: &Connection,
+    hash: &ContentHash,
+    offset: u64,
+    size: u64,
+) -> rusqlite::Result<Result<Bytes, GetRejection>> {
+    let last = connection
+        .prepare_cached(CONTENT_END)?
+        .query_row([&hash.0[..]], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
+        })
+        .optional()?;
+    let Some((last_chunk, last_length)) = last else {
+        return Ok(Err(GetRejection::UnknownContent(UnknownContent)));
+    };
+    let chunk_size = CHUNK_SIZE as u64;
+    let len = last_chunk * chunk_size + last_length;
+    match offset.checked_add(size) {
+        Some(end) if end <= len => {}
+        Some(_) | None => return Ok(Err(GetRejection::OutOfBounds { len })),
+    }
+    if size == 0 {
+        return Ok(Ok(Bytes::new()));
+    }
+    let chunk_row = |chunk: u64| {
+        connection
+            .prepare_cached(CHUNK_ROW)?
+            .query_row(params![&hash.0[..], chunk], |row| row.get(0))
+    };
+    let mut content = vec![0; usize::try_from(size).expect("a read fits in memory")];
+    let mut chunk = offset / chunk_size;
+    // start is where the read starts in the chunk, which is the start of every chunk after the first.
+    let mut start = (offset % chunk_size) as usize;
+    let mut blob = connection.blob_open(MAIN_DB, "content", "data", chunk_row(chunk)?, true)?;
+    let mut read = 0;
+    loop {
+        let length = (CHUNK_SIZE - start).min(content.len() - read);
+        blob.read_at_exact(&mut content[read..read + length], start)?;
+        read += length;
+        if read == content.len() {
+            return Ok(Ok(Bytes::from(content)));
+        }
+        chunk += 1;
+        start = 0;
+        blob.reopen(chunk_row(chunk)?)?;
     }
 }
 
 // begin_write begins the writer's transaction. While another process writes it waits on the spawner, trying again
 // until that process commits.
 async fn begin_write<S: SpawnBlocking>(
-    mut writer: OwnedMutexGuard<Writer>,
+    writer: OwnedMutexGuard<Writer>,
     spawner: &S,
 ) -> rusqlite::Result<WriteTransaction> {
-    match execute(get_mut(&mut writer.connection), BEGIN_WRITE) {
+    let begun = execute(&lock(&writer.connection), BEGIN_WRITE);
+    match begun {
         Err(failure) if is_busy(&failure) => {
             spawner
                 .spawn_blocking(move || {
-                    let connection = get_mut(&mut writer.connection);
-                    while_busy(|| execute(connection, BEGIN_WRITE))
+                    while_busy(|| execute(&lock(&writer.connection), BEGIN_WRITE))
                         .map(|()| WriteTransaction(writer))
                 })
                 .await
@@ -452,16 +816,16 @@ struct WriteTransaction(OwnedMutexGuard<Writer>);
 impl WriteTransaction {
     // commit commits the transaction, and fails once SQLite rolled it back after a failure.
     fn commit(&mut self) -> rusqlite::Result<()> {
-        execute(begun(get_mut(&mut self.0.connection))?, COMMIT)
+        execute(begun(&lock(&self.0.connection))?, COMMIT)
     }
 
     // roll_back rolls the transaction back, unless SQLite already did after a failure.
     fn roll_back(&mut self) -> rusqlite::Result<()> {
-        let connection = get_mut(&mut self.0.connection);
+        let connection = lock(&self.0.connection);
         if connection.is_autocommit() {
             return Ok(());
         }
-        execute(connection, ROLLBACK)
+        execute(&connection, ROLLBACK)
     }
 }
 

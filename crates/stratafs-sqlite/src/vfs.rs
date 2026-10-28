@@ -29,7 +29,7 @@ pub(crate) fn sync_log(connection: &Connection, against: DurableAgainst) -> rusq
         return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(found), None));
     }
     // SAFETY: the log belongs to the connection, which this thread holds, so nothing else uses it meanwhile.
-    // A log without methods is unopened, so nothing was written to it.
+    // A log without methods is unopened, and the store's read of the data version before each sync opens it.
     let synced = unsafe {
         match (*log).pMethods.as_ref().and_then(|methods| methods.xSync) {
             Some(sync) => sync(log, flags),

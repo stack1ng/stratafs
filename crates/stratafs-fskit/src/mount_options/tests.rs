@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use stratafs_tree::header::TreeVolumeId;
 
 use super::*;
@@ -10,6 +12,7 @@ fn tree_volume(id: &[u8]) -> TreeVolumeId {
 fn a_volume_is_written_as_lowercase_hex_after_its_name() {
     let options = MountOptions {
         volume: Bytes::from_static(&[0xab, 0x01]),
+        durability_cadence: None,
     };
     assert_eq!(options.to_string(), "volume=ab01");
 }
@@ -18,6 +21,7 @@ fn a_volume_is_written_as_lowercase_hex_after_its_name() {
 fn written_options_parse_back_to_their_volume() {
     let options = MountOptions {
         volume: tree_volume(&[0xcd; 16]),
+        durability_cadence: Some(Duration::from_secs(5)),
     };
     assert_eq!(
         options
@@ -80,4 +84,32 @@ fn parsing_rejects_bytes_that_are_not_a_volume() {
         "volume=ab01".parse::<MountOptions<TreeVolumeId>>(),
         Err(MountOptionsError::NotAVolume(_))
     ));
+}
+
+#[test]
+fn a_durability_cadence_is_written_in_seconds_after_the_volume() {
+    let options = MountOptions {
+        volume: Bytes::from_static(&[0xab, 0x01]),
+        durability_cadence: Some(Duration::from_secs(30)),
+    };
+    assert_eq!(options.to_string(), "volume=ab01,durability_cadence=30");
+}
+
+#[test]
+fn parsing_leaves_the_durability_cadence_out_unless_given() {
+    let options: MountOptions<Bytes> = "volume=ab01".parse().unwrap();
+    assert_eq!(options.durability_cadence, None);
+}
+
+#[test]
+fn parsing_rejects_a_durability_cadence_that_is_not_whole_seconds_above_zero() {
+    for cadence in ["0", "1.5", "-1", "", "30s"] {
+        assert!(
+            matches!(
+                format!("volume=ab01,durability_cadence={cadence}").parse::<MountOptions<Bytes>>(),
+                Err(MountOptionsError::NotSeconds(_))
+            ),
+            "{cadence} parsed"
+        );
+    }
 }

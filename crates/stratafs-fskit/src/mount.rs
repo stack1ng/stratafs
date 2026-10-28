@@ -26,7 +26,13 @@ pub fn mount<V: Clone + Into<Bytes>>(
 ) -> Result<(), MountError> {
     run(Command::new("/sbin/mount")
         .args(["-F", "-t", external_type, "-o"])
-        .arg(MountOptions { volume }.to_string())
+        .arg(
+            MountOptions {
+                volume,
+                durability_cadence: None,
+            }
+            .to_string(),
+        )
         .arg(special)
         .arg(mount_point))
 }

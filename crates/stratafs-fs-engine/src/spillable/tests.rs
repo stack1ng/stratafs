@@ -19,7 +19,7 @@ fn make_spillable(engine: &InMemoryEngine, prefix_length: usize, content: Bytes)
 }
 
 fn stored_content(engine: &InMemoryEngine, hash: &ContentHash, length: usize) -> Option<Bytes> {
-    match block_on(engine.content.get(hash, 0, length as u64)) {
+    match block_on(engine.content().get(hash, 0, length as u64)) {
         Ok(mut content) => Some(content.copy_to_bytes(content.remaining())),
         Err(StoreError::Rejected(GetRejection::UnknownContent(_))) => None,
         Err(error) => panic!("reading the content store failed: {error}"),

@@ -1,7 +1,9 @@
 use std::fmt::Display;
 use std::ptr::null_mut;
-use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Waker};
+use std::time::Duration;
 
 use block2::RcBlock;
 use bytes::{Buf, Bytes};
@@ -26,9 +28,9 @@ use stratafs_fs_engine::directories::error::{LookupError, ReaddirError, RenameEr
 use stratafs_fs_engine::directories::{NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, IoFailure, PosixError};
 use stratafs_fs_engine::{FsConfig, FsEngine, Inode, Timestamp};
-use stratafs_store::content::ContentStore;
 use stratafs_store::durability::DurableAgainst;
-use stratafs_store::kv::{KeyValueStore, TransactError};
+use stratafs_store::kv::TransactError;
+use stratafs_store::store::Store;
 
 use super::changes::AttributeChange;
 use super::item::{file_name, item_id};
@@ -37,9 +39,6 @@ use super::{errno, posix_error};
 
 // Reply is an FSKit reply block, copied so an operation can call it once it finishes.
 pub(crate) type Reply<R> = RcBlock<'static, fn(*mut R, *mut NSError), dyn Send + Sync>;
-
-// ErrorReply is an FSKit reply block that carries only an error, which is nil on success.
-pub(crate) type ErrorReply = RcBlock<'static, fn(*mut NSError), dyn Send + Sync>;
 
 // Handed carries an object FSKit handed an operation to fill, such as a directory entry packer or a read
 // buffer, to the thread the operation finishes on.
@@ -160,39 +159,65 @@ pub(crate) trait VolumeOperations: Send + Sync {
     );
 
     fn list_xattrs(self: Arc<Self>, inode: Inode, reply: Reply<FSListXattrsResult>);
-
-    // ensure_durable makes every committed operation durable against a failure. With wait it replies once they
-    // are; without it,
-    // it replies at once and lets that finish on its own.
-    fn ensure_durable(self: Arc<Self>, against: DurableAgainst, wait: bool, reply: ErrorReply);
 }
 
 // Volume is a mounted volume's engine. Each operation replies when it finishes, on FSKit's thread unless it
 // has to wait, and then on spawner.
-pub(crate) struct Volume<M, C, A, N, S>
+pub(crate) struct Volume<St, A, N, S>
 where
-    M: KeyValueStore,
-    C: ContentStore + 'static,
+    St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
 {
-    pub(crate) engine: FsEngine<M, C, A, N, S>,
+    pub(crate) engine: FsEngine<St, A, N, S>,
     pub(crate) spawner: Arc<dyn Spawn + Send + Sync>,
     pub(crate) items: Items,
+    // stops_durability_cadence stops the volume's durability cadence when the volume is dropped.
+    pub(crate) stops_durability_cadence: mpsc::Sender<()>,
 }
 
-// Closing the engine's metadata store makes every commit durable, so dropping the volume, which happens after its
-// last operation, first makes the content those commits name durable.
-impl<M, C, A, N, S> Drop for Volume<M, C, A, N, S>
+// make_durable_on_cadence makes the volume durable against a power failure every period, on a thread of its own,
+// until the volume is dropped.
+pub(crate) fn make_durable_on_cadence<St, A, N, S>(
+    volume: Weak<Volume<St, A, N, S>>,
+    stopped: mpsc::Receiver<()>,
+    period: Duration,
+) where
+    St: Store,
+    A: Fn() -> u64 + Send + Sync + 'static,
+    N: Fn() -> Timestamp + Send + Sync + 'static,
+    S: FsConfig,
+{
+    std::thread::Builder::new()
+        .name("durability cadence".to_owned())
+        .spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(period) {
+                let Some(volume) = volume.upgrade() else {
+                    return;
+                };
+                if let Err(error) =
+                    block_on(volume.engine.ensure_durable(DurableAgainst::PowerFailure))
+                {
+                    tracing::warn!(%error, "making the volume durable on its cadence failed");
+                }
+            }
+        })
+        .expect("the operating system starts the durability cadence's thread");
+}
+
+// Dropping the volume, which happens after its last operation, makes every commit durable, up to the engine's
+// durability limit.
+impl<St, A, N, S> Drop for Volume<St, A, N, S>
 where
-    M: KeyValueStore,
-    C: ContentStore + 'static,
+    St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
 {
     fn drop(&mut self) {
+        // The cadence's thread has stopped when the send fails.
+        let _ = self.stops_durability_cadence.send(());
         if let Err(error) = block_on(self.engine.ensure_durable(DurableAgainst::PowerFailure)) {
             tracing::warn!(%error, "making the volume durable before closing it failed");
         }
@@ -229,10 +254,9 @@ const LISTING_BATCH: usize = 64;
 // FSKit never needs to start it over.
 const VERIFIER: FSDirectoryVerifier = 1;
 
-impl<M, C, A, N, S> VolumeOperations for Volume<M, C, A, N, S>
+impl<St, A, N, S> VolumeOperations for Volume<St, A, N, S>
 where
-    M: KeyValueStore,
-    C: ContentStore + 'static,
+    St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
@@ -946,35 +970,17 @@ where
             }
         });
     }
-
-    fn ensure_durable(self: Arc<Self>, against: DurableAgainst, wait: bool, reply: ErrorReply) {
-        if !wait {
-            reply.call(null_mut());
-        }
-        self.run(move |volume| async move {
-            match (volume.engine.ensure_durable(against).await, wait) {
-                (Ok(()), true) => reply.call(null_mut()),
-                (Err(error), true) => {
-                    let error = posix_error(errno(PosixError::EIO), &error.to_string());
-                    reply.call(Retained::as_ptr(&error).cast_mut());
-                }
-                (Ok(()), false) => {}
-                (Err(error), false) => tracing::warn!(%error, "making the volume durable failed"),
-            }
-        });
-    }
 }
 
-impl<M, C, A, N, S> Volume<M, C, A, N, S>
+impl<St, A, N, S> Volume<St, A, N, S>
 where
-    M: KeyValueStore,
-    C: ContentStore + 'static,
+    St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
 {
     // run runs an operation, handing it the volume, on FSKit's thread until it finishes or has to wait, such
-    // as while the store makes commits durable. An operation that has to wait finishes on the spawner, so
+    // as while the store's thread pool runs its transaction. An operation that has to wait finishes on the spawner, so
     // FSKit can hand over the next one meanwhile.
     fn run<O: Future<Output = ()> + Send + 'static>(
         self: Arc<Self>,

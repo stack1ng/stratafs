@@ -1,0 +1,24 @@
+[package]
+name = "stratafs-lock-synchronized"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-lock.workspace = true
+bytes.workspace = true
+futures-core.workspace = true
+futures-lite.workspace = true
+stratafs-store.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+object_store.workspace = true
+redb = "4.4.0"
+stratafs-object-store.workspace = true
+stratafs-redb.workspace = true
+
+[lints]
+workspace = true

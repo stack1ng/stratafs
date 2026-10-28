@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
-use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::kv::{KeyValueStore, TransactError};
@@ -37,11 +37,20 @@ impl FsConfig for BenchFsConfig {
         number(option_env!("STRATAFS_BENCH_LARGEST_INLINE_ENTRY"), 4 * 1024);
 }
 
-// The metadata store comes from the build's environment too, as STRATAFS_BENCH_STORE: redb or sqlite.
+// The durability limit comes from the build's environment too, as STRATAFS_BENCH_DURABILITY: none, software or power.
+const DURABILITY_LIMIT: Option<DurableAgainst> =
+    durability_limit(option_env!("STRATAFS_BENCH_DURABILITY"));
+
+// The metadata store comes from the build's environment too, as STRATAFS_BENCH_STORE: redb, with the content in files
+// beside it, or sqlite, with the content in the same database.
 #[cfg(store = "redb")]
 type Metadata = stratafs_redb::RedbStore<ThreadPool>;
 #[cfg(store = "sqlite")]
-type Metadata = stratafs_sqlite::SqliteStore<ThreadPool>;
+type Metadata = stratafs_sqlite::SqliteMetadata<ThreadPool>;
+#[cfg(store = "redb")]
+type Content = stratafs_object_store::ObjectStoreContentStore;
+#[cfg(store = "sqlite")]
+type Content = stratafs_sqlite::SqliteContent<ThreadPool>;
 #[cfg(store = "redb")]
 type DatabaseError = redb::Error;
 #[cfg(store = "sqlite")]
@@ -55,13 +64,18 @@ pub type BenchVolume = TreeVolume<Metadata, fn() -> u128, BenchTreeConfig>;
 type VolumeRejection = <BenchVolume as KeyValueStore>::Rejection;
 type VolumeFailure = <BenchVolume as KeyValueStore>::Failure;
 
-pub type BenchEngine =
-    FsEngine<BenchVolume, ObjectStoreContentStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig>;
+// BenchStore keeps a volume and the content of every file, made durable together.
+#[cfg(store = "redb")]
+pub type BenchStore = stratafs_lock_synchronized::LockSynchronizedStore<BenchVolume, Content>;
+#[cfg(store = "sqlite")]
+pub type BenchStore = stratafs_sqlite::SqliteStore<BenchVolume, ThreadPool>;
+
+pub type BenchEngine = FsEngine<BenchStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig>;
 
 // Store is the store directory opened: the tree holding every volume, and the content of every file.
 pub struct Store {
     pub tree: BenchTree,
-    pub content: ObjectStoreContentStore,
+    pub content: Content,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,8 +95,9 @@ pub enum OpenStoreError {
             PinnedConfigError<MetadataRejection, MetadataFailure>,
         >,
     ),
+    #[cfg(store = "redb")]
     #[error("the store's content could not be opened")]
-    Content(#[source] ObjectStoreError),
+    Content(#[source] stratafs_object_store::ObjectStoreError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -125,9 +140,7 @@ impl From<&OpenVolumeError> for PosixError {
 // open_store opens the store in directory, making it first if the directory holds none.
 pub async fn open_store(directory: &Path) -> Result<Store, OpenStoreError> {
     std::fs::create_dir_all(directory).map_err(OpenStoreError::Directory)?;
-    let content = ObjectStoreContentStore::local(directory.join("content"))
-        .map_err(OpenStoreError::Content)?;
-    let metadata = open_metadata(directory)?;
+    let (metadata, content) = open_database(directory)?;
     let allocate_node: fn() -> u128 = rand::random;
     let tree = Tree::new(metadata, allocate_node)
         .await
@@ -136,19 +149,24 @@ pub async fn open_store(directory: &Path) -> Result<Store, OpenStoreError> {
 }
 
 #[cfg(store = "redb")]
-fn open_metadata(directory: &Path) -> Result<Metadata, OpenStoreError> {
-    stratafs_redb::RedbStore::local(directory.join("metadata.redb"), ThreadPool).map_err(|error| {
-        match error {
+fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError> {
+    let content = stratafs_object_store::ObjectStoreContentStore::local(directory.join("content"))
+        .map_err(OpenStoreError::Content)?;
+    let metadata = stratafs_redb::RedbStore::local(directory.join("metadata.redb"), ThreadPool)
+        .map_err(|error| match error {
             redb::Error::DatabaseAlreadyOpen => OpenStoreError::AlreadyOpen,
             error => OpenStoreError::Database(error),
-        }
-    })
+        })?;
+    Ok((metadata, content))
 }
 
 #[cfg(store = "sqlite")]
-fn open_metadata(directory: &Path) -> Result<Metadata, OpenStoreError> {
-    stratafs_sqlite::SqliteStore::local(directory.join("metadata.sqlite"), ThreadPool)
-        .map_err(OpenStoreError::Database)
+fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError> {
+    let metadata =
+        stratafs_sqlite::SqliteMetadata::local(directory.join("store.sqlite"), ThreadPool)
+            .map_err(OpenStoreError::Database)?;
+    let content = stratafs_sqlite::SqliteContent::of(&metadata);
+    Ok((metadata, content))
 }
 
 // open_volume opens volume from the store in directory.
@@ -180,10 +198,10 @@ async fn engine(store: Store, volume: TreeVolumeId) -> Result<BenchEngine, OpenV
     })?;
     let allocate_inode: fn() -> u64 = rand::random;
     FsEngine::new(
-        metadata,
-        store.content,
+        BenchStore::new(metadata, store.content),
         allocate_inode,
         now as fn() -> Timestamp,
+        DURABILITY_LIMIT,
     )
     .await
     .map_err(OpenVolumeError::Root)
@@ -195,6 +213,20 @@ fn now() -> Timestamp {
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after 1970");
     Timestamp(i64::try_from(since_epoch.as_nanos()).expect("the clock is before 2262"))
+}
+
+// durability_limit reads the durability limit build setting, or power when the build does not set it. A setting that
+// is not none, software or power stops the build.
+const fn durability_limit(setting: Option<&str>) -> Option<DurableAgainst> {
+    let Some(setting) = setting else {
+        return Some(DurableAgainst::PowerFailure);
+    };
+    match setting.as_bytes() {
+        b"none" => None,
+        b"software" => Some(DurableAgainst::SoftwareFailure),
+        b"power" => Some(DurableAgainst::PowerFailure),
+        _ => panic!("the durability build setting is not none, software or power"),
+    }
 }
 
 // number reads a decimal build setting, or default when the build does not set it. A setting that is not a

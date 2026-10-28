@@ -84,7 +84,10 @@ fn stratafs(store: &Path, mount_point: &Path) -> Result<Mounting, SuiteError> {
 
     let volume = block_on(crate::create_volume(store))
         .map_err(|error| SuiteError::Config(format!("creating a stratafs volume: {error}")))?;
-    let options = MountOptions { volume };
+    let options = MountOptions {
+        volume,
+        durability_cadence: None,
+    };
     Ok(Mounting {
         mount: format!(
             "/sbin/mount -F -t stratafs -o {options} {} {}",

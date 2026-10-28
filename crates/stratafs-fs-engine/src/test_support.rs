@@ -5,8 +5,10 @@ use std::fmt::Debug;
 use futures_lite::future::block_on;
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
+use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::{RedbFailure, RedbStore};
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::TransactError;
 use stratafs_store::spawn::Inline;
@@ -32,12 +34,15 @@ impl TreeConfig for TestTreeConfig {
     const MERGE_BELOW_PERCENT: u8 = 25;
 }
 
-pub(crate) type MetadataStore = TreeVolume<RedbStore<Inline>, fn() -> u128, TestTreeConfig>;
+pub(crate) type InMemoryStore = LockSynchronizedStore<
+    TreeVolume<RedbStore<Inline>, fn() -> u128, TestTreeConfig>,
+    ObjectStoreContentStore,
+>;
 
 pub(crate) type MetadataFailure = TreeFailure<RedbFailure, Infallible>;
 
 pub(crate) type InMemoryEngine =
-    FsEngine<MetadataStore, ObjectStoreContentStore, fn() -> u64, fn() -> Timestamp, OneKibInline>;
+    FsEngine<InMemoryStore, fn() -> u64, fn() -> Timestamp, OneKibInline>;
 
 thread_local! {
     static CLOCK: Cell<i64> = const { Cell::new(0) };
@@ -76,10 +81,10 @@ pub(crate) fn new_test_engine() -> InMemoryEngine {
             .unwrap();
         let volume = tree.open(tree.create().await.unwrap()).await.unwrap();
         FsEngine::new(
-            volume,
-            ObjectStoreContentStore::new(InMemory::new()),
+            LockSynchronizedStore::new(volume, ObjectStoreContentStore::new(InMemory::new())),
             allocate_inode,
             now,
+            Some(DurableAgainst::PowerFailure),
         )
         .await
         .unwrap()

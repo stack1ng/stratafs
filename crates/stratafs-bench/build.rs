@@ -1,4 +1,4 @@
-// The metadata store the build uses, from STRATAFS_BENCH_STORE: redb when it is unset.
+// The store the build uses, from STRATAFS_BENCH_STORE: redb when it is unset.
 fn main() {
     println!("cargo::rerun-if-env-changed=STRATAFS_BENCH_STORE");
     println!("cargo::rustc-check-cfg=cfg(store, values(\"redb\", \"sqlite\"))");

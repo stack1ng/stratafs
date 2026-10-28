@@ -25,6 +25,7 @@ tempfile = "3"
 blocking.workspace = true
 object_store = { workspace = true, features = ["fs"] }
 nix.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 cfg_aliases.workspace = true

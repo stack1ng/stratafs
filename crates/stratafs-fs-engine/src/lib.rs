@@ -1,14 +1,11 @@
 use std::marker::PhantomData;
 
-use async_lock::RwLock;
 use futures_core::future::BoxFuture;
 use storekey::{BorrowDecode, Encode};
-use stratafs_store::content::ContentStore;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
-
-use crate::error::IoFailure;
+use stratafs_store::store::Store;
 
 pub mod annotations;
 pub mod attributes;
@@ -29,14 +26,18 @@ const SMALLEST_INLINE_ENTRY: usize = 1024;
 
 pub const LARGEST_NAME_LENGTH: usize = 255;
 
-pub struct FsEngine<M, C, A, N, S> {
-    metadata: M,
-    content: C,
+// MetadataRejection and MetadataFailure are why a transaction on a store's metadata was refused or failed.
+type MetadataRejection<St> = <<St as Store>::Metadata as KeyValueStore>::Rejection;
+type MetadataFailure<St> = <<St as Store>::Metadata as KeyValueStore>::Failure;
+
+pub struct FsEngine<St: Store, A, N, S> {
     allocate_inode: A,
     now: N,
-    // writing is held by every write transaction together, and by ensure_durable alone, so no transaction
-    // commits between ensure_durable making the content durable and making the metadata durable.
-    writing: RwLock<()>,
+    // store keeps the metadata and the content, and makes them durable together.
+    store: St,
+    // durability_limit is the most ensure_durable makes commits durable against, or None when it makes nothing
+    // durable.
+    durability_limit: Option<DurableAgainst>,
     config: PhantomData<S>,
 }
 
@@ -64,10 +65,9 @@ impl<T, C, A, N: Fn() -> Timestamp, S> FsTransaction<'_, '_, T, C, A, N, S> {
     }
 }
 
-impl<M, C, A, N, S> FsEngine<M, C, A, N, S>
+impl<St, A, N, S> FsEngine<St, A, N, S>
 where
-    M: KeyValueStore,
-    C: ContentStore,
+    St: Store,
     A: Send + Sync,
     N: Fn() -> Timestamp + Send + Sync,
     S: FsConfig,
@@ -77,19 +77,23 @@ where
     // such as redb's (https://github.com/rust-lang/rust/issues/110338). The long return type comes from that form.
     #[allow(clippy::type_complexity)]
     pub fn new(
-        metadata: M,
-        content: C,
+        store: St,
         allocate_inode: A,
         now: N,
+        durability_limit: Option<DurableAgainst>,
     ) -> impl Future<
         Output = Result<
             Self,
-            TransactError<M::Rejection, M::Failure, StoreError<M::Rejection, M::Failure>>,
+            TransactError<
+                MetadataRejection<St>,
+                MetadataFailure<St>,
+                StoreError<MetadataRejection<St>, MetadataFailure<St>>,
+            >,
         >,
     > + Send {
         const {
             assert!(
-                S::LARGEST_INLINE_ENTRY <= M::LARGEST_ACCEPTED_ENTRY,
+                S::LARGEST_INLINE_ENTRY <= <St::Metadata as KeyValueStore>::LARGEST_ACCEPTED_ENTRY,
                 "the largest inline entry exceeds the largest entry the metadata store accepts"
             );
             assert!(
@@ -99,11 +103,10 @@ where
         };
         async move {
             let engine = Self {
-                metadata,
-                content,
                 allocate_inode,
                 now,
-                writing: RwLock::new(()),
+                store,
+                durability_limit,
                 config: PhantomData,
             };
             engine
@@ -119,87 +122,105 @@ where
     }
 }
 
-impl<M: KeyValueStore, C: ContentStore, A: Sync, N: Sync, S: Sync> FsEngine<M, C, A, N, S> {
-    // ensure_durable makes every transaction committed before it is called durable against a failure, and
-    // resolves once they are. The content goes first, so durable metadata never names content that is not.
+impl<St: Store, A: Sync, N: Sync, S: Sync> FsEngine<St, A, N, S> {
+    // ensure_durable makes every transaction committed before it is called durable against a failure, or against
+    // the durability limit when that is less, and resolves once they are. Without a limit it resolves at once.
     // It returns `impl Future + Send` instead of being `async fn` for the reason spillable.rs gives.
     #[allow(clippy::manual_async_fn)]
     pub fn ensure_durable(
         &self,
         against: DurableAgainst,
-    ) -> impl Future<Output = Result<(), IoFailure<M::Failure, C::Failure>>> + Send {
+    ) -> impl Future<Output = Result<(), St::Failure>> + Send {
         async move {
-            let _alone = self.writing.write().await;
-            self.content
-                .ensure_durable(against)
-                .await
-                .map_err(IoFailure::ContentWrite)?;
-            self.metadata
-                .ensure_durable(against)
-                .await
-                .map_err(IoFailure::Metadata)
+            match self.durability_limit {
+                Some(limit) => self.store.ensure_durable(against.min(limit)).await,
+                None => Ok(()),
+            }
         }
     }
 }
 
-impl<M, C, A, N, S> FsEngine<M, C, A, N, S> {
+impl<St: Store, A, N, S> FsEngine<St, A, N, S> {
     // content is the content store, which loads a read's ContentLoadPlan once the read's transaction ends.
-    pub fn content(&self) -> &C {
-        &self.content
+    pub fn content(&self) -> &St::Content {
+        self.store.content()
     }
 }
 
-impl<M: KeyValueStore, C: Sync, A: Sync, N: Sync, S: FsConfig> FsEngine<M, C, A, N, S> {
+impl<St: Store, A: Sync, N: Sync, S: FsConfig> FsEngine<St, A, N, S> {
     // transact runs work in a transaction. When work succeeds it hands its transaction back with its result.
-    // It returns `impl Future + Send` instead of being `async fn` for the reason spillable.rs gives.
-    #[allow(clippy::type_complexity, clippy::manual_async_fn)]
+    #[allow(clippy::type_complexity)]
     pub fn transact<'engine, T: Send + 'engine, E: Send + 'engine>(
         &'engine self,
         mut work: impl for<'txn> FnMut(
-            FsTransaction<'txn, 'engine, M::Transaction<'txn>, C, A, N, S>,
+            FsTransaction<
+                'txn,
+                'engine,
+                <St::Metadata as KeyValueStore>::Transaction<'txn>,
+                St::Content,
+                A,
+                N,
+                S,
+            >,
         ) -> BoxFuture<
             'txn,
             Result<
                 (
                     T,
-                    FsTransaction<'txn, 'engine, M::Transaction<'txn>, C, A, N, S>,
+                    FsTransaction<
+                        'txn,
+                        'engine,
+                        <St::Metadata as KeyValueStore>::Transaction<'txn>,
+                        St::Content,
+                        A,
+                        N,
+                        S,
+                    >,
                 ),
                 E,
             >,
         > + Send,
-    ) -> impl Future<Output = Result<T, TransactError<M::Rejection, M::Failure, E>>> + Send {
-        async move {
-            let _together = self.writing.read().await;
-            self.metadata
-                .transact(move |metadata| {
-                    let working = work(self.transaction(metadata));
-                    Box::pin(async move {
-                        let (result, transaction) = working.await?;
-                        Ok((result, transaction.metadata))
-                    })
-                })
-                .await
-        }
+    ) -> impl Future<
+        Output = Result<T, TransactError<MetadataRejection<St>, MetadataFailure<St>, E>>,
+    > + Send {
+        self.store.metadata().transact(move |metadata| {
+            let working = work(self.transaction(metadata));
+            Box::pin(async move {
+                let (result, transaction) = working.await?;
+                Ok((result, transaction.metadata))
+            })
+        })
     }
 
     pub fn read_transact<'engine, T: Send, E: Send>(
         &'engine self,
         mut work: impl for<'txn> FnMut(
-            FsTransaction<'txn, 'engine, M::ReadTransaction<'txn>, C, A, N, S>,
+            FsTransaction<
+                'txn,
+                'engine,
+                <St::Metadata as KeyValueStore>::ReadTransaction<'txn>,
+                St::Content,
+                A,
+                N,
+                S,
+            >,
         ) -> BoxFuture<'txn, Result<T, E>>
         + Send,
-    ) -> impl Future<Output = Result<T, TransactError<M::Rejection, M::Failure, E>>> + Send {
-        self.metadata
+    ) -> impl Future<
+        Output = Result<T, TransactError<MetadataRejection<St>, MetadataFailure<St>, E>>,
+    > + Send {
+        self.store
+            .metadata()
             .read_transact(move |metadata| work(self.transaction(metadata)))
     }
 
     fn transaction<'txn, 'engine, T>(
         &'engine self,
         metadata: TransactionHandle<'txn, 'engine, T>,
-    ) -> FsTransaction<'txn, 'engine, T, C, A, N, S> {
+    ) -> FsTransaction<'txn, 'engine, T, St::Content, A, N, S> {
         FsTransaction {
             metadata,
-            content: &self.content,
+            content: self.store.content(),
             allocate_inode: &self.allocate_inode,
             now: &self.now,
             config: PhantomData,

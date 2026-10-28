@@ -6,10 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
-rusqlite = { version = "0.41.0", default-features = false, features = ["bundled", "cache", "hooks"] }
+rusqlite = { version = "0.41.0", default-features = false, features = ["blob", "bundled", "cache", "fallible_uint", "hooks"] }
 stratafs-keyed-notify.workspace = true
 stratafs-store.workspace = true
 
@@ -18,6 +19,7 @@ nix.workspace = true
 
 [dev-dependencies]
 futures-lite.workspace = true
+stratafs-content-conformance.workspace = true
 stratafs-kv-conformance.workspace = true
 tempfile = "3"
 

@@ -249,7 +249,6 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
             )?;
             let entries = entries
                 .map_err(IoFailure::Metadata)?
-                .into_iter()
                 .map(|(key, value)| decode_entry(&key, value))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(IoFailure::Corrupt)?;

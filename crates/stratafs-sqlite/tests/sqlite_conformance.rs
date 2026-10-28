@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use stores::Stores;
 use stratafs_kv_conformance::runtime::{exhaustive_dfs, seeded};
+use stratafs_sqlite::SqliteContent;
 
 #[test]
 fn is_strictly_serializable() {
@@ -24,4 +25,32 @@ fn observation_lifecycle() {
         exhaustive_dfs(),
         move || stores.open(),
     );
+}
+
+#[test]
+fn stores_content_under_its_hash() {
+    let stores = Stores::new();
+    stratafs_content_conformance::stores_content_under_its_hash(|| {
+        SqliteContent::of(&stores.open())
+    });
+}
+
+#[test]
+fn reads_ranges() {
+    let stores = Stores::new();
+    stratafs_content_conformance::reads_ranges(|| SqliteContent::of(&stores.open()));
+}
+
+#[test]
+fn rejects_ranges_beyond_the_content() {
+    let stores = Stores::new();
+    stratafs_content_conformance::rejects_ranges_beyond_the_content(|| {
+        SqliteContent::of(&stores.open())
+    });
+}
+
+#[test]
+fn rejects_unknown_content() {
+    let stores = Stores::new();
+    stratafs_content_conformance::rejects_unknown_content(|| SqliteContent::of(&stores.open()));
 }
