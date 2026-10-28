@@ -186,8 +186,15 @@ impl<B, T: ?Sized, R> SlottedList<B, T, R> {
 
 impl<T: ?Sized, R: AddressableRange> SlottedList<BytesMut, T, R> {
     pub(crate) fn empty() -> Self {
+        Self::with_capacity(0, 0)
+    }
+
+    // with_capacity is an empty list with room for that many entries and bytes of entry data.
+    pub(crate) fn with_capacity(entries: usize, data: usize) -> Self {
+        let mut bytes = BytesMut::with_capacity(data + (entries + 1) * size_of::<R::Stored>());
+        bytes.extend_from_slice(address::<R>(0).as_bytes());
         Self {
-            bytes: BytesMut::from(address::<R>(0).as_bytes()),
+            bytes,
             entry: PhantomData,
             address: PhantomData,
         }
@@ -240,19 +247,20 @@ where
         &mut self,
         other: &SlottedList<B, T, O>,
     ) {
-        self.extend_from_list_starting_at(other, 0);
+        self.extend_from_list_range(other, 0..other.len());
     }
 
-    pub(crate) fn extend_from_list_starting_at<B: AsRef<[u8]>, O: AddressableRange>(
+    // extend_from_list_range copies the other list's entries in range onto the end of this list.
+    pub(crate) fn extend_from_list_range<B: AsRef<[u8]>, O: AddressableRange>(
         &mut self,
         other: &SlottedList<B, T, O>,
-        index: usize,
+        range: Range<usize>,
     ) {
         let (data_length, count) = self.lengths();
         let (other_data, other_starts) = other.parts();
-        let other_starts = &other_starts[index..];
-        let skipped = other_starts.first().map_or(other_data.len(), O::decode);
-        let other_data = &other_data[skipped..];
+        let skipped = other.data_before(range.start);
+        let other_data = &other_data[skipped..other.data_before(range.end)];
+        let other_starts = &other_starts[range];
         assert!(
             data_length + other_data.len() <= R::MAX && count + other_starts.len() <= R::MAX,
             "a slotted list holds at most {max} entries and {max} bytes of entry data",

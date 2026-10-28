@@ -133,7 +133,10 @@ where
             let first_key =
                 separator_for_parent::<C::Range>(kind, &mut chunk).map_err(TreeFailure::Corrupt)?;
             let separator = first_separator.take().unwrap_or(first_key);
-            let mut entries = SlottedList::<BytesMut, [u8], C::Range>::empty();
+            let mut entries = SlottedList::<BytesMut, [u8], C::Range>::with_capacity(
+                chunk.len(),
+                chunk.data_before(chunk.len()),
+            );
             entries.extend_from_list(&chunk);
             mutations.push(match nodes.next() {
                 Some(node) => LayerNodeMutation::Update {

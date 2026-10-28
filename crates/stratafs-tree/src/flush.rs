@@ -8,6 +8,7 @@ use smallvec::{SmallVec, smallvec};
 use stratafs_range_bounds_map::RangeBoundsMap;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
+use zerocopy::KnownLayout;
 
 use crate::descent::DescentPath;
 use crate::error::TreeFailure;
@@ -134,29 +135,48 @@ where
     }
 
     // layer_span merges a span's stored entries with its buffered sets, in key order,
-    // leaving out every stored key the buffer set or cleared.
+    // leaving out every stored key the buffer set or cleared. The stored entries between them are copied a run at a
+    // time.
     fn layer_span(
         span: &FlushSpan<C::Range>,
         buffered: &RangeBoundsMap<Bytes, Option<Bytes>>,
     ) -> Result<LayerSpan<C::Range>, crate::serialized::CorruptValue> {
-        let mut entries = SlottedList::<BytesMut, LeafEntry<C::Range>, u32>::empty();
+        // Room for every stored entry and every set, the most the merge can keep.
+        let leaves = span.leaves.iter().map(|leaf| &leaf.destination.entries);
+        let set_sizes = span.sets.iter().map(|(key, value)| {
+            LeafEntry::<C::Range>::size_for_metadata(key.len() + value.len())
+                .expect("an entry fits in memory")
+        });
+        let mut entries = SlottedList::<BytesMut, LeafEntry<C::Range>, u32>::with_capacity(
+            leaves.clone().map(|stored| stored.len()).sum::<usize>() + span.sets.len(),
+            leaves
+                .map(|stored| stored.data_before(stored.len()))
+                .sum::<usize>()
+                + set_sizes.sum::<usize>(),
+        );
         let mut sets = span.sets.iter().peekable();
         for leaf in &span.leaves {
             let stored = &leaf.destination.entries;
+            // kept is the first stored entry not yet copied or left out.
+            let mut kept = 0;
             for index in 0..stored.len() {
-                let (key, value) = stored
+                let (key, _) = stored
                     .get(index)
                     .expect("the index is in the leaf")?
                     .key_and_value()?;
+                let set_before = sets.peek().is_some_and(|(set_key, _)| &set_key[..] < key);
+                let left_out = buffered.get(&stored.get_ref().slice_ref(key)).is_some();
+                if set_before || left_out {
+                    entries.extend_from_list_range(stored, kept..index);
+                    kept = if left_out { index + 1 } else { index };
+                }
                 while let Some((set_key, set_value)) =
                     sets.next_if(|(set_key, _)| &set_key[..] < key)
                 {
                     entries.insert_entry(entries.len(), set_key, &set_value[..]);
                 }
-                if buffered.get(&stored.get_ref().slice_ref(key)).is_none() {
-                    entries.insert_entry(entries.len(), key, value);
-                }
             }
+            entries.extend_from_list_range(stored, kept..stored.len());
         }
         for (set_key, set_value) in sets {
             entries.insert_entry(entries.len(), set_key, &set_value[..]);

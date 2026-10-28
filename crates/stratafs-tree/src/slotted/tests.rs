@@ -65,6 +65,15 @@ fn an_empty_list_is_only_its_count() {
 }
 
 #[test]
+fn a_list_with_capacity_holds_that_many_entries_and_bytes_without_growing() {
+    let mut list = SlottedList::<BytesMut, [u8], u16>::with_capacity(2, 5);
+    list.insert(0, b"ab");
+    list.insert(1, b"cde");
+    let bytes = list.into_inner();
+    assert_eq!(bytes.capacity(), bytes.len());
+}
+
+#[test]
 fn entries_are_stored_before_their_starts_and_count() {
     let mut list = list_of::<u16>(&[b"ab", b"cde"]);
     list.insert(1, b"x");
@@ -155,7 +164,7 @@ fn extend_from_list_copies_between_address_widths() {
         stored::<u32>(b"abcdef", &[0, 2, 5])
     );
     let mut narrow = list_of::<u8>(&[]);
-    narrow.extend_from_list_starting_at(&wide, 1);
+    narrow.extend_from_list_range(&wide, 1..3);
     assert_eq!(&narrow.into_inner()[..], stored::<u8>(b"cdef", &[0, 3]));
 }
 
@@ -641,15 +650,17 @@ fn truncate_keeps_the_front_entries() {
 }
 
 #[test]
-fn extending_from_an_index_appends_only_the_entries_from_there() {
+fn extending_from_a_range_appends_only_its_entries() {
     let mut list = list_of::<u16>(&[b"aa"]);
-    list.extend_from_list_starting_at(&list_of::<u16>(&[b"b", b"cc", b"ddd"]), 1);
+    list.extend_from_list_range(&list_of::<u16>(&[b"b", b"cc", b"ddd"]), 1..3);
     assert_eq!(list.len(), 3);
     assert_eq!(list.get(0).unwrap().unwrap(), b"aa");
     assert_eq!(list.get(1).unwrap().unwrap(), b"cc");
     assert_eq!(list.get(2).unwrap().unwrap(), b"ddd");
-    list.extend_from_list_starting_at(&list_of::<u16>(&[b"e"]), 1);
+    list.extend_from_list_range(&list_of::<u16>(&[b"e"]), 1..1);
     assert_eq!(list.len(), 3);
+    list.extend_from_list_range(&list_of::<u16>(&[b"f", b"gg", b"h"]), 1..2);
+    assert_eq!(entries(&list), [&b"aa"[..], b"cc", b"ddd", b"gg"]);
 }
 
 #[test]

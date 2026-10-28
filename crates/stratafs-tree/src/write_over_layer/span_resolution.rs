@@ -221,7 +221,7 @@ fn join_overlapping<R: AddressableRange>(
     let skipped_entries: usize = next_left_pulls[..already_joined].iter().sum();
     joined
         .entries
-        .extend_from_list_starting_at(&next.entries, skipped_entries);
+        .extend_from_list_range(&next.entries, skipped_entries..next.entries.len());
     joined
         .nodes
         .extend(next.nodes.into_iter().skip(already_joined));
