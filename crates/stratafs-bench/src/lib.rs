@@ -42,21 +42,68 @@ const DURABILITY_LIMIT: Option<DurableAgainst> =
     durability_limit(option_env!("STRATAFS_BENCH_DURABILITY"));
 
 // The metadata store comes from the build's environment too, as STRATAFS_BENCH_STORE: redb, with the content in files
-// beside it, or sqlite, with the content in the same database.
+// beside it, or sqlite or mdbx, with the content in the same database.
 #[cfg(store = "redb")]
 type Metadata = stratafs_redb::RedbStore<ThreadPool>;
 #[cfg(store = "sqlite")]
 type Metadata = stratafs_sqlite::SqliteMetadata<ThreadPool>;
+#[cfg(store = "mdbx")]
+type Metadata = stratafs_mdbx::MdbxMetadata<ThreadPool>;
 #[cfg(store = "redb")]
 type Content = stratafs_object_store::ObjectStoreContentStore;
 #[cfg(store = "sqlite")]
 type Content = stratafs_sqlite::SqliteContent<ThreadPool>;
+#[cfg(store = "mdbx")]
+type Content = stratafs_mdbx::MdbxContent<ThreadPool>;
 #[cfg(store = "redb")]
 type DatabaseError = redb::Error;
 #[cfg(store = "sqlite")]
 type DatabaseError = MetadataFailure;
+#[cfg(store = "mdbx")]
+type DatabaseError = stratafs_mdbx::MdbxOpenError;
+
 type MetadataRejection = <Metadata as KeyValueStore>::Rejection;
 type MetadataFailure = <Metadata as KeyValueStore>::Failure;
+
+// MDBX_SAFE is whether libmdbx keeps a durable point to roll back to after a crash, from the build's environment too,
+// as STRATAFS_BENCH_MDBX_MODE: safe, which makes one after every 256 MiB written, or utterly, which makes none of its
+// own and may wipe the one ensure_durable made.
+#[cfg(store = "mdbx")]
+const MDBX_SAFE: bool = mdbx_safe(option_env!("STRATAFS_BENCH_MDBX_MODE"));
+
+// MDBX_CONFIGURATION opens the libmdbx store in 4 KiB pages, committing without a sync of its own.
+#[cfg(store = "mdbx")]
+const MDBX_CONFIGURATION: stratafs_mdbx::MdbxConfiguration<'static> =
+    stratafs_mdbx::MdbxConfiguration {
+        options: &[
+            // libmdbx sizes how many changed pages a write transaction keeps in memory from the machine's memory,
+            // which it fails to read on macOS 27.
+            (mdbx_sys::MDBX_opt_txn_dp_limit, (1 << 30) / 4096),
+            // The most read transactions libmdbx allows across every process.
+            (mdbx_sys::MDBX_opt_max_readers, 32767),
+        ],
+        geometry: stratafs_mdbx::MdbxGeometry {
+            size_lower: -1,
+            size_now: -1,
+            size_upper: 1 << 40,
+            growth_step: 64 << 20,
+            shrink_threshold: 0,
+            page_size: 4096,
+        },
+        flags: mdbx_sys::MDBX_NOSUBDIR
+            | if MDBX_SAFE {
+                mdbx_sys::MDBX_SAFE_NOSYNC
+            } else {
+                mdbx_sys::MDBX_UTTERLY_NOSYNC
+            },
+        mode: 0o644,
+        // Without a byte count, safe mode syncs a durable point each time the file fills up, where it could grow.
+        shared_options: if MDBX_SAFE {
+            &[(mdbx_sys::MDBX_opt_sync_bytes, 256 << 20)]
+        } else {
+            &[]
+        },
+    };
 
 pub type BenchTree = Tree<Metadata, fn() -> u128, BenchTreeConfig>;
 
@@ -69,6 +116,8 @@ type VolumeFailure = <BenchVolume as KeyValueStore>::Failure;
 pub type BenchStore = stratafs_lock_synchronized::LockSynchronizedStore<BenchVolume, Content>;
 #[cfg(store = "sqlite")]
 pub type BenchStore = stratafs_sqlite::SqliteStore<BenchVolume, ThreadPool>;
+#[cfg(store = "mdbx")]
+pub type BenchStore = stratafs_mdbx::MdbxStore<BenchVolume, ThreadPool>;
 
 pub type BenchEngine = FsEngine<BenchStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig>;
 
@@ -169,6 +218,21 @@ fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError
     Ok((metadata, content))
 }
 
+#[cfg(store = "mdbx")]
+fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError> {
+    let metadata = stratafs_mdbx::MdbxMetadata::open(
+        directory.join("store.mdbx"),
+        &MDBX_CONFIGURATION,
+        ThreadPool,
+    )
+    .map_err(|error| match error {
+        stratafs_mdbx::MdbxOpenError::AlreadyOpen => OpenStoreError::AlreadyOpen,
+        error => OpenStoreError::Database(error),
+    })?;
+    let content = stratafs_mdbx::MdbxContent::of(&metadata);
+    Ok((metadata, content))
+}
+
 // open_volume opens volume from the store in directory.
 pub async fn open_volume(
     directory: &Path,
@@ -226,6 +290,20 @@ const fn durability_limit(setting: Option<&str>) -> Option<DurableAgainst> {
         b"software" => Some(DurableAgainst::SoftwareFailure),
         b"power" => Some(DurableAgainst::PowerFailure),
         _ => panic!("the durability build setting is not none, software or power"),
+    }
+}
+
+// mdbx_safe reads the libmdbx mode build setting, or safe when the build does not set it. A setting that is not safe
+// or utterly stops the build.
+#[cfg(store = "mdbx")]
+const fn mdbx_safe(setting: Option<&str>) -> bool {
+    let Some(setting) = setting else {
+        return true;
+    };
+    match setting.as_bytes() {
+        b"safe" => true,
+        b"utterly" => false,
+        _ => panic!("the libmdbx mode build setting is not safe or utterly"),
     }
 }
 

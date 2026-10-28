@@ -1,0 +1,36 @@
+mdbx-sys 14.4.0 from crates.io, which builds libmdbx v0.14.4, with these changes to libmdbx/mdbx.c,
+libmdbx/mdbx-internals.h and build.rs. Each change is marked in the source with a "stratafs:" comment.
+
+For stratafs-mdbx:
+
+- osal_fsync: on Apple's systems a durable sync (MDBX_SYNC_IODQ) is F_BARRIERFSYNC, where libmdbx issued
+  F_FULLFSYNC. A barrier keeps every write before it ahead of every write after it on the disk, without waiting
+  for the disk to flush its own cache, so a commit's pages still reach the disk before the meta page that names
+  them. It costs about 0.25 ms on an M5 Mac, F_FULLFSYNC about 3.5 ms. stratafs-mdbx adds F_FULLFSYNC itself
+  when ensure_durable is against a power failure.
+
+- gc_alloc_ex: the durable point libmdbx makes on its own, when reusing pages waits on the last durable point,
+  syncs its meta page too. With MDBX_SAFE_NOSYNC it left the meta page unsynced and reused the last durable
+  point's pages at once, so an OS crash could leave a store whose every read fails as corrupt.
+
+- Locks between processes on Apple's systems: the write transaction's lock and the reader table's lock are
+  each a mutex the threads of one process share, then an open file description lock on one byte of the lock
+  file, past every byte libmdbx locks itself. The kernel drops a process's open file description locks when it
+  dies. The lock file keeps the pid of each lock's holder, as libmdbx's SystemV locking does, so the next
+  process to take a lock whose holder died recovers the way libmdbx recovers from a dead semaphore holder.
+  libmdbx used process shared pthread mutexes there, which macOS does not make robust, so a process killed while
+  it held one stalled every other process with the store open until each had closed it. The change is libmdbx's
+  SystemV locking with its semaphores replaced, since the App Sandbox denies SystemV IPC, and its lock file
+  format has a signature of its own, so no other build of libmdbx shares a lock file with it.
+
+- build.rs: libmdbx is rebuilt when mdbx-internals.h changes.
+
+Backported from libmdbx master (v0.15.0-139-g634a8449), each listed in its ChangeLog under v0.15.1:
+
+- basal_start_locked: "Fixed the MDBX_TXN_TRY flag leaking into transaction state flags." The leaked flag fails
+  an assertion in builds with assertions, such as debug builds.
+
+- rthc_drown: "Fixed a failed second in-process open releasing the first handle's file locks, letting another
+  process take exclusive access (#59)."
+
+- iov_page: "Fixed a rare durability bug: a failed disk write could be silently reported as success (#47)."

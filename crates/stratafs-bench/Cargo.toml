@@ -11,12 +11,14 @@ bytes.workspace = true
 clap.workspace = true
 futures-lite.workspace = true
 hex.workspace = true
+mdbx-sys = "=14.4.0"
 rand.workspace = true
 redb = "4.4.0"
 serde.workspace = true
 serde_json.workspace = true
 stratafs-fs-engine.workspace = true
 stratafs-lock-synchronized.workspace = true
+stratafs-mdbx.workspace = true
 stratafs-object-store.workspace = true
 stratafs-redb.workspace = true
 stratafs-sqlite.workspace = true

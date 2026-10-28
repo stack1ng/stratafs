@@ -32,8 +32,10 @@ struct Configuration {
     merge_below_percent: Option<u8>,
     #[arg(long, help = "The largest entry the engine keeps inline, in bytes")]
     largest_inline_entry: Option<u32>,
-    #[arg(long, help = "The store: redb or sqlite")]
+    #[arg(long, help = "The store: redb, sqlite or mdbx")]
     store: Option<String>,
+    #[arg(long, help = "How the mdbx store syncs: safe or utterly")]
+    mdbx_mode: Option<String>,
     #[arg(
         long,
         help = "The most the engine makes commits durable against: none, software or power"
@@ -91,6 +93,7 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
             "STRATAFS_BENCH_DURABILITY",
             configuration.durability.clone(),
         ),
+        ("STRATAFS_BENCH_MDBX_MODE", configuration.mdbx_mode.clone()),
     ] {
         match value {
             Some(value) => build.env(variable, value),

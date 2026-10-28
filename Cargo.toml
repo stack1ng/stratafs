@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
+# vendor holds patched copies of dependencies, which [patch.crates-io] points at.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -49,6 +51,7 @@ stratafs-fskit = { path = "crates/stratafs-fskit" }
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
 stratafs-lock-synchronized = { path = "crates/stratafs-lock-synchronized" }
+stratafs-mdbx = { path = "crates/stratafs-mdbx" }
 stratafs-object-store = { path = "crates/stratafs-object-store" }
 stratafs-range-bounds-map = { path = "crates/stratafs-range-bounds-map" }
 stratafs-redb = { path = "crates/stratafs-redb" }
@@ -67,10 +70,17 @@ weak-table = "0.4"
 xxhash-rust = { version = "0.8", features = ["const_xxh32"] }
 zerocopy = { version = "0.8", features = ["alloc", "derive"] }
 
+[patch.crates-io]
+# mdbx-sys with libmdbx patched for stratafs-mdbx, see vendor/mdbx-sys/PATCHES.
+mdbx-sys = { path = "vendor/mdbx-sys" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.dev.package.mdbx-sys]
 opt-level = 3
 
 [profile.dev.package.redb]

@@ -1,0 +1,29 @@
+[package]
+name = "stratafs-mdbx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+mdbx-sys = "=14.4.0"
+stratafs-keyed-notify.workspace = true
+stratafs-range-bounds-map.workspace = true
+stratafs-store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+stratafs-content-conformance.workspace = true
+stratafs-kv-conformance.workspace = true
+stratafs-tree.workspace = true
+tempfile = "3"
+
+# The workspace forbids unsafe code. libmdbx is a C library, which needs it,
+# so this crate denies it, and only the module that calls libmdbx allows it.
+[lints.rust]
+unsafe_code = "deny"
