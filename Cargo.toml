@@ -31,6 +31,7 @@ futures-lite = "2.6"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hex = "0.4"
 libc = "0.2"
+mimalloc = "0.1.52"
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 objc2 = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }
 objc2-foundation = { git = "https://github.com/madsmtm/objc2", rev = "8a5abacd90d5403fc0463459a35826f892b9142e" }

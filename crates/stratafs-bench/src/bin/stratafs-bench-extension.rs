@@ -1,12 +1,21 @@
 // The FSKit module the benchmark bundle installs. FSKit starts it once per mount.
 
+// The module allocates with mimalloc, which keeps freed memory on each thread to reuse.
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(target_os = "macos")]
 fn main() {
     use futures_executor::ThreadPool;
+    use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
+    // The module logs from info up. The os_log layer formats every event it gets, whatever the system then keeps, and
+    // every missing name or extended attribute is a debug event.
     tracing_subscriber::registry()
+        .with(LevelFilter::INFO)
         .with(tracing_oslog::OsLogger::new(
             "dev.stratafs.bench",
             "extension",

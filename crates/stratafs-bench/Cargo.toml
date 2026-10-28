@@ -29,6 +29,7 @@ toml.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 futures-executor.workspace = true
+mimalloc.workspace = true
 stratafs-fskit = { workspace = true, features = ["extension"] }
 tracing.workspace = true
 tracing-oslog.workspace = true

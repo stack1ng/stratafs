@@ -66,10 +66,12 @@ type MetadataRejection = <Metadata as KeyValueStore>::Rejection;
 type MetadataFailure = <Metadata as KeyValueStore>::Failure;
 
 // MDBX_SAFE is whether libmdbx keeps a durable point to roll back to after a crash, from the build's environment too,
-// as STRATAFS_BENCH_MDBX_MODE: safe, which makes one after every 256 MiB written, or utterly, which makes none of its
-// own and may wipe the one ensure_durable made.
+// as STRATAFS_BENCH_MDBX_MODE: safe, which makes one after every MDBX_SYNC_BYTES written, or utterly, which makes none of
+// its own and may wipe the one ensure_durable made.
 #[cfg(store = "mdbx")]
 const MDBX_SAFE: bool = mdbx_safe(option_env!("STRATAFS_BENCH_MDBX_MODE"));
+#[cfg(store = "mdbx")]
+const MDBX_SYNC_BYTES: usize = number(option_env!("STRATAFS_BENCH_MDBX_SYNC_BYTES"), 256 << 20);
 
 // MDBX_CONFIGURATION opens the libmdbx store in 4 KiB pages, committing without a sync of its own.
 #[cfg(store = "mdbx")]
@@ -99,7 +101,7 @@ const MDBX_CONFIGURATION: stratafs_mdbx::MdbxConfiguration<'static> =
         mode: 0o644,
         // Without a byte count, safe mode syncs a durable point each time the file fills up, where it could grow.
         shared_options: if MDBX_SAFE {
-            &[(mdbx_sys::MDBX_opt_sync_bytes, 256 << 20)]
+            &[(mdbx_sys::MDBX_opt_sync_bytes, MDBX_SYNC_BYTES as u64)]
         } else {
             &[]
         },

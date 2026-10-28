@@ -38,6 +38,11 @@ struct Configuration {
     mdbx_mode: Option<String>,
     #[arg(
         long,
+        help = "How many bytes the mdbx store writes between its durable points in safe mode"
+    )]
+    mdbx_sync_bytes: Option<u64>,
+    #[arg(
+        long,
         help = "The most the engine makes commits durable against: none, software or power"
     )]
     durability: Option<String>,
@@ -94,6 +99,10 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
             configuration.durability.clone(),
         ),
         ("STRATAFS_BENCH_MDBX_MODE", configuration.mdbx_mode.clone()),
+        (
+            "STRATAFS_BENCH_MDBX_SYNC_BYTES",
+            configuration.mdbx_sync_bytes.map(|value| value.to_string()),
+        ),
     ] {
         match value {
             Some(value) => build.env(variable, value),

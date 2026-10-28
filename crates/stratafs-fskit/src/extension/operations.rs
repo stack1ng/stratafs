@@ -15,10 +15,11 @@ use objc2::{AllocAnyThread, Message, msg_send};
 use objc2_foundation::{NSArray, NSData, NSError};
 use objc2_fs_kit::{
     FSCreateItemResult, FSCreateLinkResult, FSCreateSymlinkResult, FSDirectoryCookie,
-    FSDirectoryEntryPacker, FSDirectoryVerifier, FSEnumerateDirectoryResult, FSGetAttributesResult,
-    FSGetXattrResult, FSItemType, FSListXattrsResult, FSLookupItemResult, FSMutableFileDataBuffer,
-    FSReadFileResult, FSReadSymlinkResult, FSRemoveItemResult, FSRenameItemResult,
-    FSSetAttributesResult, FSSetXattrPolicy, FSSetXattrResult, FSWriteFileResult,
+    FSDirectoryEntryPacker, FSDirectoryVerifier, FSEnumerateDirectoryResult, FSFreeSpace,
+    FSGetAttributesResult, FSGetXattrResult, FSItemType, FSListXattrsResult, FSLookupItemResult,
+    FSMutableFileDataBuffer, FSReadFileResult, FSReadSymlinkResult, FSRemoveItemResult,
+    FSRenameItemResult, FSSetAttributesResult, FSSetXattrPolicy, FSSetXattrResult,
+    FSWriteFileResult,
 };
 use stratafs_fs_engine::annotations::error::{GetAnnotationError, ListAnnotationsError};
 use stratafs_fs_engine::annotations::{AnnotationKey, AnnotationScope, SetAnnotationMode};
@@ -315,7 +316,7 @@ where
                         FSSetAttributesResult::initWithAttributes_freeSpace(
                             FSSetAttributesResult::alloc(),
                             &locked.attributes(inode),
-                            None,
+                            Some(&no_free_space_update()),
                         )
                     })
                 }),
@@ -430,7 +431,7 @@ where
                                     &file_name(&name),
                                     &locked.attributes(inode),
                                     &locked.attributes(directory),
-                                    None,
+                                    Some(&no_free_space_update()),
                                 )
                             })
                         },
@@ -477,7 +478,7 @@ where
                                     &file_name(&name),
                                     &locked.attributes(inode),
                                     &locked.attributes(directory),
-                                    None,
+                                    Some(&no_free_space_update()),
                                 )
                             })
                         },
@@ -517,7 +518,7 @@ where
                                 &file_name(&name),
                                 &locked.attributes(inode),
                                 &locked.attributes(directory),
-                                None,
+                                Some(&no_free_space_update()),
                             )
                         })
                     },
@@ -571,7 +572,7 @@ where
                                 FSRemoveItemResult::alloc(),
                                 &locked.attributes(inode),
                                 &locked.attributes(directory),
-                                None,
+                                Some(&no_free_space_update()),
                             )
                         })
                     },
@@ -627,7 +628,7 @@ where
                                 &locked.attributes(from),
                                 &locked.attributes(to),
                                 replaced.as_deref(),
-                                None,
+                                Some(&no_free_space_update()),
                             )
                         })
                     })
@@ -838,7 +839,7 @@ where
                             FSWriteFileResult::alloc(),
                             contents.len(),
                             &locked.attributes(inode),
-                            None,
+                            Some(&no_free_space_update()),
                         )
                     })
                 }),
@@ -931,9 +932,12 @@ where
                 )),
             };
             match changed {
-                // SAFETY: no free space is reported.
+                // SAFETY: the free space is FSKit's sentinel for no change.
                 Ok(()) => succeed(&reply, unsafe {
-                    FSSetXattrResult::initWithFreeSpace(FSSetXattrResult::alloc(), None)
+                    FSSetXattrResult::initWithFreeSpace(
+                        FSSetXattrResult::alloc(),
+                        Some(&no_free_space_update()),
+                    )
                 }),
                 Err(error) => fail(&reply, error),
             }
@@ -1039,11 +1043,11 @@ fn succeed<R: Message>(reply: &Reply<R>, result: Option<Retained<R>>) {
 // fail replies with error, and logs it. A name or extended attribute that does not exist is ordinary, so it is
 // only logged for debugging.
 fn fail<R: Message>(reply: &Reply<R>, error: Retained<NSError>) {
-    let (code, description) = (error.code(), error.localizedDescription());
+    let code = error.code();
     if code == libc::ENOENT as isize || code == libc::ENOATTR as isize {
-        tracing::debug!(code, %description, "operation failed");
+        tracing::debug!(code, description = %error.localizedDescription(), "operation failed");
     } else {
-        tracing::warn!(code, %description, "operation failed");
+        tracing::warn!(code, description = %error.localizedDescription(), "operation failed");
     }
     reply.call(null_mut(), Retained::as_ptr(&error).cast_mut());
 }
@@ -1058,6 +1062,13 @@ fn listed(reply: &Reply<FSEnumerateDirectoryResult>) {
     let result: Option<Retained<FSEnumerateDirectoryResult>> =
         unsafe { msg_send![FSEnumerateDirectoryResult::alloc(), initWithVerifier: VERIFIER] };
     succeed(reply, result);
+}
+
+// no_free_space_update is what a result says of the volume's free space, which no operation changes: the volume reports
+// a fixed one.
+fn no_free_space_update() -> Retained<FSFreeSpace> {
+    // SAFETY: noUpdate takes nothing and returns FSKit's sentinel.
+    unsafe { FSFreeSpace::noUpdate() }
 }
 
 // failed is the error FSKit reports for a failed transaction: the work's own POSIX error when it aborted,
