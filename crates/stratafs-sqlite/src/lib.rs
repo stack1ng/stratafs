@@ -19,7 +19,9 @@ use rusqlite::wal::CheckpointMode;
 use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, ffi, params};
 
 use stratafs_keyed_notify::KeyedNotify;
-use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
+use stratafs_store::content::{
+    ContentHash, ContentHasher, ContentStore, GetRejection, UnknownContent,
+};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
@@ -629,14 +631,14 @@ fn in_write_transaction<S>(database: &Database<S>) -> bool {
 
 // chunked is content as the chunks the store keeps it in, with its hash. Empty content is one empty chunk.
 fn chunked(mut content: impl Buf) -> (ContentHash, Vec<Bytes>) {
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = ContentHasher::default();
     let mut chunks = Vec::with_capacity(content.remaining().div_ceil(CHUNK_SIZE).max(1));
     loop {
         let chunk = content.copy_to_bytes(content.remaining().min(CHUNK_SIZE));
         hasher.update(&chunk);
         chunks.push(chunk);
         if !content.has_remaining() {
-            return (ContentHash(*hasher.finalize().as_bytes()), chunks);
+            return (hasher.finish(), chunks);
         }
     }
 }

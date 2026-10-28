@@ -6,10 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-blake3.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
 thiserror.workspace = true
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 blocking.workspace = true

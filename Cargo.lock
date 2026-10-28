@@ -1825,7 +1825,6 @@ dependencies = [
 name = "stratafs-object-store"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "blocking",
  "bytes",
  "cfg_aliases",
@@ -1879,7 +1878,6 @@ dependencies = [
 name = "stratafs-sqlite"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "bytes",
  "futures-core",
  "futures-lite",
@@ -1897,12 +1895,12 @@ dependencies = [
 name = "stratafs-store"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "blocking",
  "bytes",
  "cfg_aliases",
  "futures-core",
  "thiserror",
+ "xxhash-rust",
 ]
 
 [[package]]

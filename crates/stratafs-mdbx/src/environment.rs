@@ -684,10 +684,10 @@ impl Drop for Walk<'_> {
 }
 
 // chunk_key is the key a chunk of content is kept under: the content's hash, then the chunk's index.
-fn chunk_key(hash: &ContentHash, index: u32) -> [u8; 36] {
-    let mut key = [0; 36];
-    key[..32].copy_from_slice(&hash.0);
-    key[32..].copy_from_slice(&index.to_be_bytes());
+fn chunk_key(hash: &ContentHash, index: u32) -> [u8; 20] {
+    let mut key = [0; 20];
+    key[..16].copy_from_slice(&hash.0);
+    key[16..].copy_from_slice(&index.to_be_bytes());
     key
 }
 

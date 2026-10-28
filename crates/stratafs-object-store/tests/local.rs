@@ -8,9 +8,9 @@ use stratafs_store::durability::DurableAgainst;
 
 fn blob_file(root: &std::path::Path, hash: &ContentHash) -> std::path::PathBuf {
     root.join(format!(
-        "blobs/{:02x}/{}",
+        "blobs/{:02x}/{:032x}",
         hash.0[0],
-        blake3::Hash::from_bytes(hash.0)
+        u128::from_be_bytes(hash.0)
     ))
 }
 

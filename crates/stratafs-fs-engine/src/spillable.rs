@@ -67,7 +67,7 @@ enum SpillableKind {
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct OverflowReference {
-    hash: [u8; 32],
+    hash: [u8; 16],
     length: U64,
 }
 

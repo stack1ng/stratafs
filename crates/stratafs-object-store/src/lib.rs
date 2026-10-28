@@ -8,7 +8,9 @@ use bytes::{Buf, Bytes};
 use futures_util::TryStreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
+use stratafs_store::content::{
+    ContentHash, ContentHasher, ContentStore, GetRejection, UnknownContent,
+};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use thiserror::Error;
@@ -23,7 +25,7 @@ pub enum ObjectStoreError {
     Flush(#[source] io::Error),
 }
 
-// ObjectStoreContentStore keeps each blob in an object_store store, under its BLAKE3 hash.
+// ObjectStoreContentStore keeps each blob in an object_store store, under its content hash.
 #[derive(Debug, Clone)]
 pub struct ObjectStoreContentStore {
     store: Arc<dyn ObjectStore>,
@@ -44,14 +46,14 @@ impl ObjectStoreContentStore {
 
     async fn store(&self, mut content: impl Buf + Send) -> Result<ContentHash, ObjectStoreError> {
         let len = content.remaining() as u64;
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = ContentHasher::default();
         let mut chunks = Vec::new();
         while content.has_remaining() {
             let chunk = content.copy_to_bytes(content.chunk().len());
             hasher.update(&chunk);
             chunks.push(chunk);
         }
-        let hash = ContentHash(*hasher.finalize().as_bytes());
+        let hash = hasher.finish();
         let path = object_path(&hash);
         if !self.stored_object_matches(&path, &hash, len).await? {
             self.store.put(&path, PutPayload::from_iter(chunks)).await?;
@@ -86,11 +88,11 @@ impl ObjectStoreContentStore {
 
     async fn stored_hash(&self, path: &Path) -> Result<ContentHash, object_store::Error> {
         let mut chunks = self.store.get(path).await?.into_stream();
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = ContentHasher::default();
         while let Some(chunk) = chunks.try_next().await? {
             hasher.update(&chunk);
         }
-        Ok(ContentHash(*hasher.finalize().as_bytes()))
+        Ok(hasher.finish())
     }
 
     async fn load(
@@ -162,9 +164,9 @@ impl ContentStore for ObjectStoreContentStore {
 
 fn object_path(hash: &ContentHash) -> Path {
     Path::from(format!(
-        "blobs/{:02x}/{}",
+        "blobs/{:02x}/{:032x}",
         hash.0[0],
-        blake3::Hash::from_bytes(hash.0)
+        u128::from_be_bytes(hash.0)
     ))
 }
 

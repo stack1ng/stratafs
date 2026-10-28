@@ -92,11 +92,11 @@ fn inline_values_are_stored_as_the_inline_kind_then_the_content() {
 fn overflow_values_are_stored_as_the_overflow_kind_then_the_hash_then_the_length_in_little_endian()
 {
     let value = SpillableValue::Overflow {
-        hash: ContentHash([7; 32]),
+        hash: ContentHash([7; 16]),
         length: 0x0102,
     };
     let mut expected = vec![1];
-    expected.extend_from_slice(&[7; 32]);
+    expected.extend_from_slice(&[7; 16]);
     expected.extend_from_slice(&0x0102u64.to_le_bytes());
     assert_eq!(stored(&value)[..], expected[..]);
 }
@@ -143,7 +143,7 @@ fn decoding_rejects_corrupt_values() {
         Err(CorruptValue::WrongLength)
     ));
     let mut one_byte_too_long = stored(&SpillableValue::Overflow {
-        hash: ContentHash([0; 32]),
+        hash: ContentHash([0; 16]),
         length: 0,
     })
     .to_vec();
