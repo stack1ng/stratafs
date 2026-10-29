@@ -6,17 +6,16 @@
 
 use bitflags::bitflags;
 use bytes::Bytes;
-use stratafs_serialized::serialized_value;
+use stratafs_serialized::{LittleEndian, ViewError, serialized_shape, serialized_value};
 use stratafs_store::content::ContentStore;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
-use zerocopy::little_endian::{I64, U16, U32, U64};
 use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 
 use crate::attributes::error::SetattrError;
-use crate::error::{CorruptValue, IoFailure, refused_or_failed};
+use crate::error::{IoFailure, refused_or_failed};
 use crate::key::FsKey;
-use crate::{FsConfig, FsTransaction, Inode, Timestamp};
+use crate::{FsConfig, FsTransaction, Inode, MountId, Timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable)]
 #[repr(u8)]
@@ -76,112 +75,106 @@ bitflags! {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SettableAttributes {
-    pub mode: Mode,
-    pub ownership: Ownership,
-    pub restrictions: Restrictions,
-    pub hints: Hints,
+// A file type is stored as its variant index, and an index no variant has is not a file type.
+impl LittleEndian for FileType {
+    type LittleEndian = u8;
 
-    pub size: u64,
+    fn to_little_endian(&self) -> u8 {
+        *self as u8
+    }
 
-    pub last_accessed_at: Timestamp,
-    pub content_changed_at: Timestamp,
-    pub created_at: Timestamp,
+    fn from_little_endian(little_endian: &u8) -> Result<Self, ViewError> {
+        FileType::try_read_from_bytes(&[*little_endian]).map_err(|_| ViewError::Invalid)
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Attributes {
-    pub settable: SettableAttributes,
+// Flags are stored as their bits, and bits no flag names are not flags.
+macro_rules! little_endian_flags {
+    ($($flags:ident: $bits:ty),* $(,)?) => {
+        $(
+            impl LittleEndian for $flags {
+                type LittleEndian = <$bits as LittleEndian>::LittleEndian;
 
-    pub kind: FileType,
-    pub hard_link_count: u32,
-    pub attribute_changed_at: Timestamp,
+                fn to_little_endian(&self) -> Self::LittleEndian {
+                    self.bits().to_little_endian()
+                }
 
-    pub parent: Inode,
-    pub change_version: u64,
+                fn from_little_endian(little_endian: &Self::LittleEndian) -> Result<Self, ViewError> {
+                    $flags::from_bits(<$bits>::from_little_endian(little_endian)?).ok_or(ViewError::Invalid)
+                }
+            }
+        )*
+    };
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ownership {
-    pub user_id: u32,
-    pub group_id: u32,
+little_endian_flags! {
+    Mode: u16,
+    Restrictions: u8,
+    Hints: u8,
 }
 
-impl Attributes {
-    pub(crate) fn record_change(&mut self, now: Timestamp) {
-        self.attribute_changed_at = now;
-        self.change_version += 1;
+serialized_shape! {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SettableAttributes as LittleEndianSettableAttributes {
+        pub mode: Mode,
+        pub ownership: Ownership,
+        pub restrictions: Restrictions,
+        pub hints: Hints,
+
+        pub size: u64,
+
+        pub last_accessed_at: Timestamp,
+        pub content_changed_at: Timestamp,
+        pub created_at: Timestamp,
     }
 }
 
 serialized_value! {
-    pub(crate) struct StoredAttributes {
-        kind: u8,
-        mode: U16,
-        restrictions: u8,
-        hints: u8,
-        hard_link_count: U32,
-        user_id: U32,
-        group_id: U32,
-        size: U64,
-        last_accessed_at: I64,
-        content_changed_at: I64,
-        attribute_changed_at: I64,
-        created_at: I64,
-        parent: U64,
-        change_version: U64,
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Attributes as LittleEndianAttributes {
+        pub settable: SettableAttributes,
+
+        pub kind: FileType,
+        pub hard_link_count: u32,
+        pub attribute_changed_at: Timestamp,
+
+        pub parent: Inode,
+        pub change_version: ChangeVersion,
     }
 }
 
-impl From<&Attributes> for StoredAttributes {
-    fn from(attributes: &Attributes) -> Self {
-        let settable = &attributes.settable;
-        StoredAttributes {
-            kind: attributes.kind as u8,
-            mode: U16::new(settable.mode.bits()),
-            restrictions: settable.restrictions.bits(),
-            hints: settable.hints.bits(),
-            hard_link_count: U32::new(attributes.hard_link_count),
-            user_id: U32::new(settable.ownership.user_id),
-            group_id: U32::new(settable.ownership.group_id),
-            size: U64::new(settable.size),
-            last_accessed_at: I64::new(settable.last_accessed_at.0),
-            content_changed_at: I64::new(settable.content_changed_at.0),
-            attribute_changed_at: I64::new(attributes.attribute_changed_at.0),
-            created_at: I64::new(settable.created_at.0),
-            parent: U64::new(attributes.parent.0),
-            change_version: U64::new(attributes.change_version),
+serialized_shape! {
+    // ChangeVersion counts an inode's changes, and names the mount that made the latest. Every change moves the
+    // number by one, whichever mount makes it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ChangeVersion as LittleEndianChangeVersion {
+        pub mount: MountId,
+        pub number: u64,
+    }
+}
+
+impl ChangeVersion {
+    // after is the version a change by mount moves this one to.
+    pub(crate) fn after(self, mount: MountId) -> ChangeVersion {
+        ChangeVersion {
+            mount,
+            number: self.number + 1,
         }
     }
 }
 
-impl TryFrom<&StoredAttributes> for Attributes {
-    type Error = CorruptValue;
+serialized_shape! {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Ownership as LittleEndianOwnership {
+        pub user_id: u32,
+        pub group_id: u32,
+    }
+}
 
-    fn try_from(stored: &StoredAttributes) -> Result<Self, CorruptValue> {
-        Ok(Attributes {
-            settable: SettableAttributes {
-                mode: Mode::from_bits(stored.mode.get()).ok_or(CorruptValue::UnknownModeBits)?,
-                ownership: Ownership {
-                    user_id: stored.user_id.get(),
-                    group_id: stored.group_id.get(),
-                },
-                restrictions: Restrictions::from_bits(stored.restrictions)
-                    .ok_or(CorruptValue::UnknownRestrictionBits)?,
-                hints: Hints::from_bits(stored.hints).ok_or(CorruptValue::UnknownHintBits)?,
-                size: stored.size.get(),
-                last_accessed_at: Timestamp(stored.last_accessed_at.get()),
-                content_changed_at: Timestamp(stored.content_changed_at.get()),
-                created_at: Timestamp(stored.created_at.get()),
-            },
-            kind: FileType::try_read_from_bytes(&[stored.kind])
-                .map_err(|_| CorruptValue::UnknownFileType)?,
-            hard_link_count: stored.hard_link_count.get(),
-            attribute_changed_at: Timestamp(stored.attribute_changed_at.get()),
-            parent: Inode(stored.parent.get()),
-            change_version: stored.change_version.get(),
-        })
+impl Attributes {
+    pub(crate) fn record_change(&mut self, now: Timestamp, mount: MountId) {
+        self.attribute_changed_at = now;
+        self.change_version = self.change_version.after(mount);
     }
 }
 
@@ -193,21 +186,26 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
         inode: Inode,
     ) -> impl Future<Output = Result<Option<Attributes>, IoFailure<T::Failure, C::Failure>>> + Send
     {
-        async move {
-            let Some(stored) = self
-                .metadata
-                .get(FsKey::new_attributes(inode).into())
-                .await
-                .map_err(IoFailure::Metadata)?
-            else {
-                return Ok(None);
-            };
-            let stored = StoredAttributes::view(&stored)
-                .map_err(|corrupt| IoFailure::Corrupt(corrupt.into()))?;
-            Attributes::try_from(stored)
-                .map(Some)
-                .map_err(IoFailure::Corrupt)
-        }
+        read_attributes(&*self.metadata, inode)
+    }
+}
+
+// read_attributes is inode's stored attributes as metadata reads them, or None when the inode does not exist.
+pub(crate) fn read_attributes<T: ReadKeyValueTransaction, C>(
+    metadata: &T,
+    inode: Inode,
+) -> impl Future<Output = Result<Option<Attributes>, IoFailure<T::Failure, C>>> + Send {
+    async move {
+        let Some(stored) = metadata
+            .get(FsKey::new_attributes(inode).into())
+            .await
+            .map_err(IoFailure::Metadata)?
+        else {
+            return Ok(None);
+        };
+        Attributes::view(&stored)
+            .map(Some)
+            .map_err(|corrupt| IoFailure::Corrupt(corrupt.into()))
     }
 }
 
@@ -219,10 +217,8 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
         inode: Inode,
         attributes: &Attributes,
     ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
-        self.written.push(inode);
-        let stored = Bytes::from(&StoredAttributes::from(attributes));
         self.metadata
-            .set(FsKey::new_attributes(inode).into(), stored)
+            .set(FsKey::new_attributes(inode).into(), Bytes::from(attributes))
             .map_err(refused_or_failed)
     }
 
@@ -263,7 +259,10 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 hard_link_count: 2,
                 attribute_changed_at: now,
                 parent: Inode::ROOT,
-                change_version: 0,
+                change_version: ChangeVersion {
+                    mount: self.mount,
+                    number: 0,
+                },
             };
             self.write_attributes(Inode::ROOT, &root)
         }
@@ -302,7 +301,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             {
                 attributes.settable.content_changed_at = now;
             }
-            attributes.record_change(now);
+            attributes.record_change(now, self.mount);
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)
         }

@@ -6,6 +6,8 @@ pub enum CorruptValue {
     WrongFingerprint,
     #[error("the stored value has the wrong length for its type")]
     WrongLength,
+    #[error("the stored value holds a value its type does not allow")]
+    Invalid,
     #[error("the stored entry positions do not describe the entry data")]
     InvalidEntryPositions,
     #[error("the stored node kind is not a known kind")]
@@ -33,6 +35,7 @@ impl From<ViewError> for CorruptValue {
         match error {
             ViewError::WrongFingerprint => CorruptValue::WrongFingerprint,
             ViewError::WrongLength => CorruptValue::WrongLength,
+            ViewError::Invalid => CorruptValue::Invalid,
         }
     }
 }

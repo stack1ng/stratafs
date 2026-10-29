@@ -4,6 +4,7 @@ use std::sync::{Arc, PoisonError};
 use futures_core::future::BoxFuture;
 use futures_util::task::Spawn;
 use storekey::{BorrowDecode, Encode};
+use stratafs_serialized::little_endian_newtypes;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
@@ -38,6 +39,8 @@ type MetadataFailure<St> = <<St as Store>::Metadata as KeyValueStore>::Failure;
 pub struct FsEngine<St: Store, A, N, S, C> {
     allocate_inode: A,
     now: N,
+    // mount is the mount the engine is, which stamps every change it makes.
+    mount: MountId,
     // store keeps the metadata and the content, and makes them durable together. Auto invalidators hold it too.
     store: Arc<St>,
     // durability_limit is the most ensure_durable makes commits durable against, or None when it makes nothing
@@ -60,7 +63,7 @@ impl<St: Store, A, N, S, C> Drop for FsEngine<St, A, N, S, C> {
                 .unwrap_or_else(PoisonError::into_inner),
         );
         for auto_invalidator in running.into_values() {
-            auto_invalidator.abort();
+            auto_invalidator.stop.abort();
         }
     }
 }
@@ -99,6 +102,11 @@ impl Consistency for Eventual {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, BorrowDecode)]
 pub struct Inode(pub u64);
 
+// MountId names one engine, a mount of a volume, for as long as it runs. It is made afresh each time a volume is
+// opened, so it says nothing about any earlier mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MountId(pub u64);
+
 impl Inode {
     pub const ROOT: Inode = Inode(0);
 }
@@ -106,10 +114,15 @@ impl Inode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(pub i64);
 
+little_endian_newtypes! {
+    Inode(u64),
+    MountId(u64),
+    Timestamp(i64),
+}
+
 pub struct FsTransaction<'txn, 'engine, T, C, A, N, S> {
     metadata: TransactionHandle<'txn, 'engine, T>,
-    // written is the inodes the transaction wrote, whose auto invalidators stop before it commits.
-    written: Vec<Inode>,
+    mount: MountId,
     content: &'engine C,
     allocate_inode: &'engine A,
     now: &'engine N,
@@ -136,11 +149,12 @@ where
     // new returns `impl Future + Send` instead of being `async fn`, so Send is proven here once, for every store.
     // As `async fn`, rustc checks Send at each call site and wrongly rejects stores whose types contain 'static lifetimes,
     // such as redb's (https://github.com/rust-lang/rust/issues/110338). The long return type comes from that form.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn new(
         store: St,
         allocate_inode: A,
         now: N,
+        mount: MountId,
         durability_limit: Option<DurableAgainst>,
         consistency: C,
         kernel: impl KernelCache,
@@ -169,6 +183,7 @@ where
             let engine = Self {
                 allocate_inode,
                 now,
+                mount,
                 store: Arc::new(store),
                 durability_limit,
                 consistency: Arc::new(consistency),
@@ -258,10 +273,6 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Send + Sync> FsEngine<St, A, N
             let working = work(self.transaction(metadata));
             Box::pin(async move {
                 let (result, transaction) = working.await?;
-                // The engine's own write leaves what the kernel caches of the inodes it wrote alone, since the
-                // kernel asked for it. The integration tells the engine the kernel caches them again as it hands
-                // the kernel the result.
-                self.auto_invalidators.stop(transaction.written);
                 Ok((result, transaction.metadata))
             })
         })
@@ -295,7 +306,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Send + Sync> FsEngine<St, A, N
     ) -> FsTransaction<'txn, 'engine, T, St::Content, A, N, S> {
         FsTransaction {
             metadata,
-            written: Vec::new(),
+            mount: self.mount,
             content: self.store.content(),
             allocate_inode: &self.allocate_inode,
             now: &self.now,

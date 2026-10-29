@@ -11,7 +11,7 @@ use futures_executor::ThreadPool as SpawnerPool;
 use futures_util::task::Spawn;
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::observation::{KernelCache, NoKernel};
-use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Timestamp};
+use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
@@ -286,6 +286,7 @@ async fn engine(
         BenchStore::new(metadata, store.content),
         allocate_inode,
         now as fn() -> Timestamp,
+        MountId(rand::random()),
         DURABILITY_LIMIT,
         Eventual,
         kernel,

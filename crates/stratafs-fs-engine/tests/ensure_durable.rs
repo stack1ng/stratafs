@@ -7,7 +7,7 @@ use object_store::memory::InMemory;
 use redb::Database;
 use redb::backends::InMemoryBackend;
 use stratafs_fs_engine::observation::NoKernel;
-use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Timestamp};
+use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_lock_synchronized::{LockSynchronizedMetadata, LockSynchronizedStore};
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
@@ -78,6 +78,7 @@ fn durable_against(durability_limit: Option<DurableAgainst>) -> Vec<DurableAgain
         store,
         allocate_inode,
         now,
+        MountId(1),
         durability_limit,
         Eventual,
         NoKernel,

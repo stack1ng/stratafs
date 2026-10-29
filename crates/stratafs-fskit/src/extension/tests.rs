@@ -21,10 +21,10 @@ use objc2_fs_kit::{
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
 use stratafs_fs_engine::attributes::{
-    Attributes, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
+    Attributes, ChangeVersion, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
 };
 use stratafs_fs_engine::observation::KernelCache;
-use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, Timestamp};
+use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, Timestamp};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
@@ -76,6 +76,7 @@ async fn new_engine(
         ),
         allocate_inode,
         now,
+        MountId(1),
         Some(DurableAgainst::PowerFailure),
         Eventual,
         kernel,
@@ -430,7 +431,10 @@ fn item_attributes_give_fskit_the_root_as_a_directory_under_its_own_parent() {
         hard_link_count: 2,
         attribute_changed_at: Timestamp(0),
         parent: Inode::ROOT,
-        change_version: 0,
+        change_version: ChangeVersion {
+            mount: MountId(1),
+            number: 0,
+        },
     };
     let attributes = item_attributes(Inode::ROOT, &root);
     // SAFETY: the getters read plain values.

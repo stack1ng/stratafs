@@ -4,10 +4,11 @@ use futures_lite::future::block_on;
 use stratafs_object_store::ObjectStoreError;
 use stratafs_serialized::FINGERPRINT_LENGTH;
 use zerocopy::IntoBytes;
+use zerocopy::little_endian::U16;
 
 use super::*;
 use crate::test_support::{
-    InMemoryEngine, MetadataFailure, aborted, new_test_engine, restrict, set_clock,
+    InMemoryEngine, MetadataFailure, TEST_MOUNT, aborted, new_test_engine, restrict, set_clock,
 };
 
 fn getattr(engine: &InMemoryEngine, inode: Inode) -> Option<Attributes> {
@@ -56,7 +57,10 @@ fn root_created_at(at: i64) -> Attributes {
         hard_link_count: 2,
         attribute_changed_at: Timestamp(at),
         parent: Inode::ROOT,
-        change_version: 0,
+        change_version: ChangeVersion {
+            mount: TEST_MOUNT,
+            number: 0,
+        },
     }
 }
 
@@ -116,7 +120,7 @@ fn setattr_applies_the_update_and_records_the_change() {
     };
     expected.settable.last_accessed_at = Timestamp(3);
     expected.attribute_changed_at = Timestamp(9);
-    expected.change_version = 1;
+    expected.change_version.number = 1;
     assert_eq!(changed, expected);
     assert_eq!(getattr(&engine, Inode::ROOT).unwrap(), expected);
 }
@@ -200,29 +204,31 @@ fn stored_attributes_are_the_fingerprint_then_each_field_in_little_endian() {
     attributes.attribute_changed_at = Timestamp(9);
     attributes.settable.created_at = Timestamp(10);
     attributes.parent = Inode(11);
-    attributes.change_version = 12;
+    attributes.change_version = ChangeVersion {
+        mount: MountId(12),
+        number: 13,
+    };
     attributes.settable.restrictions =
         Restrictions::OWNER_IMMUTABLE | Restrictions::ADMINISTRATOR_APPEND_ONLY;
     attributes.settable.hints = Hints::HIDDEN;
-    let mut expected = vec![2];
+    let mut expected = Vec::new();
     expected.extend_from_slice(&0o755u16.to_le_bytes());
-    expected.extend_from_slice(&[0b1001, 1]);
-    expected.extend_from_slice(&1u32.to_le_bytes());
     expected.extend_from_slice(&501u32.to_le_bytes());
     expected.extend_from_slice(&20u32.to_le_bytes());
+    expected.extend_from_slice(&[0b1001, 1]);
     expected.extend_from_slice(&6u64.to_le_bytes());
     expected.extend_from_slice(&(-3i64).to_le_bytes());
     expected.extend_from_slice(&8i64.to_le_bytes());
-    expected.extend_from_slice(&9i64.to_le_bytes());
     expected.extend_from_slice(&10i64.to_le_bytes());
+    expected.push(2);
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&9i64.to_le_bytes());
     expected.extend_from_slice(&11u64.to_le_bytes());
     expected.extend_from_slice(&12u64.to_le_bytes());
-    let stored = Bytes::from(&StoredAttributes::from(&attributes));
+    expected.extend_from_slice(&13u64.to_le_bytes());
+    let stored = Bytes::from(&attributes);
     assert_eq!(stored[FINGERPRINT_LENGTH..], expected[..]);
-    assert_eq!(
-        Attributes::try_from(StoredAttributes::view(&stored).unwrap()).unwrap(),
-        attributes
-    );
+    assert_eq!(Attributes::view(&stored).unwrap(), attributes);
 }
 
 #[test]
@@ -234,43 +240,40 @@ fn file_types_are_stored_as_their_variant_index() {
     ] {
         let mut attributes = root_created_at(0);
         attributes.kind = kind;
-        assert_eq!(StoredAttributes::from(&attributes).kind, stored);
+        assert_eq!(attributes.to_little_endian().kind, stored);
     }
 }
 
 #[test]
-fn decoding_rejects_unknown_file_types_and_mode_bits() {
-    let mut stored = StoredAttributes::from(&root_created_at(0));
-    stored.kind = 3;
+fn decoding_rejects_unknown_file_types_and_flag_bits() {
+    let mut little_endian = root_created_at(0).to_little_endian();
+    little_endian.kind = 3;
     assert!(matches!(
-        Attributes::try_from(&stored),
-        Err(CorruptValue::UnknownFileType)
+        Attributes::from_little_endian(&little_endian),
+        Err(ViewError::Invalid)
     ));
-    let mut stored = StoredAttributes::from(&root_created_at(0));
-    stored.mode = U16::new(0o10000);
+    let mut little_endian = root_created_at(0).to_little_endian();
+    little_endian.settable.mode = U16::new(0o10000);
     assert!(matches!(
-        Attributes::try_from(&stored),
-        Err(CorruptValue::UnknownModeBits)
+        Attributes::from_little_endian(&little_endian),
+        Err(ViewError::Invalid)
     ));
-    let mut stored = StoredAttributes::from(&root_created_at(0));
-    stored.restrictions = 1 << 4;
+    let mut little_endian = root_created_at(0).to_little_endian();
+    little_endian.settable.restrictions = 1 << 4;
     assert!(matches!(
-        Attributes::try_from(&stored),
-        Err(CorruptValue::UnknownRestrictionBits)
+        Attributes::from_little_endian(&little_endian),
+        Err(ViewError::Invalid)
     ));
-    let mut stored = StoredAttributes::from(&root_created_at(0));
-    stored.hints = 1 << 1;
+    let mut little_endian = root_created_at(0).to_little_endian();
+    little_endian.settable.hints = 1 << 1;
     assert!(matches!(
-        Attributes::try_from(&stored),
-        Err(CorruptValue::UnknownHintBits)
+        Attributes::from_little_endian(&little_endian),
+        Err(ViewError::Invalid)
     ));
-    let stored = Bytes::from(&StoredAttributes::from(&root_created_at(0)));
+    let stored = Bytes::from(&root_created_at(0));
     assert!(matches!(
-        StoredAttributes::view(&stored[..stored.len() - 1]),
-        Err(stratafs_serialized::ViewError::WrongLength)
+        Attributes::view(&stored[..stored.len() - 1]),
+        Err(ViewError::WrongLength)
     ));
-    assert_eq!(
-        StoredAttributes::from(&root_created_at(0)).as_bytes().len(),
-        73
-    );
+    assert_eq!(root_created_at(0).to_little_endian().as_bytes().len(), 81);
 }

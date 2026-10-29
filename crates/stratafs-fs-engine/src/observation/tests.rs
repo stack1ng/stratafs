@@ -6,6 +6,7 @@ use std::time::Duration;
 use futures_lite::future::{block_on, poll_once};
 
 use super::*;
+use crate::MountId;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::directories::NewItem;
 use crate::test_support::{InMemoryEngine, ThreadSpawner, new_test_engine, new_test_engine_for};
@@ -32,6 +33,7 @@ fn another_client(engine: &InMemoryEngine) -> InMemoryEngine {
     FsEngine {
         allocate_inode: engine.allocate_inode,
         now: engine.now,
+        mount: MountId(2),
         store: Arc::clone(&engine.store),
         durability_limit: None,
         consistency: Arc::new(Eventual),
@@ -172,4 +174,31 @@ fn a_dropped_engine_leaves_what_it_cached_alone() {
     drop(engine);
     write(&other, inode, b"elsewhere");
     assert!(invalidated.recv_timeout(NOTHING_YET).is_err());
+}
+
+#[test]
+fn an_auto_invalidating_engine_keeps_watching_after_its_own_write_and_invalidates_on_another_clients()
+ {
+    let (engine, invalidated) = auto_invalidating_engine();
+    let (inode, seen) = new_file(&engine, b"cached");
+    engine.cached(inode, &seen);
+    write(&engine, inode, b"here");
+    assert!(invalidated.recv_timeout(NOTHING_YET).is_err());
+    write(&another_client(&engine), inode, b"elsewhere");
+    assert_eq!(invalidated.recv_timeout(Duration::from_secs(10)), Ok(inode));
+}
+
+#[test]
+fn an_older_read_cached_after_a_newer_one_is_invalidated_for_a_change_between_them() {
+    let (engine, invalidated) = auto_invalidating_engine();
+    let (inode, older) = new_file(&engine, b"cached");
+    write(&another_client(&engine), inode, b"elsewhere");
+    let newer =
+        block_on(engine.read_transact(|txn| Box::pin(async move { txn.getattr(inode).await })))
+            .unwrap()
+            .unwrap();
+    engine.cached(inode, &newer);
+    assert!(invalidated.recv_timeout(NOTHING_YET).is_err());
+    engine.cached(inode, &older);
+    assert_eq!(invalidated.recv_timeout(Duration::from_secs(10)), Ok(inode));
 }

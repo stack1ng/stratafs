@@ -49,16 +49,12 @@ pub enum CorruptValue {
     WrongFingerprint,
     #[error("the stored value has the wrong length for its type")]
     WrongLength,
+    #[error("the stored value holds a value its type does not allow")]
+    Invalid,
     #[error("the stored spillable kind is not a known kind")]
     UnknownSpillableKind,
     #[error("the stored file type is not a known file type")]
     UnknownFileType,
-    #[error("the stored mode has bits that are not mode bits")]
-    UnknownModeBits,
-    #[error("the stored restrictions have bits that are not restrictions")]
-    UnknownRestrictionBits,
-    #[error("the stored hints have bits that are not hints")]
-    UnknownHintBits,
     #[error("a stored key could not be decoded")]
     UndecodableKey(#[source] storekey::DecodeError),
     #[error("a stored key is not the kind of key its position in the store implies")]
@@ -80,6 +76,7 @@ impl From<ViewError> for CorruptValue {
         match error {
             ViewError::WrongFingerprint => CorruptValue::WrongFingerprint,
             ViewError::WrongLength => CorruptValue::WrongLength,
+            ViewError::Invalid => CorruptValue::Invalid,
         }
     }
 }

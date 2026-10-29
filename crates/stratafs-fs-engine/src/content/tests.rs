@@ -7,10 +7,11 @@ use stratafs_object_store::ObjectStoreError;
 use super::*;
 use crate::Timestamp;
 use crate::attributes::error::SetattrError;
-use crate::attributes::{Hints, Mode, Ownership, Restrictions, SettableAttributes};
+use crate::attributes::{ChangeVersion, Hints, Mode, Ownership, Restrictions, SettableAttributes};
 use crate::directories::NewItem;
 use crate::test_support::{
-    InMemoryEngine, MetadataFailure, OneKibInline, aborted, new_test_engine, restrict, set_clock,
+    InMemoryEngine, MetadataFailure, OneKibInline, TEST_MOUNT, aborted, new_test_engine, restrict,
+    set_clock,
 };
 
 fn stored(extent: &ExtentValue) -> Bytes {
@@ -99,7 +100,10 @@ fn file_of_size(engine: &InMemoryEngine, inode: Inode, size: u64) {
         hard_link_count: 1,
         attribute_changed_at: Timestamp(0),
         parent: Inode::ROOT,
-        change_version: 0,
+        change_version: ChangeVersion {
+            mount: TEST_MOUNT,
+            number: 0,
+        },
     };
     block_on(engine.transact(|mut txn| {
         let attributes = attributes.clone();
@@ -483,7 +487,7 @@ fn a_write_stores_one_extent_and_records_the_change() {
     assert_eq!(attributes.settable.size, 5);
     assert_eq!(attributes.settable.content_changed_at, Timestamp(5));
     assert_eq!(attributes.attribute_changed_at, Timestamp(5));
-    assert_eq!(attributes.change_version, 1);
+    assert_eq!(attributes.change_version.number, 1);
     assert_eq!(getattr(&engine, inode), Some(attributes));
 }
 
@@ -974,7 +978,7 @@ fn a_resize_records_a_content_change() {
     let attributes = resize(&engine, inode, 4);
     assert_eq!(attributes.settable.content_changed_at, Timestamp(5));
     assert_eq!(attributes.attribute_changed_at, Timestamp(5));
-    assert_eq!(attributes.change_version, 1);
+    assert_eq!(attributes.change_version.number, 1);
     assert_eq!(getattr(&engine, inode), Some(attributes));
 }
 

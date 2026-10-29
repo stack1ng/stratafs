@@ -14,7 +14,7 @@ use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 use crate::attributes::{
-    Attributes, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
+    Attributes, ChangeVersion, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
 };
 use crate::directories::error::{
     CreateError, HardLinkError, HardUnlinkError, LookupError, ReaddirError, RenameError, RmdirError,
@@ -373,7 +373,7 @@ where
         async move {
             self.remove_name(dir, position, inode, item.kind)
                 .map_err(IoFailure::Metadata)?;
-            item.record_change(now);
+            item.record_change(now, self.mount);
             match item.kind {
                 FileType::Directory => item.hard_link_count = 0,
                 FileType::File | FileType::SymbolicLink => {
@@ -404,7 +404,7 @@ where
         now: Timestamp,
     ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
         directory.settable.content_changed_at = now;
-        directory.record_change(now);
+        directory.record_change(now, self.mount);
         self.write_attributes(dir, directory)
     }
 
@@ -477,7 +477,10 @@ where
                 hard_link_count,
                 attribute_changed_at: now,
                 parent: dir,
-                change_version: 0,
+                change_version: ChangeVersion {
+                    mount: self.mount,
+                    number: 0,
+                },
             };
             update(&mut attributes.settable);
             if let NewItem::SymbolicLink(target) = item {
@@ -549,7 +552,7 @@ where
                 .checked_add(1)
                 .ok_or(HardLinkError::TooManyLinks)?;
             let now = self.now();
-            item.record_change(now);
+            item.record_change(now, self.mount);
             self.write_attributes(inode, &item)?;
             self.add_name(dir, position, name, inode, item.kind)?;
             self.write_entry_change(dir, &mut directory, now)?;
@@ -809,7 +812,7 @@ where
                     if other.parent == new_dir {
                         other.parent = dir;
                     }
-                    other.record_change(now);
+                    other.record_change(now, self.mount);
                     self.write_attributes(target.inode, &other)?;
                     Some((target.inode, other, target.position))
                 }
@@ -857,7 +860,7 @@ where
             if item.parent == dir {
                 item.parent = new_dir;
             }
-            item.record_change(now);
+            item.record_change(now, self.mount);
             self.write_attributes(source.inode, &item)?;
             if moves_between_directories {
                 from.hard_link_count = from

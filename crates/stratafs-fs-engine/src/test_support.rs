@@ -19,7 +19,10 @@ use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
 use crate::observation::{KernelCache, NoKernel};
-use crate::{Eventual, FsConfig, FsEngine, Inode, Timestamp};
+use crate::{Eventual, FsConfig, FsEngine, Inode, MountId, Timestamp};
+
+// TEST_MOUNT is the mount test engines are.
+pub(crate) const TEST_MOUNT: MountId = MountId(1);
 
 pub(crate) struct OneKibInline;
 
@@ -101,6 +104,7 @@ pub(crate) fn new_test_engine_for(kernel: impl KernelCache) -> InMemoryEngine {
             LockSynchronizedStore::new(volume, ObjectStoreContentStore::new(InMemory::new())),
             allocate_inode,
             now,
+            TEST_MOUNT,
             Some(DurableAgainst::PowerFailure),
             Eventual,
             kernel,

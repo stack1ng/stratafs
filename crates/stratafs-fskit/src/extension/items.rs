@@ -62,7 +62,7 @@ impl Items {
         for (inode, read) in reads {
             match reads_by_inode.entry(inode.0) {
                 Entry::Occupied(mut kept) => {
-                    if read.change_version > kept.get().change_version {
+                    if read.change_version.number > kept.get().change_version.number {
                         kept.insert(read);
                     }
                 }
@@ -98,7 +98,7 @@ impl Items {
                 if state
                     .newest
                     .as_ref()
-                    .is_none_or(|newest| read.change_version > newest.change_version)
+                    .is_none_or(|newest| read.change_version.number > newest.change_version.number)
                 {
                     state.newest = Some(read);
                 }

@@ -120,7 +120,7 @@ fn an_annotation_reads_back_and_its_write_records_the_change() {
     );
     let attributes = getattr(&engine, Inode::ROOT).unwrap();
     assert_eq!(attributes.attribute_changed_at, Timestamp(9));
-    assert_eq!(attributes.change_version, 1);
+    assert_eq!(attributes.change_version.number, 1);
 }
 
 #[test]
@@ -340,7 +340,7 @@ fn remove_annotation_removes_the_key_and_records_the_change() {
     );
     let attributes = getattr(&engine, Inode::ROOT).unwrap();
     assert_eq!(attributes.attribute_changed_at, Timestamp(9));
-    assert_eq!(attributes.change_version, 3);
+    assert_eq!(attributes.change_version.number, 3);
     assert_eq!(removed, attributes);
     assert!(matches!(
         remove_annotation(&engine, Inode::ROOT, macos(b"a")),

@@ -213,7 +213,7 @@ fn create_names_a_new_inode_and_records_the_change_on_its_directory() {
     assert_eq!(change.item.settable.created_at, Timestamp(9));
     assert_eq!(change.parent.settable.content_changed_at, Timestamp(9));
     assert_eq!(change.parent.attribute_changed_at, Timestamp(9));
-    assert_eq!(change.parent.change_version, 1);
+    assert_eq!(change.parent.change_version.number, 1);
     assert_eq!(change.parent.hard_link_count, 2);
     assert_eq!(
         lookup(&engine, Inode::ROOT, b"a").unwrap().found,

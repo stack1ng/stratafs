@@ -161,7 +161,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             self.metadata
                 .set(key, value.to_stored())
                 .map_err(refused_or_failed)?;
-            attributes.record_change(self.now());
+            attributes.record_change(self.now(), self.mount);
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)
         }
@@ -193,7 +193,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 return Err(RemoveAnnotationError::AttributeNotFound);
             }
             self.metadata.clear(key).map_err(IoFailure::Metadata)?;
-            attributes.record_change(self.now());
+            attributes.record_change(self.now(), self.mount);
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)
         }

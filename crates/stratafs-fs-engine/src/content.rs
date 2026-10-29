@@ -462,7 +462,7 @@ where
             let now = self.now();
             attributes.settable.size = attributes.settable.size.max(write_end);
             attributes.settable.content_changed_at = now;
-            attributes.record_change(now);
+            attributes.record_change(now, self.mount);
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)
         }
