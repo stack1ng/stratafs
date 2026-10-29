@@ -38,7 +38,20 @@ pub struct FsEngine<St: Store, A, N, S> {
     // durability_limit is the most ensure_durable makes commits durable against, or None when it makes nothing
     // durable.
     durability_limit: Option<DurableAgainst>,
+    consistency: Consistency,
     config: PhantomData<S>,
+}
+
+// Consistency is what a client's reads promise about other clients' writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consistency {
+    // StrongCached serves reads from a cache, which forces any write to verify that all other
+    // StrongCached clients have been invalidated before it can return.
+    StrongCached,
+    // StrongUncached reads everything from the store, without any caching.
+    StrongUncached,
+    // Eventual serves reads from a cache that may lag behind other clients' writes.
+    Eventual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, BorrowDecode)]
@@ -81,6 +94,7 @@ where
         allocate_inode: A,
         now: N,
         durability_limit: Option<DurableAgainst>,
+        consistency: Consistency,
     ) -> impl Future<
         Output = Result<
             Self,
@@ -107,6 +121,7 @@ where
                 now,
                 store,
                 durability_limit,
+                consistency,
                 config: PhantomData,
             };
             engine
@@ -144,6 +159,11 @@ impl<St: Store, A, N, S> FsEngine<St, A, N, S> {
     // content is the content store, which loads a read's ContentLoadPlan once the read's transaction ends.
     pub fn content(&self) -> &St::Content {
         self.store.content()
+    }
+
+    // consistency is what the engine's reads promise about other clients' writes.
+    pub fn consistency(&self) -> Consistency {
+        self.consistency
     }
 }
 

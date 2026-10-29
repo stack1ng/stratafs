@@ -23,7 +23,7 @@ use redb::backends::InMemoryBackend;
 use stratafs_fs_engine::attributes::{
     Attributes, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
 };
-use stratafs_fs_engine::{FsConfig, FsEngine, Inode, Timestamp};
+use stratafs_fs_engine::{Consistency, FsConfig, FsEngine, Inode, Timestamp};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
@@ -73,6 +73,7 @@ async fn new_engine() -> Result<TestEngine, io::Error> {
         allocate_inode,
         now,
         Some(DurableAgainst::PowerFailure),
+        Consistency::Eventual,
     )
     .await
     .map_err(io::Error::other)

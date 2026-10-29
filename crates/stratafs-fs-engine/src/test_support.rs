@@ -17,7 +17,7 @@ use stratafs_tree::tree::{Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
-use crate::{FsConfig, FsEngine, Inode, Timestamp};
+use crate::{Consistency, FsConfig, FsEngine, Inode, Timestamp};
 
 pub(crate) struct OneKibInline;
 
@@ -85,6 +85,7 @@ pub(crate) fn new_test_engine() -> InMemoryEngine {
             allocate_inode,
             now,
             Some(DurableAgainst::PowerFailure),
+            Consistency::Eventual,
         )
         .await
         .unwrap()

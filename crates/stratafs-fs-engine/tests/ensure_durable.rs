@@ -5,7 +5,7 @@ use futures_lite::future::block_on;
 use object_store::memory::InMemory;
 use redb::Database;
 use redb::backends::InMemoryBackend;
-use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
+use stratafs_fs_engine::{Consistency, FsConfig, FsEngine, Timestamp};
 use stratafs_lock_synchronized::{LockSynchronizedMetadata, LockSynchronizedStore};
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
@@ -62,8 +62,14 @@ fn durable_against(durability_limit: Option<DurableAgainst>) -> Vec<DurableAgain
     };
     let allocate_inode: fn() -> u64 = || 7;
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
-    let engine: FsEngine<_, _, _, TestConfig> =
-        block_on(FsEngine::new(store, allocate_inode, now, durability_limit)).unwrap();
+    let engine: FsEngine<_, _, _, TestConfig> = block_on(FsEngine::new(
+        store,
+        allocate_inode,
+        now,
+        durability_limit,
+        Consistency::Eventual,
+    ))
+    .unwrap();
     for against in [
         DurableAgainst::SoftwareFailure,
         DurableAgainst::PowerFailure,

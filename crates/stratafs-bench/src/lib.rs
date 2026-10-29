@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use stratafs_fs_engine::error::PosixError;
-use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
+use stratafs_fs_engine::{Consistency, FsConfig, FsEngine, Timestamp};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
@@ -268,6 +268,7 @@ async fn engine(store: Store, volume: TreeVolumeId) -> Result<BenchEngine, OpenV
         allocate_inode,
         now as fn() -> Timestamp,
         DURABILITY_LIMIT,
+        Consistency::Eventual,
     )
     .await
     .map_err(OpenVolumeError::Root)
