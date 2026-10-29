@@ -219,6 +219,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
         inode: Inode,
         attributes: &Attributes,
     ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
+        self.written.push(inode);
         let stored = Bytes::from(&StoredAttributes::from(attributes));
         self.metadata
             .set(FsKey::new_attributes(inode).into(), stored)

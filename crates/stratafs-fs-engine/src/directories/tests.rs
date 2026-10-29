@@ -51,13 +51,16 @@ fn lookup(
     engine: &InMemoryEngine,
     dir: Inode,
     name: &[u8],
-) -> Result<Option<(Inode, Attributes)>, LookupError<MetadataFailure, ObjectStoreError>> {
+) -> Result<Lookup, LookupError<MetadataFailure, ObjectStoreError>> {
     block_on(engine.read_transact(|txn| Box::pin(async move { txn.lookup(dir, name).await })))
         .map_err(aborted)
 }
 
 fn named(engine: &InMemoryEngine, dir: Inode, name: &[u8]) -> Option<Inode> {
-    lookup(engine, dir, name).unwrap().map(|(inode, _)| inode)
+    lookup(engine, dir, name)
+        .unwrap()
+        .found
+        .map(|(inode, _)| inode)
 }
 
 fn readdir(
@@ -213,7 +216,7 @@ fn create_names_a_new_inode_and_records_the_change_on_its_directory() {
     assert_eq!(change.parent.change_version, 1);
     assert_eq!(change.parent.hard_link_count, 2);
     assert_eq!(
-        lookup(&engine, Inode::ROOT, b"a").unwrap(),
+        lookup(&engine, Inode::ROOT, b"a").unwrap().found,
         Some((change.inode, change.item))
     );
     assert_eq!(getattr(&engine, Inode::ROOT).unwrap(), change.parent);
@@ -336,6 +339,15 @@ fn lookup_finds_names_and_reports_missing_ones_as_none() {
     let a = file(&engine, Inode::ROOT, b"a");
     assert_eq!(named(&engine, Inode::ROOT, b"a"), Some(a));
     assert_eq!(named(&engine, Inode::ROOT, b"b"), None);
+    let root = getattr(&engine, Inode::ROOT);
+    assert_eq!(
+        Some(lookup(&engine, Inode::ROOT, b"a").unwrap().directory),
+        root
+    );
+    assert_eq!(
+        Some(lookup(&engine, Inode::ROOT, b"b").unwrap().directory),
+        root
+    );
     assert!(matches!(
         lookup(&engine, a, b"b"),
         Err(LookupError::NotADirectory)

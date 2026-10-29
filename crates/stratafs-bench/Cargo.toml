@@ -9,7 +9,9 @@ publish = false
 [dependencies]
 bytes.workspace = true
 clap.workspace = true
+futures-executor.workspace = true
 futures-lite.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 mdbx-sys = "=14.4.0"
 rand.workspace = true
@@ -28,7 +30,6 @@ thiserror.workspace = true
 toml.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-futures-executor.workspace = true
 mimalloc.workspace = true
 stratafs-fskit = { workspace = true, features = ["extension"] }
 tracing.workspace = true

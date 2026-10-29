@@ -27,13 +27,14 @@ use objc2_foundation::{
     NSUUID,
 };
 use stratafs_fs_engine::error::PosixError;
-use stratafs_fs_engine::{FsConfig, FsEngine, Timestamp};
+use stratafs_fs_engine::{Cached, FsConfig, FsEngine, Timestamp};
 use stratafs_store::store::Store;
 
 use crate::mount_options::MountOptions;
 use file_system::StrataFileSystem;
 use items::Items;
 use operations::{Volume, VolumeOperations, make_durable_on_cadence};
+pub use volume::FsKitCache;
 use volume::StrataVolume;
 
 // OpenedVolume is an activated volume: its id, and its operations on the engine the extension binary opened.
@@ -70,7 +71,7 @@ struct ActivateArguments {
 }
 
 type OpenVolume =
-    Box<dyn Fn(&Path, &[String]) -> Result<OpenedVolume, ActivateError> + Send + Sync>;
+    Box<dyn Fn(&Path, &[String], FsKitCache) -> Result<OpenedVolume, ActivateError> + Send + Sync>;
 
 // OPEN_VOLUME is how activate opens a volume. It is the one static: NSExtensionMain creates
 // StrataFileSystem itself, with no arguments, so this is the only way run's arguments reach it.
@@ -79,15 +80,25 @@ static OPEN_VOLUME: OnceLock<OpenVolume> = OnceLock::new();
 
 // run starts the FSKit extension and never returns. The extension binary's main calls it.
 // When FSKit activates a mounted volume, run's open_volume opens it from the store directory mount was
-// given and the volume its -o volume option names. Its errors reach mount as the POSIX errors they stand for.
+// given and the volume its -o volume option names, as an engine that invalidates the kernel cache it is handed,
+// running its auto invalidators on the spawner it is handed. Its errors reach mount as the POSIX errors they
+// stand for.
 // FSKit hands every operation over on one thread and does not wait for the reply. Each operation runs on
 // that thread until it finishes or yields, as a store does while it waits for the disk to make commits durable, and then
 // finishes on spawner, so FSKit can hand over the next one. Store work that blocks without yielding, such as
 // file IO on this machine's disk, holds up that thread. spawner must run on threads of its own:
 // NSExtensionMain keeps the main thread.
-pub fn run<V, St, A, N, S, F>(
+pub fn run<V, St, A, N, S, C, F>(
     spawner: impl Spawn + Send + Sync + 'static,
-    open_volume: impl AsyncFn(&Path, V) -> Result<FsEngine<St, A, N, S>, F> + Send + Sync + 'static,
+    open_volume: impl AsyncFn(
+        &Path,
+        V,
+        FsKitCache,
+        Arc<dyn Spawn + Send + Sync>,
+    ) -> Result<FsEngine<St, A, N, S, C>, F>
+    + Send
+    + Sync
+    + 'static,
 ) -> !
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
@@ -95,6 +106,7 @@ where
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
+    C: Cached<St>,
     F: Error + Send + Sync + 'static,
     for<'e> PosixError: From<&'e F>,
 {
@@ -124,9 +136,17 @@ const DURABILITY_CADENCE: Duration = Duration::from_secs(30);
 
 // opener wraps open_volume so it takes the store directory and activate's options, and returns the volume
 // as FSKit's classes hold it, running its operations on spawner.
-fn opener<V, St, A, N, S, F>(
+fn opener<V, St, A, N, S, C, F>(
     spawner: impl Spawn + Send + Sync + 'static,
-    open_volume: impl AsyncFn(&Path, V) -> Result<FsEngine<St, A, N, S>, F> + Send + Sync + 'static,
+    open_volume: impl AsyncFn(
+        &Path,
+        V,
+        FsKitCache,
+        Arc<dyn Spawn + Send + Sync>,
+    ) -> Result<FsEngine<St, A, N, S, C>, F>
+    + Send
+    + Sync
+    + 'static,
 ) -> OpenVolume
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
@@ -134,11 +154,12 @@ where
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
+    C: Cached<St>,
     F: Error + Send + Sync + 'static,
     for<'e> PosixError: From<&'e F>,
 {
     let spawner: Arc<dyn Spawn + Send + Sync> = Arc::new(spawner);
-    Box::new(move |store, arguments| {
+    Box::new(move |store, arguments, kernel| {
         let arguments = ActivateArguments::try_parse_from(arguments)
             .map_err(ActivateError::UnreadableOptions)?;
         let options: MountOptions<V> = arguments
@@ -147,12 +168,11 @@ where
             .parse()
             .map_err(|error| ActivateError::InvalidOptions(Box::new(error)))?;
         let id = options.volume.clone().into();
-        let engine = block_on(open_volume(store, options.volume)).map_err(|error| {
-            ActivateError::OpenFailed {
+        let engine = block_on(open_volume(store, options.volume, kernel, spawner.clone()))
+            .map_err(|error| ActivateError::OpenFailed {
                 posix: PosixError::from(&error),
                 source: Box::new(error),
-            }
-        })?;
+            })?;
         let (stops_durability_cadence, durability_cadence_stopped) = mpsc::channel();
         let volume = Arc::new(Volume {
             engine,
@@ -175,11 +195,12 @@ where
 pub(crate) fn open_volume(
     store: &Path,
     arguments: &[String],
+    kernel: FsKitCache,
 ) -> Result<OpenedVolume, ActivateError> {
     let open = OPEN_VOLUME
         .get()
         .expect("run stores the volume opener before FSKit can call in");
-    open(store, arguments)
+    open(store, arguments, kernel)
 }
 
 // errno is a POSIX error's number on macOS.

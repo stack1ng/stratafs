@@ -55,6 +55,14 @@ pub struct EntryChange {
     pub parent: Attributes,
 }
 
+// Lookup is what a lookup read: the directory's attributes, and the inode its name refers to with that inode's
+// attributes, or None when no entry has the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lookup {
+    pub directory: Attributes,
+    pub found: Option<(Inode, Attributes)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenameChange {
     pub inode: Inode,
@@ -202,9 +210,7 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
         &self,
         dir: Inode,
         name: &[u8],
-    ) -> impl Future<
-        Output = Result<Option<(Inode, Attributes)>, LookupError<T::Failure, C::Failure>>,
-    > + Send {
+    ) -> impl Future<Output = Result<Lookup, LookupError<T::Failure, C::Failure>>> + Send {
         async move {
             check_name(
                 name,
@@ -212,19 +218,25 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
                 LookupError::FileNameTooLong,
             )?;
             let (directory, search) = join(self.getattr(dir), self.find_name(dir, name)).await;
-            require_directory(
+            let directory = require_directory(
                 directory?,
                 LookupError::StaleFileHandle,
                 LookupError::NotADirectory,
             )?;
             let NameSearch::Found(entry) = search? else {
-                return Ok(None);
+                return Ok(Lookup {
+                    directory,
+                    found: None,
+                });
             };
             let attributes = self
                 .getattr(entry.inode)
                 .await?
                 .ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
-            Ok(Some((entry.inode, attributes)))
+            Ok(Lookup {
+                directory,
+                found: Some((entry.inode, attributes)),
+            })
         }
     }
 

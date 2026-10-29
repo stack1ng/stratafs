@@ -23,7 +23,8 @@ use redb::backends::InMemoryBackend;
 use stratafs_fs_engine::attributes::{
     Attributes, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
 };
-use stratafs_fs_engine::{Consistency, FsConfig, FsEngine, Inode, Timestamp};
+use stratafs_fs_engine::observation::KernelCache;
+use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, Timestamp};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
@@ -43,7 +44,7 @@ impl FsConfig for TestConfig {
 
 type TestStore = LockSynchronizedStore<RedbStore<SimulatedThreadPool>, ObjectStoreContentStore>;
 
-type TestEngine = FsEngine<TestStore, fn() -> u64, fn() -> Timestamp, TestConfig>;
+type TestEngine = FsEngine<TestStore, fn() -> u64, fn() -> Timestamp, TestConfig, Eventual>;
 
 // SimulatedThreadPool yields before it does the work, as a thread pool does when the work is not done by the
 // first poll, so making commits durable makes its operation wait.
@@ -59,7 +60,10 @@ impl SpawnBlocking for SimulatedThreadPool {
     }
 }
 
-async fn new_engine() -> Result<TestEngine, io::Error> {
+async fn new_engine(
+    kernel: impl KernelCache,
+    spawner: impl Spawn + Send + Sync + 'static,
+) -> Result<TestEngine, io::Error> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .map_err(io::Error::other)?;
@@ -73,7 +77,9 @@ async fn new_engine() -> Result<TestEngine, io::Error> {
         allocate_inode,
         now,
         Some(DurableAgainst::PowerFailure),
-        Consistency::Eventual,
+        Eventual,
+        kernel,
+        spawner,
     )
     .await
     .map_err(io::Error::other)
@@ -126,14 +132,19 @@ fn install() {
             OPEN_VOLUME
                 .set(opener(
                     ThreadSpawner,
-                    async |mounted: &Path, volume: Bytes| {
+                    async |mounted: &Path,
+                           volume: Bytes,
+                           kernel: FsKitCache,
+                           spawner: Arc<dyn Spawn + Send + Sync>| {
                         if mounted != store() {
                             return Err(TestOpenError::WrongStore(mounted.to_owned()));
                         }
                         match &volume[..] {
                             [0xff] => Err(TestOpenError::Down),
                             [0xbb] => Err(TestOpenError::Busy),
-                            _ => new_engine().await.map_err(TestOpenError::Engine),
+                            _ => new_engine(kernel, spawner)
+                                .await
+                                .map_err(TestOpenError::Engine),
                         }
                     }
                 ))

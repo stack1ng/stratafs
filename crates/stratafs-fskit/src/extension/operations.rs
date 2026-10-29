@@ -23,19 +23,20 @@ use objc2_fs_kit::{
 };
 use stratafs_fs_engine::annotations::error::{GetAnnotationError, ListAnnotationsError};
 use stratafs_fs_engine::annotations::{AnnotationKey, AnnotationScope, SetAnnotationMode};
+use stratafs_fs_engine::attributes::Attributes;
 use stratafs_fs_engine::attributes::FileType;
 use stratafs_fs_engine::content::error::{ReadError, ReadSymbolicLinkError};
 use stratafs_fs_engine::directories::error::{LookupError, ReaddirError, RenameError};
 use stratafs_fs_engine::directories::{NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, IoFailure, PosixError};
-use stratafs_fs_engine::{FsConfig, FsEngine, Inode, Timestamp};
+use stratafs_fs_engine::{Cached, FsConfig, FsEngine, Inode, Timestamp};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::TransactError;
 use stratafs_store::store::Store;
 
 use super::changes::AttributeChange;
 use super::item::{file_name, item_id};
-use super::items::Items;
+use super::items::{Items, Locked};
 use super::{errno, posix_error};
 
 // Reply is an FSKit reply block, copied so an operation can call it once it finishes.
@@ -164,18 +165,22 @@ pub(crate) trait VolumeOperations: Send + Sync {
     // delete_if_unlinked deletes inode, which FSKit no longer holds, if no name refers to it. Nothing waits on it,
     // so it logs a failure.
     fn delete_if_unlinked(self: Arc<Self>, inode: Inode);
+
+    // forget tells the engine the kernel no longer holds inode.
+    fn forget(&self, inode: Inode);
 }
 
 // Volume is a mounted volume's engine. Each operation replies when it finishes, on FSKit's thread unless it
 // has to wait, and then on spawner.
-pub(crate) struct Volume<St, A, N, S>
+pub(crate) struct Volume<St, A, N, S, C>
 where
     St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
+    C: Cached<St>,
 {
-    pub(crate) engine: FsEngine<St, A, N, S>,
+    pub(crate) engine: FsEngine<St, A, N, S, C>,
     pub(crate) spawner: Arc<dyn Spawn + Send + Sync>,
     pub(crate) items: Items,
     // stops_durability_cadence stops the volume's durability cadence when the volume is dropped.
@@ -184,8 +189,8 @@ where
 
 // make_durable_on_cadence makes the volume durable against a power failure every period, on a thread of its own,
 // until the volume is dropped.
-pub(crate) fn make_durable_on_cadence<St, A, N, S>(
-    volume: Weak<Volume<St, A, N, S>>,
+pub(crate) fn make_durable_on_cadence<St, A, N, S, C>(
+    volume: Weak<Volume<St, A, N, S, C>>,
     stopped: mpsc::Receiver<()>,
     period: Duration,
 ) where
@@ -193,6 +198,7 @@ pub(crate) fn make_durable_on_cadence<St, A, N, S>(
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
+    C: Cached<St>,
 {
     std::thread::Builder::new()
         .name("durability cadence".to_owned())
@@ -213,12 +219,13 @@ pub(crate) fn make_durable_on_cadence<St, A, N, S>(
 
 // Dropping the volume, which happens after its last operation, makes every commit durable, up to the engine's
 // durability limit.
-impl<St, A, N, S> Drop for Volume<St, A, N, S>
+impl<St, A, N, S, C> Drop for Volume<St, A, N, S, C>
 where
     St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
+    C: Cached<St>,
 {
     fn drop(&mut self) {
         // The cadence's thread has stopped when the send fails.
@@ -259,12 +266,13 @@ const LISTING_BATCH: usize = 64;
 // FSKit never needs to start it over.
 const VERIFIER: FSDirectoryVerifier = 1;
 
-impl<St, A, N, S> VolumeOperations for Volume<St, A, N, S>
+impl<St, A, N, S, C> VolumeOperations for Volume<St, A, N, S, C>
 where
     St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
+    C: Cached<St>,
 {
     fn items(&self) -> &Items {
         &self.items
@@ -279,7 +287,7 @@ where
                 })
                 .await;
             match found {
-                Ok(Some(attributes)) => volume.items.reply([(inode, attributes)], |locked| {
+                Ok(Some(attributes)) => volume.reply([(inode, attributes)], |locked| {
                     // SAFETY: the attributes are a live, fully populated object.
                     succeed(&reply, unsafe {
                         FSGetAttributesResult::initWithAttributes(
@@ -314,7 +322,7 @@ where
                 })
                 .await;
             match changed {
-                Ok(attributes) => volume.items.reply([(inode, attributes)], |locked| {
+                Ok(attributes) => volume.reply([(inode, attributes)], |locked| {
                     // SAFETY: the attributes are a live, fully populated object.
                     succeed(&reply, unsafe {
                         FSSetAttributesResult::initWithAttributes_freeSpace(
@@ -339,24 +347,31 @@ where
                 })
                 .await;
             match found {
-                Ok(Some((inode, attributes))) => {
-                    volume.items.reply([(inode, attributes)], |locked| {
-                        let item = locked.item(inode);
-                        // SAFETY: the item, name and attributes are live objects.
-                        succeed(&reply, unsafe {
-                            FSLookupItemResult::initWithFoundItem_itemName_itemAttributes(
-                                FSLookupItemResult::alloc(),
-                                &item,
-                                &file_name(&name),
-                                &locked.attributes(inode),
-                            )
-                        })
-                    })
+                Ok(lookup) => {
+                    match lookup.found {
+                        Some((inode, attributes)) => {
+                            volume.reply([(inode, attributes)], |locked| {
+                                let item = locked.item(inode);
+                                // SAFETY: the item, name and attributes are live objects.
+                                succeed(&reply, unsafe {
+                                    FSLookupItemResult::initWithFoundItem_itemName_itemAttributes(
+                                        FSLookupItemResult::alloc(),
+                                        &item,
+                                        &file_name(&name),
+                                        &locked.attributes(inode),
+                                    )
+                                })
+                            })
+                        }
+                        None => fail(
+                            &reply,
+                            posix_error(errno(PosixError::ENOENT), "no item has that name"),
+                        ),
+                    }
+                    // The engine learns the kernel caches the directory once the kernel has the answer, so an
+                    // invalidation reaches the kernel after it.
+                    volume.engine.cached(directory, &lookup.directory);
                 }
-                Ok(None) => fail(
-                    &reply,
-                    posix_error(errno(PosixError::ENOENT), "no item has that name"),
-                ),
                 Err(error) => fail(&reply, failed(error)),
             }
         });
@@ -384,7 +399,7 @@ where
                 })
                 .await;
             match read {
-                Ok((target, attributes)) => volume.items.reply([(inode, attributes)], |locked| {
+                Ok((target, attributes)) => volume.reply([(inode, attributes)], |locked| {
                     // SAFETY: the target and attributes are live objects.
                     succeed(&reply, unsafe {
                         FSReadSymlinkResult::initWithContents_symlinkAttributes(
@@ -423,7 +438,7 @@ where
             match created {
                 Ok(created) => {
                     let inode = created.inode;
-                    volume.items.reply(
+                    volume.reply(
                         [(inode, created.item), (directory, created.parent)],
                         |locked| {
                             let item = locked.item(inode);
@@ -470,7 +485,7 @@ where
             match created {
                 Ok(created) => {
                     let inode = created.inode;
-                    volume.items.reply(
+                    volume.reply(
                         [(inode, created.item), (directory, created.parent)],
                         |locked| {
                             let item = locked.item(inode);
@@ -512,7 +527,7 @@ where
                 })
                 .await;
             match linked {
-                Ok(linked) => volume.items.reply(
+                Ok(linked) => volume.reply(
                     [(inode, linked.item), (directory, linked.parent)],
                     |locked| {
                         // SAFETY: the name and attributes are live objects.
@@ -567,7 +582,7 @@ where
                     .map_err(failed),
             };
             match removed {
-                Ok(removed) => volume.items.reply(
+                Ok(removed) => volume.reply(
                     [(inode, removed.item), (directory, removed.parent)],
                     |locked| {
                         // SAFETY: the attributes are live objects.
@@ -604,7 +619,7 @@ where
                             .lookup(to, &to_name)
                             .await
                             .map_err(RenameFailure::Lookup)?;
-                        if at_destination.map(|(inode, _)| inode) != expected_replaced {
+                        if at_destination.found.map(|(inode, _)| inode) != expected_replaced {
                             return Err(RenameFailure::DestinationChanged);
                         }
                         let result = transaction
@@ -621,7 +636,7 @@ where
                     let reads = [(inode, renamed.item), (from, renamed.from), (to, renamed.to)]
                         .into_iter()
                         .chain(renamed.replaced);
-                    volume.items.reply(reads, |locked| {
+                    volume.reply(reads, |locked| {
                         let replaced = replaced.map(|replaced| locked.attributes(replaced));
                         // SAFETY: the name and attributes are live objects.
                         succeed(&reply, unsafe {
@@ -804,7 +819,7 @@ where
                 piece.copy_to_slice(&mut destination[filled..filled + length]);
                 filled += length;
             }
-            volume.items.reply([(inode, attributes)], |locked| {
+            volume.reply([(inode, attributes)], |locked| {
                 // SAFETY: the attributes are a live, fully populated object.
                 succeed(&reply, unsafe {
                     FSReadFileResult::initWithBytesRead_itemAttributes(
@@ -836,7 +851,7 @@ where
                 })
                 .await;
             match written {
-                Ok(attributes) => volume.items.reply([(inode, attributes)], |locked| {
+                Ok(attributes) => volume.reply([(inode, attributes)], |locked| {
                     // SAFETY: the attributes are a live, fully populated object.
                     succeed(&reply, unsafe {
                         FSWriteFileResult::initWithBytesWritten_itemAttributes_freeSpace(
@@ -912,7 +927,7 @@ where
                             let result = transaction
                                 .set_annotation(inode, annotation_key(&name), value, mode)
                                 .await;
-                            result.map(|()| ((), transaction))
+                            result.map(|attributes| (attributes, transaction))
                         })
                     })
                     .await
@@ -925,7 +940,7 @@ where
                             let result = transaction
                                 .remove_annotation(inode, annotation_key(&name))
                                 .await;
-                            result.map(|()| ((), transaction))
+                            result.map(|attributes| (attributes, transaction))
                         })
                     })
                     .await
@@ -936,13 +951,16 @@ where
                 )),
             };
             match changed {
-                // SAFETY: the free space is FSKit's sentinel for no change.
-                Ok(()) => succeed(&reply, unsafe {
-                    FSSetXattrResult::initWithFreeSpace(
-                        FSSetXattrResult::alloc(),
-                        Some(&no_free_space_update()),
-                    )
-                }),
+                Ok(attributes) => {
+                    volume.engine.cached(inode, &attributes);
+                    // SAFETY: the free space is FSKit's sentinel for no change.
+                    succeed(&reply, unsafe {
+                        FSSetXattrResult::initWithFreeSpace(
+                            FSSetXattrResult::alloc(),
+                            Some(&no_free_space_update()),
+                        )
+                    })
+                }
                 Err(error) => fail(&reply, error),
             }
         });
@@ -995,14 +1013,19 @@ where
             }
         });
     }
+
+    fn forget(&self, inode: Inode) {
+        self.engine.forget(inode);
+    }
 }
 
-impl<St, A, N, S> Volume<St, A, N, S>
+impl<St, A, N, S, C> Volume<St, A, N, S, C>
 where
     St: Store,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
+    C: Cached<St>,
 {
     // run runs an operation, handing it the volume, on FSKit's thread until it finishes or has to wait, such
     // as while the store's thread pool runs its transaction. An operation that has to wait finishes on the spawner, so
@@ -1023,6 +1046,20 @@ where
                 .spawn(operation)
                 .expect("the spawner accepts work while a volume is mounted");
         }
+    }
+
+    // reply replies with reads as Items::reply does, then tells the engine the kernel caches each item it read.
+    fn reply<R>(
+        self: &Arc<Self>,
+        reads: impl IntoIterator<Item = (Inode, Attributes)>,
+        reply: impl FnOnce(&mut Locked<'_>) -> R,
+    ) -> R {
+        let reads: Vec<_> = reads.into_iter().collect();
+        let replied = self.items.reply(reads.iter().cloned(), reply);
+        for (inode, read) in &reads {
+            self.engine.cached(*inode, read);
+        }
+        replied
     }
 }
 

@@ -14,6 +14,7 @@ storekey.workspace = true
 stratafs-serialized.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 zerocopy.workspace = true
 

@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::fmt::Debug;
 
 use futures_lite::future::block_on;
+use futures_util::task::{FutureObj, Spawn, SpawnError};
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
 use stratafs_lock_synchronized::LockSynchronizedStore;
@@ -17,7 +18,8 @@ use stratafs_tree::tree::{Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
-use crate::{Consistency, FsConfig, FsEngine, Inode, Timestamp};
+use crate::observation::{KernelCache, NoKernel};
+use crate::{Eventual, FsConfig, FsEngine, Inode, Timestamp};
 
 pub(crate) struct OneKibInline;
 
@@ -42,7 +44,7 @@ pub(crate) type InMemoryStore = LockSynchronizedStore<
 pub(crate) type MetadataFailure = TreeFailure<RedbFailure, Infallible>;
 
 pub(crate) type InMemoryEngine =
-    FsEngine<InMemoryStore, fn() -> u64, fn() -> Timestamp, OneKibInline>;
+    FsEngine<InMemoryStore, fn() -> u64, fn() -> Timestamp, OneKibInline, Eventual>;
 
 thread_local! {
     static CLOCK: Cell<i64> = const { Cell::new(0) };
@@ -66,7 +68,22 @@ fn next_node() -> u128 {
     NEXT_NODE.replace(NEXT_NODE.get() + 1)
 }
 
+// ThreadSpawner runs each task on a thread of its own.
+pub(crate) struct ThreadSpawner;
+
+impl Spawn for ThreadSpawner {
+    fn spawn_obj(&self, task: FutureObj<'static, ()>) -> Result<(), SpawnError> {
+        std::thread::spawn(move || block_on(task));
+        Ok(())
+    }
+}
+
 pub(crate) fn new_test_engine() -> InMemoryEngine {
+    new_test_engine_for(NoKernel)
+}
+
+// new_test_engine_for is a test engine whose inodes kernel caches.
+pub(crate) fn new_test_engine_for(kernel: impl KernelCache) -> InMemoryEngine {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
@@ -85,7 +102,9 @@ pub(crate) fn new_test_engine() -> InMemoryEngine {
             allocate_inode,
             now,
             Some(DurableAgainst::PowerFailure),
-            Consistency::Eventual,
+            Eventual,
+            kernel,
+            ThreadSpawner,
         )
         .await
         .unwrap()

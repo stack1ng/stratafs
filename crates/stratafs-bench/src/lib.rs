@@ -7,8 +7,11 @@ use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures_executor::ThreadPool as SpawnerPool;
+use futures_util::task::Spawn;
 use stratafs_fs_engine::error::PosixError;
-use stratafs_fs_engine::{Consistency, FsConfig, FsEngine, Timestamp};
+use stratafs_fs_engine::observation::{KernelCache, NoKernel};
+use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Timestamp};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
@@ -121,7 +124,8 @@ pub type BenchStore = stratafs_sqlite::SqliteStore<BenchVolume, ThreadPool>;
 #[cfg(store = "mdbx")]
 pub type BenchStore = stratafs_mdbx::MdbxStore<BenchVolume, ThreadPool>;
 
-pub type BenchEngine = FsEngine<BenchStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig>;
+pub type BenchEngine =
+    FsEngine<BenchStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig, Eventual>;
 
 // Store is the store directory opened: the tree holding every volume, and the content of every file.
 pub struct Store {
@@ -174,6 +178,8 @@ pub enum CreateVolumeError {
     Create(#[source] <BenchTree as ForkableKeyValueStore>::CreateError),
     #[error(transparent)]
     Open(#[from] OpenVolumeError),
+    #[error("the engine's thread pool could not start")]
+    Pool(#[source] io::Error),
 }
 
 impl From<&OpenVolumeError> for PosixError {
@@ -235,13 +241,16 @@ fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError
     Ok((metadata, content))
 }
 
-// open_volume opens volume from the store in directory.
+// open_volume opens volume from the store in directory, as an engine that invalidates kernel's cache, running its
+// auto invalidators on spawner.
 pub async fn open_volume(
     directory: &Path,
     volume: TreeVolumeId,
+    kernel: impl KernelCache,
+    spawner: impl Spawn + Send + Sync + 'static,
 ) -> Result<BenchEngine, OpenVolumeError> {
     let store = open_store(directory).await?;
-    engine(store, volume).await
+    engine(store, volume, kernel, spawner).await
 }
 
 // create_volume makes a new, empty volume in the store in directory, and returns its id.
@@ -252,12 +261,22 @@ pub async fn create_volume(directory: &Path) -> Result<TreeVolumeId, CreateVolum
         .create()
         .await
         .map_err(CreateVolumeError::Create)?;
-    // Opening the engine makes the volume's root directory, so a mount finds it ready.
-    engine(store, volume).await?;
+    // Opening the engine makes the volume's root directory, so a mount finds it ready. No kernel caches its inodes,
+    // so its pool runs nothing.
+    let pool = SpawnerPool::builder()
+        .pool_size(1)
+        .create()
+        .map_err(CreateVolumeError::Pool)?;
+    engine(store, volume, NoKernel, pool).await?;
     Ok(volume)
 }
 
-async fn engine(store: Store, volume: TreeVolumeId) -> Result<BenchEngine, OpenVolumeError> {
+async fn engine(
+    store: Store,
+    volume: TreeVolumeId,
+    kernel: impl KernelCache,
+    spawner: impl Spawn + Send + Sync + 'static,
+) -> Result<BenchEngine, OpenVolumeError> {
     let metadata = store.tree.open(volume).await.map_err(|error| match error {
         StoreError::Rejected(UnknownVolume) => OpenVolumeError::UnknownVolume,
         StoreError::Failed(failure) => OpenVolumeError::Volume(failure),
@@ -268,7 +287,9 @@ async fn engine(store: Store, volume: TreeVolumeId) -> Result<BenchEngine, OpenV
         allocate_inode,
         now as fn() -> Timestamp,
         DURABILITY_LIMIT,
-        Consistency::Eventual,
+        Eventual,
+        kernel,
+        spawner,
     )
     .await
     .map_err(OpenVolumeError::Root)

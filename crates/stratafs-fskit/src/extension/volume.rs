@@ -6,29 +6,35 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use block2::SendableBlock;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
 use objc2::{AllocAnyThread, Ivars, Message, define_class, msg_send};
 use objc2_foundation::{NSData, NSError, NSInteger, NSObject, NSString, NSURL};
 use objc2_fs_kit::{
     FSActivateResult, FSContext, FSCreateItemResult, FSCreateLinkResult, FSCreateSymlinkResult,
-    FSDeactivateOptions, FSDirectoryCookie, FSDirectoryEntryPacker, FSDirectoryVerifier,
-    FSEnumerateDirectoryResult, FSFileName, FSGetAttributesResult, FSGetXattrResult, FSItem,
-    FSItemGetAttributesRequest, FSItemSetAttributesRequest, FSItemType, FSListXattrsResult,
-    FSLookupItemResult, FSMutableFileDataBuffer, FSReadFileResult, FSReadSymlinkResult,
-    FSRemoveItemResult, FSRenameItemResult, FSSetAttributesResult, FSSetXattrPolicy,
-    FSSetXattrResult, FSStatFSResult, FSSyncFlags, FSTaskOptions, FSVolume, FSVolumeCaseFormat,
-    FSVolumeCommonOperations, FSVolumeHandler, FSVolumeIdentifier, FSVolumePathConfOperations,
-    FSVolumeReadWriteHandler, FSVolumeSupportedCapabilities, FSVolumeXattrHandler,
-    FSWriteFileResult,
+    FSDataCacheMode, FSDeactivateOptions, FSDirectoryCookie, FSDirectoryEntryPacker,
+    FSDirectoryVerifier, FSEnumerateDirectoryResult, FSFileName, FSGetAttributesResult,
+    FSGetXattrResult, FSItem, FSItemGetAttributesRequest, FSItemSetAttributesRequest, FSItemType,
+    FSKernelCacheCoherencyAction, FSKernelCacheCoherencyType, FSListXattrsResult,
+    FSLookupItemResult, FSMutableFileDataBuffer, FSOpenItemResult, FSReadFileResult,
+    FSReadSymlinkResult, FSRemoveItemResult, FSRenameItemResult, FSSetAttributesResult,
+    FSSetXattrPolicy, FSSetXattrResult, FSStatFSResult, FSSyncFlags, FSTaskOptions,
+    FSUpgradeItemResult, FSVolume, FSVolumeCaseFormat, FSVolumeCommonOperations,
+    FSVolumeDataCacheHandler, FSVolumeHandler, FSVolumeIdentifier, FSVolumeOpenModes,
+    FSVolumePathConfOperations, FSVolumeReadWriteHandler, FSVolumeSupportedCapabilities,
+    FSVolumeXattrHandler, FSWriteFileResult,
 };
 use stratafs_fs_engine::attributes::FileType;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::error::PosixError;
+use stratafs_fs_engine::observation::KernelCache;
 use stratafs_fs_engine::{Inode, LARGEST_NAME_LENGTH};
+use stratafs_store::spawn::{SpawnBlocking, ThreadPool};
 
 use super::changes::attribute_change;
 use super::item::{StrataItem, file_name, name_bytes};
+use super::items::Granted;
 use super::operations::{Handed, Reply, VolumeOperations};
 use super::{ActivateError, errno, identity, open_volume, posix_error};
 
@@ -153,17 +159,22 @@ define_class!(
             reply.call(null_mut());
         }
 
-        // reclaim lets go of an item FSKit no longer holds, then deletes it if it has no name, as FSKit asks of a
-        // removed item. It replies before the deletion, which the call that let go of the item has no need to wait on.
+        // reclaim lets go of an item FSKit no longer holds, tells the engine the kernel no longer holds it, then
+        // deletes it if it has no name, as FSKit asks of a removed item. It replies before the deletion, which the
+        // call that let go of the item has no need to wait on.
         #[unsafe(method(reclaimItem:replyHandler:))]
         fn reclaim(&self, item: &FSItem, reply: &SendableBlock<'static, fn(*mut NSError)>) {
             let item = StrataItem::of(item);
-            let unlinked = self
-                .active_operations()
-                .filter(|operations| operations.items().reclaim(item));
+            let reclaimed = self.active_operations().and_then(|operations| {
+                let unlinked = operations.items().reclaim(item)?;
+                Some((operations, unlinked))
+            });
             reply.call(null_mut());
-            if let Some(operations) = unlinked {
-                operations.delete_if_unlinked(*item.inode());
+            if let Some((operations, unlinked)) = reclaimed {
+                operations.forget(*item.inode());
+                if unlinked {
+                    operations.delete_if_unlinked(*item.inode());
+                }
             }
         }
 
@@ -482,6 +493,56 @@ define_class!(
             });
         }
     }
+
+    // The kernel caches an item's contents as the volume grants when the item opens, and the volume invalidates
+    // what the kernel caches for an item through the same protocol.
+    unsafe impl FSVolumeDataCacheHandler for StrataVolume {
+        #[unsafe(method(openItem:modes:cacheMode:context:replyHandler:))]
+        fn open(
+            &self,
+            item: &FSItem,
+            _modes: FSVolumeOpenModes,
+            cache_mode: FSDataCacheMode,
+            _context: &FSContext,
+            reply: &SendableBlock<'static, fn(*mut FSOpenItemResult, *mut NSError)>,
+        ) {
+            let coherency = self.grant(item, cache_mode);
+            // SAFETY: the result is a plain value object made from a valid coherency.
+            let result = unsafe {
+                FSOpenItemResult::initWithGrantedCoherency(FSOpenItemResult::alloc(), coherency)
+            };
+            reply.call(Retained::as_ptr(&result).cast_mut(), null_mut());
+        }
+
+        #[unsafe(method(closeItem:context:replyHandler:))]
+        fn close(&self, item: &FSItem, _context: &FSContext, reply: &SendableBlock<'static, fn()>) {
+            if let Some(operations) = self.active_operations() {
+                operations
+                    .items()
+                    .grant(*StrataItem::of(item).inode(), Granted::default());
+            }
+            reply.call();
+        }
+
+        #[unsafe(method(upgradeItem:cacheMode:context:replyHandler:))]
+        fn upgrade(
+            &self,
+            item: &FSItem,
+            cache_mode: FSDataCacheMode,
+            _context: &FSContext,
+            reply: &SendableBlock<'static, fn(*mut FSUpgradeItemResult, *mut NSError)>,
+        ) {
+            let coherency = self.grant(item, cache_mode);
+            // SAFETY: the result is a plain value object made from a valid coherency.
+            let result = unsafe {
+                FSUpgradeItemResult::initWithGrantedCoherency(
+                    FSUpgradeItemResult::alloc(),
+                    coherency,
+                )
+            };
+            reply.call(Retained::as_ptr(&result).cast_mut(), null_mut());
+        }
+    }
 );
 
 // SAFETY: StrataVolume defines every FSVolumeCommonOperations method as part of FSVolumeHandler, which
@@ -515,7 +576,7 @@ impl StrataVolume {
         arguments: &[String],
         reply: &SendableBlock<'static, fn(*mut FSActivateResult, *mut NSError)>,
     ) {
-        let opened = match open_volume(self.store(), arguments) {
+        let opened = match open_volume(self.store(), arguments, FsKitCache(self.retain())) {
             Ok(opened) => {
                 tracing::info!(?arguments, store = %self.store().display(), "activated");
                 opened
@@ -541,6 +602,26 @@ impl StrataVolume {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(opened.operations);
         reply.call(Retained::as_ptr(&result).cast_mut(), null_mut());
+    }
+
+    // grant records and returns the most the kernel may cache of an item's contents in the mode it asked for:
+    // writes cached and written back later when it reads and writes.
+    fn grant(&self, item: &FSItem, cache_mode: FSDataCacheMode) -> FSKernelCacheCoherencyType {
+        let coherency = match cache_mode {
+            FSDataCacheMode::ReadWriteWithCache => FSKernelCacheCoherencyType::WriteBack,
+            FSDataCacheMode::ReadWithCache => FSKernelCacheCoherencyType::ReadCache,
+            _ => FSKernelCacheCoherencyType::NoCache,
+        };
+        if let Some(operations) = self.active_operations() {
+            operations.items().grant(
+                *StrataItem::of(item).inode(),
+                Granted {
+                    mode: cache_mode,
+                    coherency,
+                },
+            );
+        }
+        coherency
     }
 
     // active_operations are the volume's operations, until deactivate drops them and the engine with them.
@@ -581,6 +662,51 @@ fn activate_errno(error: &ActivateError) -> libc::c_int {
 // store_name is the name of the store directory, or its whole path when it has none, such as /.
 pub(crate) fn store_name(store: &Path) -> &OsStr {
     store.file_name().unwrap_or(store.as_os_str())
+}
+
+// FsKitCache is the kernel's cache of a volume's items, reached through the volume FSKit mounted.
+#[derive(Clone)]
+pub struct FsKitCache(Retained<StrataVolume>);
+
+// SAFETY: setCacheState is the only call made through it, and FSKit takes it on any thread, as it calls the volume
+// itself on threads of its choosing.
+unsafe impl Send for FsKitCache {}
+// SAFETY: as for Send.
+unsafe impl Sync for FsKitCache {}
+
+// The kernel calls into the volume while it invalidates, so invalidating waits on a thread of its own.
+impl KernelCache for FsKitCache {
+    fn invalidate(&self, inode: Inode) -> BoxFuture<'static, ()> {
+        let cache = self.clone();
+        Box::pin(ThreadPool.spawn_blocking(move || cache.invalidate_now(inode)))
+    }
+}
+
+impl FsKitCache {
+    // invalidate_now writes out the item's unwritten contents and drops everything the kernel caches for it,
+    // keeping the caching granted for its contents. It waits for the kernel, so it runs with no lock held.
+    fn invalidate_now(&self, inode: Inode) {
+        let Some((item, granted)) = self
+            .0
+            .active_operations()
+            .and_then(|operations| operations.items().item_to_invalidate(inode))
+        else {
+            return;
+        };
+        // SAFETY: the item is one the kernel was handed, and the grant is one the kernel was given.
+        let failed = unsafe {
+            self.0
+                .setCacheStateForItem_cacheMode_coherencyType_coherencyAction(
+                    &item,
+                    granted.mode,
+                    granted.coherency,
+                    FSKernelCacheCoherencyAction::PushInvalidate,
+                )
+        };
+        if let Some(error) = failed {
+            tracing::warn!(inode = inode.0, code = error.code(), description = %error.localizedDescription(), "invalidating the kernel's copy failed");
+        }
+    }
 }
 
 // StoreAccess is the sandbox's access to the store directory FSKit handed the extension, which lasts until

@@ -12,6 +12,7 @@ use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 use crate::annotations::error::{
     GetAnnotationError, ListAnnotationsError, RemoveAnnotationError, SetAnnotationError,
 };
+use crate::attributes::Attributes;
 use crate::error::{IoFailure, refused_or_failed};
 use crate::key::{FsKey, annotation_name, annotations_in};
 use crate::spillable::{SpillableContent, SpillableValue};
@@ -119,14 +120,16 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
 impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sync, S: FsConfig>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
+    // set_annotation returns the item's attributes after the change.
     pub fn set_annotation(
         &mut self,
         inode: Inode,
         key: AnnotationKey<'_>,
         value: impl Buf + Send,
         mode: SetAnnotationMode,
-    ) -> impl Future<Output = Result<(), SetAnnotationError<T::Failure, T::Rejection, C::Failure>>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<Attributes, SetAnnotationError<T::Failure, T::Rejection, C::Failure>>,
+    > + Send {
         async move {
             if key.name().is_empty() {
                 return Err(SetAnnotationError::InvalidInput);
@@ -160,16 +163,17 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 .map_err(refused_or_failed)?;
             attributes.record_change(self.now());
             self.write_attributes(inode, &attributes)?;
-            Ok(())
+            Ok(attributes)
         }
     }
 
+    // remove_annotation returns the item's attributes after the change.
     pub fn remove_annotation(
         &mut self,
         inode: Inode,
         key: AnnotationKey<'_>,
     ) -> impl Future<
-        Output = Result<(), RemoveAnnotationError<T::Failure, T::Rejection, C::Failure>>,
+        Output = Result<Attributes, RemoveAnnotationError<T::Failure, T::Rejection, C::Failure>>,
     > + Send {
         async move {
             if key.name().is_empty() {
@@ -191,7 +195,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             self.metadata.clear(key).map_err(IoFailure::Metadata)?;
             attributes.record_change(self.now());
             self.write_attributes(inode, &attributes)?;
-            Ok(())
+            Ok(attributes)
         }
     }
 }

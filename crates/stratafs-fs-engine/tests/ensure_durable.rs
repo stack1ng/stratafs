@@ -2,16 +2,28 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
 use futures_lite::future::block_on;
+use futures_util::task::{FutureObj, Spawn, SpawnError};
 use object_store::memory::InMemory;
 use redb::Database;
 use redb::backends::InMemoryBackend;
-use stratafs_fs_engine::{Consistency, FsConfig, FsEngine, Timestamp};
+use stratafs_fs_engine::observation::NoKernel;
+use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Timestamp};
 use stratafs_lock_synchronized::{LockSynchronizedMetadata, LockSynchronizedStore};
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::spawn::Inline;
 use stratafs_store::store::Store;
+
+// ThreadSpawner runs each task on a thread of its own.
+struct ThreadSpawner;
+
+impl Spawn for ThreadSpawner {
+    fn spawn_obj(&self, task: FutureObj<'static, ()>) -> Result<(), SpawnError> {
+        std::thread::spawn(move || block_on(task));
+        Ok(())
+    }
+}
 
 type Log = Arc<Mutex<Vec<DurableAgainst>>>;
 
@@ -62,12 +74,14 @@ fn durable_against(durability_limit: Option<DurableAgainst>) -> Vec<DurableAgain
     };
     let allocate_inode: fn() -> u64 = || 7;
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
-    let engine: FsEngine<_, _, _, TestConfig> = block_on(FsEngine::new(
+    let engine: FsEngine<_, _, _, TestConfig, _> = block_on(FsEngine::new(
         store,
         allocate_inode,
         now,
         durability_limit,
-        Consistency::Eventual,
+        Eventual,
+        NoKernel,
+        ThreadSpawner,
     ))
     .unwrap();
     for against in [

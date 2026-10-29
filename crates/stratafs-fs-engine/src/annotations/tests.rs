@@ -48,7 +48,7 @@ fn set_annotation(
     key: AnnotationKey<'_>,
     value: &[u8],
     mode: SetAnnotationMode,
-) -> Result<(), SetAnnotationError<MetadataFailure, Infallible, ObjectStoreError>> {
+) -> Result<Attributes, SetAnnotationError<MetadataFailure, Infallible, ObjectStoreError>> {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
             let result = txn.set_annotation(inode, key, value, mode).await;
@@ -62,7 +62,7 @@ fn remove_annotation(
     engine: &InMemoryEngine,
     inode: Inode,
     key: AnnotationKey<'_>,
-) -> Result<(), RemoveAnnotationError<MetadataFailure, Infallible, ObjectStoreError>> {
+) -> Result<Attributes, RemoveAnnotationError<MetadataFailure, Infallible, ObjectStoreError>> {
     block_on(engine.transact(|mut txn| {
         Box::pin(async move {
             let result = txn.remove_annotation(inode, key).await;
@@ -325,7 +325,7 @@ fn remove_annotation_removes_the_key_and_records_the_change() {
     )
     .unwrap();
     set_clock(9);
-    remove_annotation(&engine, Inode::ROOT, macos(b"a")).unwrap();
+    let removed = remove_annotation(&engine, Inode::ROOT, macos(b"a")).unwrap();
     assert_eq!(
         get_annotation(&engine, Inode::ROOT, macos(b"a")).unwrap(),
         None
@@ -341,6 +341,7 @@ fn remove_annotation_removes_the_key_and_records_the_change() {
     let attributes = getattr(&engine, Inode::ROOT).unwrap();
     assert_eq!(attributes.attribute_changed_at, Timestamp(9));
     assert_eq!(attributes.change_version, 3);
+    assert_eq!(removed, attributes);
     assert!(matches!(
         remove_annotation(&engine, Inode::ROOT, macos(b"a")),
         Err(RemoveAnnotationError::AttributeNotFound)
