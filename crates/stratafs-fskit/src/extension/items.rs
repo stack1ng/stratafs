@@ -114,9 +114,10 @@ impl Items {
         }
     }
 
-    // reclaim lets go of item, unless FSKit handed it out again since asking for the reclaim. The inode's
-    // lock is held throughout, so no lookup can hand the item out meanwhile, as FSItem's tryReclaim requires.
-    pub(crate) fn reclaim(&self, item: &StrataItem) {
+    // reclaim lets go of item, unless FSKit handed it out again since asking for the reclaim, and says whether
+    // the item it let go of has no name, by the newest attributes handed out for it. The inode's lock is held
+    // throughout, so no lookup can hand the item out meanwhile, as FSItem's tryReclaim requires.
+    pub(crate) fn reclaim(&self, item: &StrataItem) -> bool {
         let inode = *item.inode();
         let Some(slot) = self
             .slots
@@ -125,7 +126,7 @@ impl Items {
             .get(&inode)
             .cloned()
         else {
-            return;
+            return false;
         };
         let mut locked = slot.lock().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: the reclaim block is a plain block, and the inode's lock keeps lookups out.
@@ -137,6 +138,11 @@ impl Items {
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&inode);
         }
+        reclaimed
+            && locked
+                .newest
+                .as_ref()
+                .is_some_and(|newest| newest.hard_link_count == 0)
     }
 }
 

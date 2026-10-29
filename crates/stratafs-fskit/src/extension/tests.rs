@@ -14,8 +14,9 @@ use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_fs_kit::{
     FSActivateResult, FSContext, FSCreateItemResult, FSDeactivateOptions, FSGenericURLResource,
     FSGetAttributesResult, FSItemAttribute, FSItemGetAttributesRequest, FSItemID,
-    FSItemSetAttributesRequest, FSItemType, FSPathURLResource, FSResource, FSSetAttributesResult,
-    FSSyncFlags, FSTaskOptions, FSUnaryFileSystemOperations, FSVolume, FSVolumeHandler,
+    FSItemSetAttributesRequest, FSItemType, FSPathURLResource, FSRemoveItemResult, FSResource,
+    FSSetAttributesResult, FSSyncFlags, FSTaskOptions, FSUnaryFileSystemOperations, FSVolume,
+    FSVolumeHandler,
 };
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
@@ -625,4 +626,40 @@ fn synchronize_replies_at_once() {
         unsafe { strata_volume(&volume).synchronizeWithFlags_replyHandler(flags, &reply) };
         assert_eq!(received.try_recv(), Ok(true), "{}", flags.0);
     }
+}
+
+// FSKit's tryReclaim refuses an item it did not hand out itself, so the deletion on reclaim is left to a mounted
+// volume.
+#[test]
+fn a_removed_file_still_answers() {
+    let volume = mounted("ab06");
+    // SAFETY: the request is a plain value object.
+    let plain = unsafe { FSItemSetAttributesRequest::new() };
+    let created = create_file(&volume, Inode::ROOT, b"f", &plain);
+    assert_eq!(
+        created.recv_timeout(Duration::from_secs(10)).unwrap(),
+        Ok(())
+    );
+    // The test engine numbers every new inode 7.
+    let file = Inode(7);
+    let (reply, removed) = reply::<FSRemoveItemResult>();
+    // SAFETY: the items, name, context and reply are all valid for the call.
+    unsafe {
+        strata_volume(&volume).removeItem_named_fromDirectory_context_replyHandler(
+            &StrataItem::new(file, FileType::File),
+            &file_name(b"f"),
+            &StrataItem::new(Inode::ROOT, FileType::Directory),
+            &context(),
+            &reply,
+        );
+    }
+    assert_eq!(
+        removed.recv_timeout(Duration::from_secs(10)).unwrap(),
+        Ok(())
+    );
+    let attributes = get_attributes(&volume, file);
+    assert_eq!(
+        attributes.recv_timeout(Duration::from_secs(10)).unwrap(),
+        Ok(())
+    );
 }

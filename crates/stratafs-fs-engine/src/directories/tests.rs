@@ -137,6 +137,16 @@ fn rename(
     .map_err(aborted)
 }
 
+fn delete_if_unlinked(engine: &InMemoryEngine, inode: Inode) {
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.delete_if_unlinked(inode).await;
+            result.map(|()| ((), txn))
+        })
+    }))
+    .unwrap();
+}
+
 fn read_symbolic_link(
     engine: &InMemoryEngine,
     inode: Inode,
@@ -417,7 +427,7 @@ fn hard_link_refuses_directories_existing_names_and_missing_inodes() {
 }
 
 #[test]
-fn hard_unlinking_the_last_name_deletes_the_inode_and_all_its_keys() {
+fn hard_unlinking_the_last_name_keeps_the_inode_until_it_is_deleted_if_unlinked() {
     let engine = new_test_engine();
     let a = file(&engine, Inode::ROOT, b"a");
     block_on(engine.transact(|mut txn| {
@@ -437,9 +447,61 @@ fn hard_unlinking_the_last_name_deletes_the_inode_and_all_its_keys() {
     let change = hard_unlink(&engine, Inode::ROOT, b"a", None).unwrap();
     assert_eq!(change.item.hard_link_count, 0);
     assert_eq!(named(&engine, Inode::ROOT, b"a"), None);
+    assert_eq!(getattr(&engine, a), Some(change.item));
+    assert_eq!(getattr(&engine, Inode::ROOT).unwrap(), change.parent);
+    delete_if_unlinked(&engine, a);
     assert_eq!(getattr(&engine, a), None);
     assert_eq!(stored_keys_of(&engine, a), 0);
-    assert_eq!(getattr(&engine, Inode::ROOT).unwrap(), change.parent);
+}
+
+#[test]
+fn an_unlinked_file_can_still_be_written() {
+    let engine = new_test_engine();
+    let a = file(&engine, Inode::ROOT, b"a");
+    hard_unlink(&engine, Inode::ROOT, b"a", None).unwrap();
+    block_on(engine.transact(|mut txn| {
+        Box::pin(async move {
+            let result = txn.write(a, 0, Bytes::from_static(b"kept")).await;
+            result.map(|result| (result, txn))
+        })
+    }))
+    .unwrap();
+    assert_eq!(getattr(&engine, a).unwrap().settable.size, 4);
+}
+
+#[test]
+fn deleting_if_unlinked_keeps_an_inode_that_has_a_name() {
+    let engine = new_test_engine();
+    let a = file(&engine, Inode::ROOT, b"a");
+    delete_if_unlinked(&engine, a);
+    assert_eq!(getattr(&engine, a).unwrap().hard_link_count, 1);
+    assert_eq!(named(&engine, Inode::ROOT, b"a"), Some(a));
+}
+
+#[test]
+fn a_removed_directory_and_an_unlinked_file_take_no_new_names() {
+    let engine = new_test_engine();
+    let d = directory(&engine, Inode::ROOT, b"d");
+    let f = file(&engine, Inode::ROOT, b"f");
+    let unlinked = file(&engine, Inode::ROOT, b"unlinked");
+    rmdir(&engine, Inode::ROOT, b"d").unwrap();
+    hard_unlink(&engine, Inode::ROOT, b"unlinked", None).unwrap();
+    assert!(matches!(
+        create(&engine, d, b"x", NewItem::File),
+        Err(CreateError::NotFound)
+    ));
+    assert!(matches!(
+        hard_link(&engine, f, d, b"x"),
+        Err(HardLinkError::NotFound)
+    ));
+    assert!(matches!(
+        rename(&engine, Inode::ROOT, b"f", d, b"x", RenameMode::Replace),
+        Err(RenameError::NotFound)
+    ));
+    assert!(matches!(
+        hard_link(&engine, unlinked, Inode::ROOT, b"again"),
+        Err(HardLinkError::NotFound)
+    ));
 }
 
 #[test]
@@ -521,9 +583,11 @@ fn rmdir_removes_an_empty_directory_and_its_hard_link_to_the_parent() {
     let d = directory(&engine, Inode::ROOT, b"d");
     let change = rmdir(&engine, Inode::ROOT, b"d").unwrap();
     assert_eq!(change.parent.hard_link_count, 2);
+    assert_eq!(getattr(&engine, d), Some(change.item));
+    assert_eq!(named(&engine, Inode::ROOT, b"d"), None);
+    delete_if_unlinked(&engine, d);
     assert_eq!(getattr(&engine, d), None);
     assert_eq!(stored_keys_of(&engine, d), 0);
-    assert_eq!(named(&engine, Inode::ROOT, b"d"), None);
 }
 
 #[test]
@@ -632,7 +696,7 @@ fn replacing_a_file_releases_its_name() {
     let (replaced, attributes) = change.replaced.unwrap();
     assert_eq!(replaced, b);
     assert_eq!(attributes.hard_link_count, 0);
-    assert_eq!(getattr(&engine, b), None);
+    assert_eq!(getattr(&engine, b), Some(attributes));
     assert_eq!(named(&engine, Inode::ROOT, b"b"), Some(a));
     let change = rename(
         &engine,

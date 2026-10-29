@@ -160,6 +160,10 @@ pub(crate) trait VolumeOperations: Send + Sync {
     );
 
     fn list_xattrs(self: Arc<Self>, inode: Inode, reply: Reply<FSListXattrsResult>);
+
+    // delete_if_unlinked deletes inode, which FSKit no longer holds, if no name refers to it. Nothing waits on it,
+    // so it logs a failure.
+    fn delete_if_unlinked(self: Arc<Self>, inode: Inode);
 }
 
 // Volume is a mounted volume's engine. Each operation replies when it finishes, on FSKit's thread unless it
@@ -971,6 +975,23 @@ where
                     })
                 }
                 Err(error) => fail(&reply, failed(error)),
+            }
+        });
+    }
+
+    fn delete_if_unlinked(self: Arc<Self>, inode: Inode) {
+        self.run(move |volume| async move {
+            let deleted = volume
+                .engine
+                .transact(|mut transaction| {
+                    Box::pin(async move {
+                        let result = transaction.delete_if_unlinked(inode).await;
+                        result.map(|()| ((), transaction))
+                    })
+                })
+                .await;
+            if let Err(error) = deleted {
+                tracing::warn!(inode = inode.0, %error, "deleting an item with no name failed");
             }
         });
     }

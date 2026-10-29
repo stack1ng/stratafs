@@ -36,6 +36,8 @@ pub enum CreateError<M, R, C> {
     StaleFileHandle,
     #[error("ENOTDIR: Not a directory")]
     NotADirectory,
+    #[error("ENOENT: No such file or directory")]
+    NotFound,
     #[error("EPERM: Operation not permitted")]
     OperationNotPermitted,
     #[error("EEXIST: File exists")]
@@ -60,6 +62,8 @@ pub enum HardLinkError<M, R, C> {
     StaleFileHandle,
     #[error("ENOTDIR: Not a directory")]
     NotADirectory,
+    #[error("ENOENT: No such file or directory")]
+    NotFound,
     #[error("EPERM: Operation not permitted")]
     OperationNotPermitted,
     #[error("EEXIST: File exists")]
@@ -222,6 +226,7 @@ impl<M, R, C> From<&CreateError<M, R, C>> for PosixError {
             CreateError::FileNameTooLong => PosixError::ENAMETOOLONG,
             CreateError::StaleFileHandle => PosixError::ESTALE,
             CreateError::NotADirectory => PosixError::ENOTDIR,
+            CreateError::NotFound => PosixError::ENOENT,
             CreateError::OperationNotPermitted => PosixError::EPERM,
             CreateError::AlreadyExists => PosixError::EEXIST,
             CreateError::TooManyLinks => PosixError::EMLINK,
@@ -238,6 +243,7 @@ impl<M, R, C> From<&HardLinkError<M, R, C>> for PosixError {
             HardLinkError::FileNameTooLong => PosixError::ENAMETOOLONG,
             HardLinkError::StaleFileHandle => PosixError::ESTALE,
             HardLinkError::NotADirectory => PosixError::ENOTDIR,
+            HardLinkError::NotFound => PosixError::ENOENT,
             HardLinkError::OperationNotPermitted => PosixError::EPERM,
             HardLinkError::AlreadyExists => PosixError::EEXIST,
             HardLinkError::TooManyLinks => PosixError::EMLINK,

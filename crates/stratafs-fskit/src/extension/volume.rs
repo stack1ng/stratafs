@@ -153,12 +153,18 @@ define_class!(
             reply.call(null_mut());
         }
 
+        // reclaim lets go of an item FSKit no longer holds, then deletes it if it has no name, as FSKit asks of a
+        // removed item. It replies before the deletion, which the call that let go of the item has no need to wait on.
         #[unsafe(method(reclaimItem:replyHandler:))]
         fn reclaim(&self, item: &FSItem, reply: &SendableBlock<'static, fn(*mut NSError)>) {
-            if let Some(operations) = self.active_operations() {
-                operations.items().reclaim(StrataItem::of(item));
-            }
+            let item = StrataItem::of(item);
+            let unlinked = self
+                .active_operations()
+                .filter(|operations| operations.items().reclaim(item));
             reply.call(null_mut());
+            if let Some(operations) = unlinked {
+                operations.delete_if_unlinked(*item.inode());
+            }
         }
 
         // activate opens the volume mount's options name, and hands FSKit its root directory.

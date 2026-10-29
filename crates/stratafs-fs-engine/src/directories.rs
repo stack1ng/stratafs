@@ -348,6 +348,8 @@ where
         }
     }
 
+    // release_name removes one of inode's names. An inode left with no name stays until delete_if_unlinked, so
+    // whoever still holds it keeps using it.
     fn release_name(
         &mut self,
         dir: Inode,
@@ -355,7 +357,7 @@ where
         inode: Inode,
         item: &mut Attributes,
         now: Timestamp,
-    ) -> impl Future<Output = Result<bool, IoFailure<T::Failure, C::Failure>>> + Send {
+    ) -> impl Future<Output = Result<(), IoFailure<T::Failure, C::Failure>>> + Send {
         async move {
             self.remove_name(dir, position, inode, item.kind)
                 .map_err(IoFailure::Metadata)?;
@@ -369,13 +371,7 @@ where
                         .ok_or(IoFailure::Corrupt(CorruptValue::UncountedHardLink))?
                 }
             }
-            if item.hard_link_count == 0 {
-                self.delete_inode(inode)
-                    .await
-                    .map_err(IoFailure::Metadata)?;
-                return Ok(true);
-            }
-            if item.parent == dir {
+            if item.hard_link_count > 0 && item.parent == dir {
                 let mut remaining = self
                     .metadata
                     .get_range(hard_links_of(inode), 1)
@@ -385,7 +381,7 @@ where
                     item.parent = hard_link_directory(&key).map_err(IoFailure::Corrupt)?;
                 }
             }
-            Ok(false)
+            Ok(())
         }
     }
 
@@ -428,6 +424,9 @@ where
                 CreateError::StaleFileHandle,
                 CreateError::NotADirectory,
             )?;
+            if directory.hard_link_count == 0 {
+                return Err(CreateError::NotFound);
+            }
             let position = match search? {
                 NameSearch::Found(_) => return Err(CreateError::AlreadyExists),
                 NameSearch::Full => return Err(CreateError::StorageFull),
@@ -516,6 +515,9 @@ where
                 HardLinkError::StaleFileHandle,
                 HardLinkError::NotADirectory,
             )?;
+            if item.hard_link_count == 0 || directory.hard_link_count == 0 {
+                return Err(HardLinkError::NotFound);
+            }
             let position = match search? {
                 NameSearch::Found(_) => return Err(HardLinkError::AlreadyExists),
                 NameSearch::Full => None,
@@ -586,12 +588,9 @@ where
                 return Err(HardUnlinkError::OperationNotPermitted);
             }
             let now = self.now();
-            if !self
-                .release_name(dir, entry.position, entry.inode, &mut item, now)
-                .await?
-            {
-                self.write_attributes(entry.inode, &item)?;
-            }
+            self.release_name(dir, entry.position, entry.inode, &mut item, now)
+                .await?;
+            self.write_attributes(entry.inode, &item)?;
             self.write_entry_change(dir, &mut directory, now)?;
             Ok(EntryChange {
                 inode: entry.inode,
@@ -642,6 +641,7 @@ where
             let now = self.now();
             self.release_name(dir, entry.position, entry.inode, &mut item, now)
                 .await?;
+            self.write_attributes(entry.inode, &item)?;
             directory.hard_link_count = directory
                 .hard_link_count
                 .checked_sub(1)
@@ -694,6 +694,9 @@ where
                 RenameError::StaleFileHandle,
                 RenameError::NotADirectory,
             )?;
+            if to.hard_link_count == 0 {
+                return Err(RenameError::NotFound);
+            }
             let NameSearch::Found(source) = source? else {
                 return Err(RenameError::NotFound);
             };
@@ -826,12 +829,9 @@ where
                     }
                     self.remove_name(dir, source.position, source.inode, item.kind)
                         .map_err(IoFailure::Metadata)?;
-                    if !self
-                        .release_name(new_dir, target.position, target.inode, &mut replaced, now)
-                        .await?
-                    {
-                        self.write_attributes(target.inode, &replaced)?;
-                    }
+                    self.release_name(new_dir, target.position, target.inode, &mut replaced, now)
+                        .await?;
+                    self.write_attributes(target.inode, &replaced)?;
                     Some((target.inode, replaced, target.position))
                 }
             };
@@ -873,6 +873,25 @@ where
                 to,
                 replaced,
             })
+        }
+    }
+
+    // delete_if_unlinked deletes inode if no name refers to it. Its holder calls it on letting go of it.
+    pub fn delete_if_unlinked(
+        &mut self,
+        inode: Inode,
+    ) -> impl Future<Output = Result<(), IoFailure<T::Failure, C::Failure>>> + Send {
+        async move {
+            if self
+                .getattr(inode)
+                .await?
+                .is_some_and(|item| item.hard_link_count == 0)
+            {
+                self.delete_inode(inode)
+                    .await
+                    .map_err(IoFailure::Metadata)?;
+            }
+            Ok(())
         }
     }
 }
