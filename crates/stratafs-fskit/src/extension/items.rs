@@ -26,7 +26,7 @@ pub(crate) struct Items {
 #[derive(Default)]
 struct ItemState {
     // item is the inode's one StrataItem, made the first time FSKit is handed the item. A directory listing hands
-    // FSKit only an entry's attributes, so an inode can have a state and no item yet.
+    // FSKit only an entry's attributes, so its state has no item until the listing's reply is done.
     item: Option<Retained<StrataItem>>,
     newest: Option<Attributes>,
     // retired marks a state that reclaim took out of the map. An operation that reached it first starts over.
@@ -51,7 +51,8 @@ pub(crate) struct Locked<'a> {
 impl Items {
     // reply locks every inode in reads, in inode order so operations never wait on each other in a cycle,
     // keeps each read that is newer than the newest attributes already handed out, and calls reply while
-    // the locks are held.
+    // the locks are held. A state left with no item afterwards is one a directory listing only handed FSKit the
+    // attributes of, which the kernel keeps nothing of, so it goes, and an operation waiting on it starts over.
     pub(crate) fn reply<R>(
         &self,
         reads: impl IntoIterator<Item = (Inode, Attributes)>,
@@ -103,7 +104,15 @@ impl Items {
                     state.newest = Some(read);
                 }
             }
-            return reply(&mut locked);
+            let replied = reply(&mut locked);
+            let mut map = self.states.lock().unwrap_or_else(PoisonError::into_inner);
+            for (inode, state) in &mut locked.states {
+                if state.item.is_none() {
+                    state.retired = true;
+                    map.remove(&Inode(*inode));
+                }
+            }
+            return replied;
         }
     }
 
@@ -212,3 +221,6 @@ impl Locked<'_> {
             .clone()
     }
 }
+
+#[cfg(test)]
+mod tests;
