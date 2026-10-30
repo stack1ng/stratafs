@@ -1,0 +1,15 @@
+# Deploys the coordinator: one Durable Object per volume, reached at /volume/<name>.
+name = "stratafs-websocket-pubsub"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[[durable_objects.bindings]]
+name = "COORDINATOR"
+class_name = "VolumeCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VolumeCoordinator"]

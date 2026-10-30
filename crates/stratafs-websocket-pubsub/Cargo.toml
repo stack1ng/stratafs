@@ -1,0 +1,27 @@
+[package]
+name = "stratafs-websocket-pubsub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# client is the native client mounts connect to a coordinator with.
+client = [
+    "dep:futures-util",
+    "dep:stratafs-serialized",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:zerocopy",
+]
+
+[dependencies]
+futures-util = { workspace = true, optional = true, features = ["sink"] }
+stratafs-serialized = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, optional = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { workspace = true, optional = true }
+zerocopy = { workspace = true, optional = true }
+
+[lints]
+workspace = true

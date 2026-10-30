@@ -1,0 +1,21 @@
+[package]
+name = "stratafs-websocket-pubsub-durable-object"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+# It runs only on Cloudflare, as WebAssembly, so on any other target the crate is empty.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
+stratafs-websocket-pubsub.workspace = true
+# The durable_object macro expands to wasm-bindgen code that names the crate directly.
+wasm-bindgen.workspace = true
+worker.workspace = true
+
+[lints]
+workspace = true

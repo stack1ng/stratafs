@@ -1,0 +1,21 @@
+[package]
+name = "stratafs-websocket-pubsub-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+futures-util = { workspace = true, features = ["sink"] }
+stratafs-websocket-pubsub.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+stratafs-websocket-pubsub = { workspace = true, features = ["client"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite.workspace = true
+
+[lints]
+workspace = true

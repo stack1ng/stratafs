@@ -85,9 +85,10 @@ pub trait Cached<St: Store>: Consistency {
     ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 }
 
-// StrongCached serves reads from a cache, which forces any write to verify that all other
-// StrongCached clients have been invalidated before it can return.
-pub struct StrongCached;
+// StrongUntilDisconnectCached serves reads from a cache, which forces any write to verify that all other
+// StrongUntilDisconnectCached clients have been invalidated before it can return. A client that disconnects
+// may miss writes until it notices and fails.
+pub struct StrongUntilDisconnectCached;
 
 // StrongUncached reads everything from the store, without any caching.
 pub struct StrongUncached;
@@ -95,7 +96,7 @@ pub struct StrongUncached;
 // Eventual serves reads from a cache that may lag behind other clients' writes.
 pub struct Eventual;
 
-impl Consistency for StrongCached {}
+impl Consistency for StrongUntilDisconnectCached {}
 impl Consistency for StrongUncached {}
 impl Consistency for Eventual {}
 
