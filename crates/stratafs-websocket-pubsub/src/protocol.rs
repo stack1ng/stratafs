@@ -1,9 +1,9 @@
 // The frames a client and a coordinator exchange, each one binary WebSocket message: a tag byte, then little endian
 // integers, then any message bytes. Pings are the text messages PING and PONG, which hosts answer themselves.
 
-// Key is what a subscription and a publish are about: an inode within the volume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Key(pub u64);
+use std::time::Duration;
+
+pub use stratafs_pubsub::Key;
 
 // ConnectionId names one connection to a coordinator for as long as it is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -11,6 +11,11 @@ pub struct ConnectionId(pub u64);
 
 pub const PING: &str = "ping";
 pub const PONG: &str = "pong";
+
+// A client pings every PING_EVERY. Either side counts the other gone once it has heard nothing from it for SILENT,
+// two pings, since a connection the network drops does not close.
+pub const PING_EVERY: Duration = Duration::from_secs(1);
+pub const SILENT: Duration = Duration::from_secs(2);
 
 // ClientFrame is a frame a client sends. A publish is named by its publisher's connection and the request number
 // the publisher gave it.
@@ -34,7 +39,6 @@ pub enum ClientFrame<'a> {
     // TimedOut gives up on a publish, and the holders that have not acknowledged it are disconnected.
     TimedOut {
         request: u64,
-        key: Key,
     },
 }
 
@@ -75,7 +79,7 @@ impl ClientFrame<'_> {
             ClientFrame::Acknowledge { publisher, request } => {
                 frame(4, &[publisher.0, request], &[])
             }
-            ClientFrame::TimedOut { request, key } => frame(5, &[request, key.0], &[]),
+            ClientFrame::TimedOut { request } => frame(5, &[request], &[]),
         }
     }
 }
@@ -102,7 +106,6 @@ impl<'a> ClientFrame<'a> {
             },
             5 => ClientFrame::TimedOut {
                 request: reader.integer()?,
-                key: Key(reader.integer()?),
             },
             _ => return Err(MalformedFrame),
         };

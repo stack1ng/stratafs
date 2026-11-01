@@ -20,10 +20,7 @@ fn every_client_frame_decodes_to_itself() {
             publisher: ConnectionId(4),
             request: 5,
         },
-        ClientFrame::TimedOut {
-            request: 6,
-            key: Key(7),
-        },
+        ClientFrame::TimedOut { request: 6 },
     ] {
         assert_eq!(ClientFrame::decode(&frame.encode()).unwrap(), frame);
     }

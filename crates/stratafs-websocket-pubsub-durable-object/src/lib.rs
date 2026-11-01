@@ -8,10 +8,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use stratafs_websocket_pubsub::coordinator::{Coordinator, Sockets};
-use stratafs_websocket_pubsub::protocol::{ConnectionId, PING, PONG};
+use stratafs_websocket_pubsub::protocol::{ConnectionId, PING, PONG, SILENT};
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::wasm_bindgen;
 use worker::{
     Context, DurableObject, Env, Request, Response, Result, State, WebSocket,
-    WebSocketIncomingMessage, WebSocketPair, durable_object, event,
+    WebSocketIncomingMessage, WebSocketPair, durable_object, event, js_sys, web_sys,
 };
 
 use membership::{StoredMembership, next_connection};
@@ -171,4 +173,27 @@ impl Sockets for Connections<'_> {
     fn close(&self, connection: ConnectionId) {
         self.closing.borrow_mut().push(connection);
     }
+
+    // A connection Cloudflare has answered no ping on for SILENT is gone. One with no answered ping yet has only
+    // just opened.
+    fn silent(&self, connection: ConnectionId) -> bool {
+        self.state
+            .get_websockets_with_tag(&connection.0.to_string())
+            .first()
+            .and_then(|socket| {
+                let state: &RawState = self.state.as_raw().unchecked_ref();
+                state.last_pong(socket.as_ref())
+            })
+            .is_some_and(|pong| js_sys::Date::now() - pong.get_time() > SILENT.as_millis() as f64)
+    }
+}
+
+#[wasm_bindgen]
+extern "C" {
+    // RawState is a Durable Object's state as JavaScript has it, for what workers-rs does not wrap.
+    type RawState;
+
+    // last_pong is when Cloudflare last answered a ping on socket, if it has.
+    #[wasm_bindgen(method, js_name = getWebSocketAutoResponseTimestamp)]
+    fn last_pong(this: &RawState, socket: &web_sys::WebSocket) -> Option<js_sys::Date>;
 }

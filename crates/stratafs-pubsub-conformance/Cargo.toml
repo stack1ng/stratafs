@@ -1,0 +1,16 @@
+[package]
+name = "stratafs-pubsub-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+rand.workspace = true
+stratafs-pubsub.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

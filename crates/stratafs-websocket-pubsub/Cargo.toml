@@ -17,11 +17,15 @@ client = [
 
 [dependencies]
 futures-util = { workspace = true, optional = true, features = ["sink"] }
+stratafs-pubsub.workspace = true
 stratafs-serialized = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = { workspace = true, optional = true }
 zerocopy = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

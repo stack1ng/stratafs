@@ -11,6 +11,9 @@ pub trait Sockets {
 
     // close closes connection, and the host then calls closed for it.
     fn close(&self, connection: ConnectionId);
+
+    // silent says whether connection has sent nothing for SILENT, so it is gone though it has not closed.
+    fn silent(&self, connection: ConnectionId) -> bool;
 }
 
 // Membership is the coordinator's state that has to outlive the coordinator itself: which connections hold each key,
@@ -68,19 +71,25 @@ impl<M: Membership> Coordinator<M> {
                 self.membership.release(key, connection);
                 self.forget_holder(connection, |pending| pending.key == key, sockets);
             }
-            // A publish goes to every holder of its key but its publisher, which made the change itself.
+            // A publish goes to every holder of its key but its publisher, which made the change itself, and a holder
+            // that has gone silent, which is closed instead.
             ClientFrame::Publish {
                 request,
                 key,
                 message,
             } => {
                 self.membership.set_last(key, message);
-                let missing: HashSet<ConnectionId> = self
-                    .membership
-                    .holders(key)
-                    .into_iter()
-                    .filter(|holder| *holder != connection)
-                    .collect();
+                let mut missing = HashSet::new();
+                for holder in self.membership.holders(key) {
+                    if holder == connection {
+                        continue;
+                    }
+                    if sockets.silent(holder) {
+                        sockets.close(holder);
+                    } else {
+                        missing.insert(holder);
+                    }
+                }
                 if missing.is_empty() {
                     sockets.send(connection, &ServerFrame::Done { request }.encode());
                     return;
@@ -108,21 +117,13 @@ impl<M: Membership> Coordinator<M> {
                     sockets.send(publisher, &ServerFrame::Done { request }.encode());
                 }
             }
-            // A publish the coordinator no longer has, such as one hibernation lost, closes every other holder of
-            // its key, since any of them may not have handled it.
-            ClientFrame::TimedOut { request, key } => {
-                let unanswered: Vec<ConnectionId> =
-                    match self.pending.remove(&(connection, request)) {
-                        Some(pending) => pending.missing.into_iter().collect(),
-                        None => self
-                            .membership
-                            .holders(key)
-                            .into_iter()
-                            .filter(|holder| *holder != connection)
-                            .collect(),
-                    };
-                for holder in unanswered {
-                    sockets.close(holder);
+            // A publish that times out is not made, so its holders need closing only so they hold up no later
+            // publish. One the coordinator no longer has, being done or lost to hibernation, closes no one.
+            ClientFrame::TimedOut { request } => {
+                if let Some(pending) = self.pending.remove(&(connection, request)) {
+                    for holder in pending.missing {
+                        sockets.close(holder);
+                    }
                 }
             }
         }

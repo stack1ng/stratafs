@@ -13,9 +13,10 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "syn
 tokio-tungstenite.workspace = true
 
 [dev-dependencies]
+stratafs-pubsub.workspace = true
+stratafs-pubsub-conformance.workspace = true
 stratafs-websocket-pubsub = { workspace = true, features = ["client"] }
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

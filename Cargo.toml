@@ -57,6 +57,8 @@ stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
 stratafs-lock-synchronized = { path = "crates/stratafs-lock-synchronized" }
 stratafs-mdbx = { path = "crates/stratafs-mdbx" }
 stratafs-object-store = { path = "crates/stratafs-object-store" }
+stratafs-pubsub = { path = "crates/stratafs-pubsub" }
+stratafs-pubsub-conformance = { path = "crates/stratafs-pubsub-conformance" }
 stratafs-range-bounds-map = { path = "crates/stratafs-range-bounds-map" }
 stratafs-redb = { path = "crates/stratafs-redb" }
 stratafs-serialized = { path = "crates/stratafs-serialized" }

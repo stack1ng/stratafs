@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use stratafs_websocket_pubsub::coordinator::{Coordinator, MemoryMembership, Sockets};
-use stratafs_websocket_pubsub::protocol::{ConnectionId, PING, PONG};
+use stratafs_websocket_pubsub::protocol::{ConnectionId, PING, PONG, SILENT};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
@@ -61,7 +61,9 @@ async fn connect(stream: TcpStream, connection: ConnectionId, volumes: Volumes) 
         return;
     }
     let mut volume = None;
-    let accepted =
+    // A connection that does not finish its handshake within SILENT is gone too.
+    let accepted = tokio::time::timeout(
+        SILENT,
         tokio_tungstenite::accept_hdr_async(stream, |request: &Request, response: Response| {
             match request.uri().path().strip_prefix("/volume/") {
                 Some(name) if !name.is_empty() && !name.contains('/') => {
@@ -75,9 +77,10 @@ async fn connect(stream: TcpStream, connection: ConnectionId, volumes: Volumes) 
                     Err(refused)
                 }
             }
-        })
-        .await;
-    let (Ok(socket), Some(volume)) = (accepted, volume) else {
+        }),
+    )
+    .await;
+    let (Ok(Ok(socket)), Some(volume)) = (accepted, volume) else {
         return;
     };
     let events = coordinator_of(&volumes, volume);
@@ -111,7 +114,8 @@ async fn connect(stream: TcpStream, connection: ConnectionId, volumes: Volumes) 
         }
         let _ = sink.close().await;
     });
-    while let Some(Ok(message)) = stream.next().await {
+    // A connection that sends nothing, not even a ping, for SILENT is gone though it never closed.
+    while let Ok(Some(Ok(message))) = tokio::time::timeout(SILENT, stream.next()).await {
         match message {
             Message::Binary(frame) => {
                 let frame = frame.to_vec();
@@ -213,5 +217,10 @@ impl Sockets for Connections<'_> {
 
     fn close(&self, connection: ConnectionId) {
         self.closing.borrow_mut().push(connection);
+    }
+
+    // A connection that goes silent closes itself.
+    fn silent(&self, _connection: ConnectionId) -> bool {
+        false
     }
 }

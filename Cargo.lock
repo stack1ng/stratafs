@@ -2055,6 +2055,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-pubsub"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "stratafs-pubsub-conformance"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "rand 0.10.3",
+ "stratafs-pubsub",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "stratafs-range-bounds-map"
 version = "0.1.0"
 dependencies = [
@@ -2148,6 +2166,8 @@ name = "stratafs-websocket-pubsub"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "proptest",
+ "stratafs-pubsub",
  "stratafs-serialized",
  "thiserror",
  "tokio",
@@ -2172,6 +2192,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "futures-util",
+ "stratafs-pubsub",
+ "stratafs-pubsub-conformance",
  "stratafs-websocket-pubsub",
  "tokio",
  "tokio-tungstenite",
