@@ -1,16 +1,18 @@
 // MemoryVolume is a volume's pub/sub kept in memory, which clients connect to directly. It is the reference the
-// conformance suite checks itself against. Handlers run on the Tokio runtime of the publish that reaches them.
+// conformance suite checks itself against. Handlers run on the volume's runtime.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::pending;
+use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use futures_util::future::BoxFuture;
+use futures_channel::oneshot;
+use futures_util::future::{BoxFuture, Either, Shared, select};
 use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use stratafs_pubsub::{Key, PubSub, PubSubError};
-use tokio::sync::watch;
+use stratafs_runtime::Runtime;
 
 use crate::Volume;
 
@@ -24,15 +26,15 @@ type OnPublished<M> = Arc<dyn Fn(M) -> BoxFuture<'static, ()> + Send + Sync>;
 
 pub struct MemoryVolume<M> {
     state: Arc<Mutex<State<M>>>,
+    runtime: Arc<dyn Runtime>,
 }
 
 struct State<M> {
     next_client: ClientId,
-    // failures is each connected client's failure, which it reports once it fails.
-    failures: HashMap<ClientId, watch::Sender<Option<MemoryFailure>>>,
-    // holders is each key's holders, by client.
-    holders: HashMap<Key, HashMap<ClientId, Holder<M>>>,
-    last: HashMap<Key, M>,
+    // failures sends each connected client why it failed, once it does.
+    failures: HashMap<ClientId, oneshot::Sender<MemoryFailure>>,
+    // holders is each key's holders, by client, in order, so a publish reaches them the same way each time it runs.
+    holders: HashMap<Key, BTreeMap<ClientId, Holder<M>>>,
     // silenced is each client whose connection carries nothing. It holds nothing, and fails once SILENT passes.
     silenced: HashSet<ClientId>,
 }
@@ -40,10 +42,9 @@ struct State<M> {
 // Holder is a client's hold of a key.
 struct Holder<M> {
     on_published: OnPublished<M>,
-    // held is dropped once the hold ends, which stops the publishes waiting on it.
-    held: watch::Sender<()>,
-    // subscribed turns true once the hold's on_subscribed has run, which messages to it wait for.
-    subscribed: watch::Receiver<bool>,
+    // held is dropped once the hold ends, which resolves ended for the publishes waiting on it.
+    _held: oneshot::Sender<()>,
+    ended: Shared<oneshot::Receiver<()>>,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -58,7 +59,9 @@ pub enum MemoryFailure {
 
 pub struct MemoryClient<M> {
     connection: Arc<Connection<M>>,
-    failure: watch::Receiver<Option<MemoryFailure>>,
+    // failure resolves to why the client failed, once it has.
+    failure: Shared<oneshot::Receiver<MemoryFailure>>,
+    runtime: Arc<dyn Runtime>,
 }
 
 pub struct MemorySubscription<M> {
@@ -72,33 +75,33 @@ struct Connection<M> {
     client: ClientId,
 }
 
-impl<M> Default for MemoryVolume<M> {
-    fn default() -> Self {
+impl<M> MemoryVolume<M> {
+    // new is an empty volume whose handlers and timers run on runtime.
+    pub fn new(runtime: Arc<dyn Runtime>) -> Self {
         MemoryVolume {
             state: Arc::new(Mutex::new(State {
                 next_client: 0,
                 failures: HashMap::new(),
                 holders: HashMap::new(),
-                last: HashMap::new(),
                 silenced: HashSet::new(),
             })),
+            runtime,
         }
     }
-}
 
-impl<M> MemoryVolume<M> {
     pub fn connect(&self) -> MemoryClient<M> {
         let mut state = lock(&self.state);
         let client = state.next_client;
         state.next_client += 1;
-        let (failed, failure) = watch::channel(None);
+        let (failed, failure) = oneshot::channel();
         state.failures.insert(client, failed);
         MemoryClient {
             connection: Arc::new(Connection {
                 state: Arc::clone(&self.state),
                 client,
             }),
-            failure,
+            failure: failure.shared(),
+            runtime: Arc::clone(&self.runtime),
         }
     }
 }
@@ -106,14 +109,8 @@ impl<M> MemoryVolume<M> {
 impl<M> State<M> {
     // fail fails client for failure, unless it already failed, and ends its holds.
     fn fail(&mut self, client: ClientId, failure: MemoryFailure) {
-        if let Some(failed) = self.failures.get(&client) {
-            failed.send_if_modified(|failed| {
-                if failed.is_some() {
-                    return false;
-                }
-                *failed = Some(failure);
-                true
-            });
+        if let Some(failed) = self.failures.remove(&client) {
+            let _ = failed.send(failure);
         }
         self.release_all(client);
     }
@@ -134,7 +131,6 @@ impl<M: Clone + Send + Sync + 'static> PubSub for MemoryClient<M> {
     async fn subscribe<Handled>(
         &self,
         key: Key,
-        on_subscribed: impl FnOnce(Option<M>) + Send + 'static,
         on_published: impl Fn(M) -> Handled + Send + Sync + 'static,
     ) -> Result<MemorySubscription<M>, PubSubError<MemoryFailure>>
     where
@@ -144,34 +140,27 @@ impl<M: Clone + Send + Sync + 'static> PubSub for MemoryClient<M> {
         if self.silenced() {
             return Err(PubSubError::Failed(self.failed().await));
         }
-        let (subscribed, last) = {
-            let mut state = lock(&self.connection.state);
-            if let Some(failure) = self.failure.borrow().clone() {
-                return Err(PubSubError::Failed(failure));
-            }
-            let holders = state.holders.entry(key).or_default();
-            if holders.contains_key(&self.connection.client) {
-                return Err(PubSubError::AlreadySubscribed);
-            }
-            let (subscribed, waiting) = watch::channel(false);
-            holders.insert(
-                self.connection.client,
-                Holder {
-                    on_published: Arc::new(move |message| Box::pin(on_published(message))),
-                    held: watch::channel(()).0,
-                    subscribed: waiting,
-                },
-            );
-            (subscribed, state.last.get(&key).cloned())
-        };
-        // Made before on_subscribed runs, so a panic in it releases the key.
-        let subscription = MemorySubscription {
+        let mut state = lock(&self.connection.state);
+        if let Some(failure) = self.failure_now() {
+            return Err(PubSubError::Failed(failure));
+        }
+        let holders = state.holders.entry(key).or_default();
+        if holders.contains_key(&self.connection.client) {
+            return Err(PubSubError::AlreadySubscribed);
+        }
+        let (held, ended) = oneshot::channel();
+        holders.insert(
+            self.connection.client,
+            Holder {
+                on_published: Arc::new(move |message| Box::pin(on_published(message))),
+                _held: held,
+                ended: ended.shared(),
+            },
+        );
+        Ok(MemorySubscription {
             connection: Arc::clone(&self.connection),
             key,
-        };
-        on_subscribed(last);
-        subscribed.send_replace(true);
-        Ok(subscription)
+        })
     }
 
     async fn publish(
@@ -182,9 +171,9 @@ impl<M: Clone + Send + Sync + 'static> PubSub for MemoryClient<M> {
     ) -> Result<(), PubSubError<MemoryFailure>> {
         // A silenced client's publish reaches no one, so it ends only by timing out or the client failing.
         if self.silenced() {
-            return Err(match tokio::time::timeout(timeout, self.failed()).await {
-                Ok(failure) => PubSubError::Failed(failure),
-                Err(_) => PubSubError::TimedOut,
+            return Err(match self.runtime.timeout(timeout, self.failed()).await {
+                Some(failure) => PubSubError::Failed(failure),
+                None => PubSubError::TimedOut,
             });
         }
         let mut unhandled = Unhandled {
@@ -193,37 +182,33 @@ impl<M: Clone + Send + Sync + 'static> PubSub for MemoryClient<M> {
         };
         let mut handling = FuturesUnordered::new();
         {
-            let mut state = lock(&self.connection.state);
-            if let Some(failure) = self.failure.borrow().clone() {
+            let state = lock(&self.connection.state);
+            if let Some(failure) = self.failure_now() {
                 return Err(PubSubError::Failed(failure));
             }
-            state.last.insert(key, message.clone());
             for (&client, holder) in state.holders.get(&key).into_iter().flatten() {
                 if client == self.connection.client {
                     continue;
                 }
                 unhandled.clients.insert(client);
-                let on_published = Arc::clone(&holder.on_published);
-                let mut held = holder.held.subscribe();
-                let mut subscribed = holder.subscribed.clone();
+                let (on_published, ended) =
+                    (Arc::clone(&holder.on_published), holder.ended.clone());
                 // The handler runs on its own task, so a publish that ends first stops waiting on it but does not
                 // stop it.
                 let message = message.clone();
-                let handler = tokio::spawn(async move {
-                    if subscribed.wait_for(|subscribed| *subscribed).await.is_ok() {
-                        on_published(message).await;
-                    }
-                });
+                let (done, handled) = oneshot::channel();
+                self.runtime.spawn(Box::pin(async move {
+                    on_published(message).await;
+                    let _ = done.send(());
+                }));
                 handling.push(async move {
                     // A handler that panics never handles the message, and a hold that ends no longer counts.
-                    tokio::select! {
-                        () = async {
-                            if handler.await.is_err() {
-                                pending::<()>().await;
-                            }
-                        } => {}
-                        _ = held.changed() => {}
-                    }
+                    let handled = async {
+                        if handled.await.is_err() {
+                            pending::<()>().await;
+                        }
+                    };
+                    select(pin!(handled), ended).await;
                     client
                 });
             }
@@ -233,11 +218,10 @@ impl<M: Clone + Send + Sync + 'static> PubSub for MemoryClient<M> {
                 unhandled.clients.remove(&client);
             }
         };
-        let failure = tokio::select! {
-            handled = tokio::time::timeout(timeout, all_handled) => {
-                return handled.map_err(|_| PubSubError::TimedOut);
-            }
-            failure = self.failed() => failure,
+        let handled = self.runtime.timeout(timeout, all_handled);
+        let failure = match select(pin!(handled), pin!(self.failed())).await {
+            Either::Left((handled, _)) => return handled.ok_or(PubSubError::TimedOut),
+            Either::Right((failure, _)) => failure,
         };
         // A publisher that failed no longer waits on anyone, so it disconnects nobody.
         unhandled.clients.clear();
@@ -245,17 +229,19 @@ impl<M: Clone + Send + Sync + 'static> PubSub for MemoryClient<M> {
     }
 
     async fn failed(&self) -> MemoryFailure {
-        let mut failure = self.failure.clone();
-        failure
-            .wait_for(Option::is_some)
+        self.failure
+            .clone()
             .await
-            .ok()
-            .and_then(|failed| failed.clone())
             .expect("a client's failure is kept for as long as the client")
     }
 }
 
 impl<M> MemoryClient<M> {
+    // failure_now is why the client failed, if it has.
+    fn failure_now(&self) -> Option<MemoryFailure> {
+        self.failure.clone().now_or_never()?.ok()
+    }
+
     fn silenced(&self) -> bool {
         lock(&self.connection.state)
             .silenced
@@ -323,11 +309,11 @@ impl Volume for MemoryVolume<u64> {
             state.release_all(client);
             state.silenced.insert(client);
         }
-        let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
-            tokio::time::sleep(SILENT).await;
+        let (state, runtime) = (Arc::clone(&self.state), Arc::clone(&self.runtime));
+        self.runtime.spawn(Box::pin(async move {
+            runtime.sleep(SILENT).await;
             lock(&state).fail(client, MemoryFailure::Silent);
-        });
+        }));
     }
 }
 

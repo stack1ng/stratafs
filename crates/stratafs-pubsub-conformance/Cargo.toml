@@ -6,9 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+futures-channel.workspace = true
 futures-util.workspace = true
 rand.workspace = true
 stratafs-pubsub.workspace = true
+stratafs-runtime.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 

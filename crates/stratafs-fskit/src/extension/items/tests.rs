@@ -34,14 +34,14 @@ fn file() -> Attributes {
 #[test]
 fn a_state_a_reply_hands_fskit_no_item_for_goes_once_the_reply_is_done() {
     let items = Items::default();
-    items.reply([(Inode(5), file())], |_| {});
+    items.reply([(Inode(5), file())], &|| true, |_| {});
     assert!(items.state(Inode(5)).is_none());
 }
 
 #[test]
 fn a_state_a_reply_hands_fskit_the_item_for_stays() {
     let items = Items::default();
-    items.reply([(Inode(5), file())], |locked| {
+    items.reply([(Inode(5), file())], &|| true, |locked| {
         locked.item(Inode(5));
     });
     assert!(items.state(Inode(5)).is_some());

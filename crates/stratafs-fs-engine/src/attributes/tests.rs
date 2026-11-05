@@ -7,6 +7,7 @@ use zerocopy::IntoBytes;
 use zerocopy::little_endian::U16;
 
 use super::*;
+use crate::Purge;
 use crate::test_support::{
     InMemoryEngine, MetadataFailure, TEST_MOUNT, aborted, new_test_engine, restrict, set_clock,
 };
@@ -23,7 +24,7 @@ fn setattr(
     update: impl Fn(&mut SettableAttributes) + Send + Sync,
 ) -> Result<Attributes, SetattrError<MetadataFailure, Infallible, ObjectStoreError>> {
     let update = &update;
-    block_on(engine.transact(|mut txn| {
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.setattr(inode, update).await;
             result.map(|result| (result, txn))
@@ -82,7 +83,7 @@ fn creating_the_root_again_leaves_an_existing_root_alone() {
     })
     .unwrap();
     set_clock(9);
-    block_on(engine.transact(|mut txn| {
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.create_root_if_missing().await;
             result.map(|result| (result, txn))

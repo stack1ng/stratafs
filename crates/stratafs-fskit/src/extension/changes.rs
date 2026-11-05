@@ -4,7 +4,8 @@ use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2_foundation::NSError;
 use objc2_fs_kit::{FSItemAttribute, FSItemSetAttributesRequest};
-use stratafs_fs_engine::attributes::{Mode, SettableAttributes};
+use stratafs_fs_engine::Purge;
+use stratafs_fs_engine::attributes::{FileType, Mode, SettableAttributes};
 
 use super::item::{restrictions_and_hints, timestamp};
 use super::posix_error;
@@ -22,6 +23,23 @@ const APPLIED: FSItemAttribute = FSItemAttribute::Mode
     .union(FSItemAttribute::ModifyTime)
     .union(FSItemAttribute::BirthTime)
     .union(FSItemAttribute::Flags);
+
+// purge is whether FSKit's purge of an item of kind waits for request's change of it: for a file only a change of
+// size or times does; for a directory nothing does. A symbolic link's copy is never dropped.
+pub(crate) fn purge(request: &FSItemSetAttributesRequest, kind: FileType) -> Purge {
+    const WAITED: FSItemAttribute = FSItemAttribute::Size
+        .union(FSItemAttribute::AccessTime)
+        .union(FSItemAttribute::ModifyTime)
+        .union(FSItemAttribute::BirthTime);
+    // SAFETY: isValid reads a plain value.
+    let waited = WAITED
+        .iter()
+        .any(|attribute| unsafe { request.isValid(attribute) });
+    match kind {
+        FileType::File if waited => Purge::Waits,
+        FileType::File | FileType::Directory | FileType::SymbolicLink => Purge::GoesAhead,
+    }
+}
 
 // attribute_change reads what request asks to change on FSKit's thread, tells FSKit which of those it
 // applies, and returns the change for the operation to apply on its own thread. It refuses flags the volume

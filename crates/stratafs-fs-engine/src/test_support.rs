@@ -1,14 +1,16 @@
 use std::cell::Cell;
 use std::convert::Infallible;
 use std::fmt::Debug;
+use std::sync::Arc;
 
+use futures_executor::ThreadPool;
 use futures_lite::future::block_on;
-use futures_util::task::{FutureObj, Spawn, SpawnError};
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::{RedbFailure, RedbStore};
+use stratafs_runtime::ThreadPoolRuntime;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::TransactError;
@@ -19,7 +21,7 @@ use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
 use crate::observation::{KernelCache, NoKernel};
-use crate::{Eventual, FsConfig, FsEngine, Inode, MountId, Timestamp};
+use crate::{Eventual, FsConfig, FsEngine, Inode, MountId, Purge, Timestamp};
 
 // TEST_MOUNT is the mount test engines are.
 pub(crate) const TEST_MOUNT: MountId = MountId(1);
@@ -71,16 +73,6 @@ fn next_node() -> u128 {
     NEXT_NODE.replace(NEXT_NODE.get() + 1)
 }
 
-// ThreadSpawner runs each task on a thread of its own.
-pub(crate) struct ThreadSpawner;
-
-impl Spawn for ThreadSpawner {
-    fn spawn_obj(&self, task: FutureObj<'static, ()>) -> Result<(), SpawnError> {
-        std::thread::spawn(move || block_on(task));
-        Ok(())
-    }
-}
-
 pub(crate) fn new_test_engine() -> InMemoryEngine {
     new_test_engine_for(NoKernel)
 }
@@ -106,9 +98,9 @@ pub(crate) fn new_test_engine_for(kernel: impl KernelCache) -> InMemoryEngine {
             now,
             TEST_MOUNT,
             Some(DurableAgainst::PowerFailure),
-            Eventual,
+            Eventual::default(),
             kernel,
-            ThreadSpawner,
+            Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
         )
         .await
         .unwrap()
@@ -127,7 +119,7 @@ pub(crate) fn aborted<R: Debug, F: Debug, E>(error: TransactError<R, F, E>) -> E
 
 // restrict sets inode's restrictions, which a setattr may change whatever they were before.
 pub(crate) fn restrict(engine: &InMemoryEngine, inode: Inode, restrictions: Restrictions) {
-    block_on(engine.transact(|mut txn| {
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .setattr(inode, |settable| settable.restrictions = restrictions)

@@ -28,9 +28,7 @@ function decode(data) {
   const integer = (i) => view.getBigUint64(1 + 8 * i, true);
   switch (bytes[0]) {
     case 6:
-      return { subscribed: integer(0), last: null };
-    case 7:
-      return { subscribed: integer(0), last: [...bytes.slice(9)] };
+      return { subscribed: integer(0) };
     case 8:
       return { publisher: integer(0), request: integer(1), key: integer(2), message: [...bytes.slice(25)] };
     case 9:
@@ -71,7 +69,7 @@ it("an idle coordinator is evicted while its holders stay connected", { timeout:
     object.marked = true;
   });
   holder.send(frame(SUBSCRIBE, [7]));
-  expect(await holder.next()).toEqual({ subscribed: 7n, last: null });
+  expect(await holder.next()).toEqual({ subscribed: 7n });
   expect(await runInDurableObject(coordinator, (object) => object.marked)).toBe(true);
 
   // Cloudflare answers pings without waking the object, and evicts it after 10 seconds without events.

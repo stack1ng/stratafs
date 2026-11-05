@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 34ef77c4da8432c1bfcd5547851b6e31bd2585c38f74248e3950cbca0c7abff3 # shrinks to activity = SimulatedActivity { mounts: [[[Write("a", [120]), Reclaim("a")], [Stat("c"), Lookup("a")]], [[Read("a")]]], faults: [], slow: false }, seed = 9863043892738910456
+cc e8990189c34e9ffb7b6d48468a6ae8f1970659f519b20de10aef03600d5bea4d # shrinks to activity = SimulatedActivity { mounts: [[[Read(("d", "b"))], [Write(("d", "b"), [120]), Read(("d", "b"))]], [[Write(("d", "b"), [120]), Create(("e", "a")), Unlink(("d", "a"))]]], faults: [], slow: false }, seed = 11756066641268077491
+cc ca380924ec7a566d7d42342273372640e10ebfcf8d8ad7db5756ad83874c0b00
+cc b0ca71d5be2f30d9092d031ff17634bac9e0721b51e210df6440d08591721137

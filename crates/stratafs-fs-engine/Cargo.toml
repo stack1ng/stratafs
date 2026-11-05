@@ -8,9 +8,12 @@ license.workspace = true
 [dependencies]
 bitflags.workspace = true
 bytes.workspace = true
+event-listener.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 storekey.workspace = true
+stratafs-pubsub.workspace = true
+stratafs-runtime.workspace = true
 stratafs-serialized.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
@@ -19,6 +22,7 @@ xxhash-rust = { workspace = true, features = ["xxh3"] }
 zerocopy.workspace = true
 
 [dev-dependencies]
+futures-executor.workspace = true
 futures-lite.workspace = true
 object_store.workspace = true
 redb = "4.4.0"

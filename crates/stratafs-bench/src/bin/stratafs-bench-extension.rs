@@ -8,6 +8,7 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(target_os = "macos")]
 fn main() {
     use futures_executor::ThreadPool;
+    use stratafs_runtime::ThreadPoolRuntime;
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -29,7 +30,7 @@ fn main() {
     }));
     // Operations that have to wait, such as while commits are made durable, finish on the pool's threads.
     let pool = ThreadPool::new().expect("the operating system starts the pool's threads");
-    stratafs_fskit::extension::run(pool, stratafs_bench::open_volume)
+    stratafs_fskit::extension::run(ThreadPoolRuntime(pool), stratafs_bench::open_volume)
 }
 
 #[cfg(not(target_os = "macos"))]

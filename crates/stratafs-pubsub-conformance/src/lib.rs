@@ -3,11 +3,10 @@
 
 mod memory;
 mod random;
+mod runtime;
 
 use std::future::pending;
 use std::pin::pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,6 +17,7 @@ use tokio::sync::Notify;
 
 pub use memory::{MemoryClient, MemoryFailure, MemorySubscription, MemoryVolume};
 pub use random::no_holder_misses_a_publish;
+pub use runtime::TokioRuntime;
 
 // Volume is a fresh volume of the pub/sub under test.
 pub trait Volume: Send + Sync + 'static {
@@ -43,8 +43,6 @@ macro_rules! pubsub_conformance {
             a_publish_with_no_other_holders_resolves,
             a_client_does_not_get_its_own_publishes,
             a_publish_resolves_once_every_other_holder_has_handled_it,
-            a_late_subscriber_gets_the_last_message_published,
-            on_subscribed_runs_before_any_publish_is_handled,
             a_client_holds_a_key_once,
             a_dropped_subscription_no_longer_gets_publishes,
             a_subscribe_dropped_before_it_returns_releases_its_key,
@@ -89,7 +87,7 @@ pub async fn a_client_does_not_get_its_own_publishes(volume: impl Volume) {
     let delivered = Delivered::default();
     // Its handler never finishes, so the publish resolves only if it does not wait on it.
     let _subscription = writer
-        .subscribe(KEY, |_| {}, delivered.then(pending))
+        .subscribe(KEY, delivered.then(pending))
         .await
         .unwrap();
     writer.publish(KEY, &1, PATIENT).await.unwrap();
@@ -104,11 +102,7 @@ pub async fn a_publish_resolves_once_every_other_holder_has_handled_it(volume: i
     for delay in [0, 100] {
         let (holder, _) = volume.connect().await;
         let subscription = holder
-            .subscribe(
-                KEY,
-                |_| {},
-                records_after(Duration::from_millis(delay), &handled),
-            )
+            .subscribe(KEY, records_after(Duration::from_millis(delay), &handled))
             .await
             .unwrap();
         holders.push((holder, subscription));
@@ -118,83 +112,21 @@ pub async fn a_publish_resolves_once_every_other_holder_has_handled_it(volume: i
     assert_eq!(*handled.lock().unwrap(), vec![2, 2]);
 }
 
-pub async fn a_late_subscriber_gets_the_last_message_published(volume: impl Volume) {
-    let (writer, _) = volume.connect().await;
-    writer.publish(KEY, &3, PATIENT).await.unwrap();
-    writer.publish(KEY, &4, PATIENT).await.unwrap();
-    let (late, _) = volume.connect().await;
-    for (key, expected) in [(KEY, Some(4)), (Key(8), None)] {
-        let last = Arc::new(Mutex::new(None));
-        let seen = Arc::clone(&last);
-        let _subscription = late
-            .subscribe(
-                key,
-                move |message| *seen.lock().unwrap() = Some(message),
-                |_| async {},
-            )
-            .await
-            .unwrap();
-        assert_eq!(*last.lock().unwrap(), Some(expected), "{key:?}");
-    }
-}
-
-pub async fn on_subscribed_runs_before_any_publish_is_handled(volume: impl Volume) {
-    let (writer, _) = volume.connect().await;
-    let (holder, _) = volume.connect().await;
-    let early = Arc::new(AtomicBool::new(false));
-    // The holder subscribes again and again while the writer keeps publishing, so publishes land just as it
-    // subscribes.
-    let subscribing = async {
-        for _ in 0..200 {
-            let subscribed = Arc::new(AtomicBool::new(false));
-            let ran = Arc::clone(&subscribed);
-            let early = Arc::clone(&early);
-            let _subscription = holder
-                .subscribe(
-                    KEY,
-                    move |_| ran.store(true, SeqCst),
-                    move |_| {
-                        early.fetch_or(!subscribed.load(SeqCst), SeqCst);
-                        async {}
-                    },
-                )
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    };
-    let publishing = async {
-        loop {
-            writer.publish(KEY, &19, PATIENT).await.unwrap();
-            // A publish with no one to wait on need not yield, and the holder must get its turn.
-            tokio::task::yield_now().await;
-        }
-    };
-    tokio::select! {
-        () = subscribing => {}
-        () = publishing => {}
-    }
-    assert!(
-        !early.load(SeqCst),
-        "a handler ran before its on_subscribed"
-    );
-}
-
 pub async fn a_client_holds_a_key_once(volume: impl Volume) {
     let (holder, _) = volume.connect().await;
-    let subscription = holder.subscribe(KEY, |_| {}, |_| async {}).await.unwrap();
-    let again = holder.subscribe(KEY, |_| {}, |_| async {}).await;
+    let subscription = holder.subscribe(KEY, |_| async {}).await.unwrap();
+    let again = holder.subscribe(KEY, |_| async {}).await;
     assert!(
         matches!(again, Err(PubSubError::AlreadySubscribed)),
         "{:?}",
         again.err()
     );
     drop(subscription);
-    holder.subscribe(KEY, |_| {}, |_| async {}).await.unwrap();
+    holder.subscribe(KEY, |_| async {}).await.unwrap();
     // A subscribe of the key that is still running holds it too.
     let (first, second) = tokio::join!(
-        holder.subscribe(Key(8), |_| {}, |_| async {}),
-        holder.subscribe(Key(8), |_| {}, |_| async {}),
+        holder.subscribe(Key(8), |_| async {}),
+        holder.subscribe(Key(8), |_| async {}),
     );
     assert!(
         matches!(
@@ -217,7 +149,6 @@ pub async fn a_dropped_subscription_no_longer_gets_publishes(volume: impl Volume
     let subscription = holder
         .subscribe(
             KEY,
-            |_| {},
             delivered.then(move || {
                 reaching.notify_one();
                 pending()
@@ -249,7 +180,7 @@ pub async fn a_subscribe_dropped_before_it_returns_releases_its_key(volume: impl
     dropped_subscribe(&holder).await;
     let delivered = Delivered::default();
     let _subscription = holder
-        .subscribe(KEY, |_| {}, delivered.then(|| async {}))
+        .subscribe(KEY, delivered.then(|| async {}))
         .await
         .unwrap();
     writer.publish(KEY, &7, PATIENT).await.unwrap();
@@ -259,17 +190,17 @@ pub async fn a_subscribe_dropped_before_it_returns_releases_its_key(volume: impl
 // dropped_subscribe starts a subscribe to KEY whose handler never finishes, polls it once, so that a subscribe which
 // waits on an answer has sent for it, and drops it, with any subscription it already returned.
 async fn dropped_subscribe(client: &impl PubSub<Message = u64>) {
-    let mut subscribing = pin!(client.subscribe(KEY, |_| {}, |_| pending()));
+    let mut subscribing = pin!(client.subscribe(KEY, |_| pending()));
     let _ = subscribing.as_mut().now_or_never();
 }
 
 pub async fn a_holder_that_does_not_handle_a_publish_in_time_fails(volume: impl Volume) {
     let (stuck, _) = volume.connect().await;
-    let _stuck_subscription = stuck.subscribe(KEY, |_| {}, |_| pending()).await.unwrap();
+    let _stuck_subscription = stuck.subscribe(KEY, |_| pending()).await.unwrap();
     let (prompt, _) = volume.connect().await;
     let delivered = Delivered::default();
     let _prompt_subscription = prompt
-        .subscribe(KEY, |_| {}, delivered.then(|| async {}))
+        .subscribe(KEY, delivered.then(|| async {}))
         .await
         .unwrap();
     let (writer, _) = volume.connect().await;
@@ -288,11 +219,11 @@ pub async fn a_holder_that_does_not_handle_a_publish_in_time_fails(volume: impl 
 
 pub async fn a_dropped_publish_fails_the_holders_that_had_not_handled_it(volume: impl Volume) {
     let (stuck, _) = volume.connect().await;
-    let _stuck_subscription = stuck.subscribe(KEY, |_| {}, |_| pending()).await.unwrap();
+    let _stuck_subscription = stuck.subscribe(KEY, |_| pending()).await.unwrap();
     let (prompt, _) = volume.connect().await;
     let delivered = Delivered::default();
     let _prompt_subscription = prompt
-        .subscribe(KEY, |_| {}, delivered.then(|| async {}))
+        .subscribe(KEY, delivered.then(|| async {}))
         .await
         .unwrap();
     let (writer, _) = volume.connect().await;
@@ -310,14 +241,10 @@ pub async fn a_holder_whose_connection_is_cut_no_longer_holds_up_publishes(volum
     let reached = Arc::new(Notify::new());
     let reaching = Arc::clone(&reached);
     let _subscription = holder
-        .subscribe(
-            KEY,
-            |_| {},
-            move |_| {
-                reaching.notify_one();
-                pending()
-            },
-        )
+        .subscribe(KEY, move |_| {
+            reaching.notify_one();
+            pending()
+        })
         .await
         .unwrap();
     let (writer, _) = volume.connect().await;
@@ -335,7 +262,7 @@ pub async fn a_client_whose_connection_is_cut_fails(volume: impl Volume) {
     let (slow, _) = volume.connect().await;
     let handled = Arc::new(Mutex::new(Vec::new()));
     let _slow_subscription = slow
-        .subscribe(KEY, |_| {}, records_after(2 * IMPATIENT, &handled))
+        .subscribe(KEY, records_after(2 * IMPATIENT, &handled))
         .await
         .unwrap();
     let (writer, connection) = volume.connect().await;
@@ -350,7 +277,7 @@ pub async fn a_client_whose_connection_is_cut_fails(volume: impl Volume) {
         "{published:?}"
     );
     within(PATIENT, writer.failed()).await;
-    let subscribed = writer.subscribe(Key(8), |_| {}, |_| async {}).await;
+    let subscribed = writer.subscribe(Key(8), |_| async {}).await;
     assert!(
         matches!(subscribed, Err(PubSubError::Failed(_))),
         "{:?}",
@@ -364,7 +291,7 @@ pub async fn a_client_whose_connection_is_cut_fails(volume: impl Volume) {
 
 pub async fn a_silenced_holder_fails_and_no_longer_holds_up_publishes(volume: impl Volume) {
     let (holder, connection) = volume.connect().await;
-    let _subscription = holder.subscribe(KEY, |_| {}, |_| pending()).await.unwrap();
+    let _subscription = holder.subscribe(KEY, |_| pending()).await.unwrap();
     volume.silence(&connection);
     within(PATIENT, holder.failed()).await;
     let (writer, _) = volume.connect().await;

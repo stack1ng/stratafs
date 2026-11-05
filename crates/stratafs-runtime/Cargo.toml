@@ -1,0 +1,20 @@
+[package]
+name = "stratafs-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# replay runs a test body in many interleavings of its tasks, on a virtual clock, for the conformance suites.
+replay = ["dep:shuttle", "futures-util/channel"]
+
+[dependencies]
+futures-core.workspace = true
+futures-executor.workspace = true
+futures-timer.workspace = true
+futures-util.workspace = true
+shuttle = { workspace = true, optional = true }
+
+[lints]
+workspace = true

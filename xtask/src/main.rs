@@ -50,6 +50,11 @@ struct Configuration {
         help = "The most the engine makes commits durable against: none, software or power"
     )]
     durability: Option<String>,
+    #[arg(
+        long,
+        help = "What a mount's reads promise about other mounts' writes: eventual or strong"
+    )]
+    consistency: Option<String>,
 }
 
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister";
@@ -154,6 +159,10 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
             "STRATAFS_BENCH_MDBX_SYNC_BYTES",
             configuration.mdbx_sync_bytes.map(|value| value.to_string()),
         ),
+        (
+            "STRATAFS_BENCH_CONSISTENCY",
+            configuration.consistency.clone(),
+        ),
     ] {
         match value {
             Some(value) => build.env(variable, value),
@@ -165,9 +174,22 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
     let built = workspace.join("target/release");
     let app = workspace.join("target/bench/StrataBench.app");
     let appex = app.join("Contents/Extensions/StrataBench.appex");
-    if app.exists() {
-        std::fs::remove_dir_all(&app)
-            .map_err(|error| format!("removing {}: {error}", app.display()))?;
+    // LaunchServices drops the app's registration when the app is gone or broken for long, or is registered again
+    // while a volume is mounted or a module process lives, and the module then stays disabled until it is enabled in
+    // System Settings. So the app is updated in place, each file swapped in whole, and signed again at once.
+    let mounted = output(&mut Command::new("/sbin/mount"))?;
+    if String::from_utf8_lossy(&mounted).contains("(stratafs") {
+        return Err("a stratafs volume is mounted; unmount it before bundling".to_owned());
+    }
+    if Command::new("/usr/bin/pgrep")
+        .args(["-f", "stratafs-bench-extension"])
+        .output()
+        .is_ok_and(|found| found.status.success())
+    {
+        return Err(
+            "a stratafs-bench-extension process is still running; wait for it to exit, or stop it, before bundling"
+                .to_owned(),
+        );
     }
     for (from, to) in [
         (
@@ -360,13 +382,21 @@ fn signing(module: &str) -> Result<Signing, String> {
     })
 }
 
+// copy puts a copy of from at to, swapping it in whole, so to is never missing or half written.
 fn copy(from: &Path, to: &PathBuf) -> Result<(), String> {
     let directory = to.parent().expect("a bundle file sits in a directory");
     std::fs::create_dir_all(directory)
         .map_err(|error| format!("making {}: {error}", directory.display()))?;
-    std::fs::copy(from, to)
-        .map(|_| ())
-        .map_err(|error| format!("copying {} to {}: {error}", from.display(), to.display()))
+    let copied = PathBuf::from(format!("{}.copying", to.display()));
+    std::fs::copy(from, &copied).map_err(|error| {
+        format!(
+            "copying {} to {}: {error}",
+            from.display(),
+            copied.display()
+        )
+    })?;
+    std::fs::rename(&copied, to)
+        .map_err(|error| format!("moving {} to {}: {error}", copied.display(), to.display()))
 }
 
 // output runs command and returns what it printed.

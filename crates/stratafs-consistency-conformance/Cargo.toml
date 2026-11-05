@@ -1,0 +1,28 @@
+[package]
+name = "stratafs-consistency-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+event-listener.workspace = true
+futures-channel.workspace = true
+futures-lite.workspace = true
+futures-util.workspace = true
+object_store.workspace = true
+proptest.workspace = true
+redb = "4.4.0"
+stratafs-fs-engine.workspace = true
+stratafs-lock-synchronized.workspace = true
+stratafs-object-store.workspace = true
+stratafs-pubsub-conformance.workspace = true
+stratafs-redb.workspace = true
+stratafs-runtime = { workspace = true, features = ["replay"] }
+stratafs-store.workspace = true
+stratafs-tree.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

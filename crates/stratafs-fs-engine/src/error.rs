@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use stratafs_serialized::ViewError;
 use stratafs_store::content::GetRejection;
 use stratafs_store::error::StoreError;
@@ -25,6 +27,37 @@ pub enum PosixError {
     ESTALE,
 }
 
+// Posix is an error that says which POSIX error it stands for, so an adapter reports the right one even for an error
+// whose type it does not know, such as a consistency's failure.
+pub trait Posix {
+    fn posix(&self) -> PosixError;
+}
+
+impl<E> Posix for E
+where
+    for<'e> PosixError: From<&'e E>,
+{
+    fn posix(&self) -> PosixError {
+        PosixError::from(self)
+    }
+}
+
+impl From<&Infallible> for PosixError {
+    fn from(never: &Infallible) -> Self {
+        match *never {}
+    }
+}
+
+// EngineFailure is why a transaction failed outside its work: the store failed, or the consistency could not let it
+// go ahead.
+#[derive(Debug, thiserror::Error)]
+pub enum EngineFailure<F, X> {
+    #[error(transparent)]
+    Store(F),
+    #[error(transparent)]
+    Consistency(X),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IoFailure<M, C> {
     #[error(transparent)]
@@ -35,6 +68,16 @@ pub enum IoFailure<M, C> {
     ContentWrite(C),
     #[error(transparent)]
     Corrupt(CorruptValue),
+}
+
+// A store failure is an I/O error; a consistency's failure stands for its own.
+impl<F, X: Posix> From<&EngineFailure<F, X>> for PosixError {
+    fn from(failure: &EngineFailure<F, X>) -> Self {
+        match failure {
+            EngineFailure::Store(_) => PosixError::EIO,
+            EngineFailure::Consistency(failure) => failure.posix(),
+        }
+    }
 }
 
 impl<M, C> From<&IoFailure<M, C>> for PosixError {

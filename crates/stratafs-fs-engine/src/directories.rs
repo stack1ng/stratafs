@@ -24,7 +24,7 @@ use crate::key::{
     FsKey, directory_entries_after, directory_entries_between, directory_entry_position,
     every_key_of, hard_link_directory, hard_links_of,
 };
-use crate::{FsConfig, FsTransaction, Inode, LARGEST_NAME_LENGTH, Timestamp};
+use crate::{Change, FsConfig, FsTransaction, Inode, LARGEST_NAME_LENGTH, Timestamp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryEntry {
@@ -277,20 +277,24 @@ where
     N: Fn() -> Timestamp + Sync,
     S: FsConfig,
 {
-    fn new_inode(&self) -> impl Future<Output = Result<Inode, T::Failure>> + Send {
+    // new_inode allocates an inode number no inode has, reusing one an earlier attempt allocated when it can.
+    fn new_inode(&mut self) -> impl Future<Output = Result<Inode, T::Failure>> + Send {
         async move {
             loop {
-                let candidate = (self.allocate_inode)();
-                if candidate == Inode::ROOT.0 || candidate > LARGEST_INODE {
+                let inode = self
+                    .reuse
+                    .pop()
+                    .unwrap_or_else(|| Inode((self.allocate_inode)()));
+                if inode == Inode::ROOT || inode.0 > LARGEST_INODE {
                     continue;
                 }
-                let inode = Inode(candidate);
                 if self
                     .metadata
                     .get(FsKey::new_attributes(inode).into())
                     .await?
                     .is_none()
                 {
+                    self.allocated.push(inode);
                     return Ok(inode);
                 }
             }
@@ -344,11 +348,14 @@ where
         }
     }
 
+    // delete_inode deletes every key of inode, whose attributes were item.
     fn delete_inode(
         &mut self,
         inode: Inode,
+        item: Attributes,
     ) -> impl Future<Output = Result<(), T::Failure>> + Send {
         async move {
+            self.changes.insert(inode, Change::Deleted(item));
             let keys = self
                 .metadata
                 .get_range(every_key_of(inode), usize::MAX)
@@ -897,12 +904,10 @@ where
         inode: Inode,
     ) -> impl Future<Output = Result<(), IoFailure<T::Failure, C::Failure>>> + Send {
         async move {
-            if self
-                .getattr(inode)
-                .await?
-                .is_some_and(|item| item.hard_link_count == 0)
+            if let Some(item) = self.getattr(inode).await?
+                && item.hard_link_count == 0
             {
-                self.delete_inode(inode)
+                self.delete_inode(inode, item)
                     .await
                     .map_err(IoFailure::Metadata)?;
             }

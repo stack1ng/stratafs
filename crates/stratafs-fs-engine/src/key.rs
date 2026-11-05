@@ -23,6 +23,7 @@ pub(crate) enum KeyKind<'a> {
     HardLink { dir: Inode, position: u64 },
     SymbolicLinkTarget,
     ContentExtent { end: u64 },
+    PendingChangeVersion,
 }
 
 #[derive(Encode, BorrowDecode)]
@@ -88,6 +89,13 @@ impl<'a> FsKey<'a> {
         FsKey {
             inode,
             kind: KeyKind::ContentExtent { end },
+        }
+    }
+
+    pub(crate) fn new_pending_change_version(inode: Inode) -> Self {
+        FsKey {
+            inode,
+            kind: KeyKind::PendingChangeVersion,
         }
     }
 }
@@ -157,15 +165,9 @@ pub(crate) fn hard_links_of(inode: Inode) -> (Bound<Bytes>, Bound<Bytes>) {
 }
 
 pub(crate) fn every_key_of(inode: Inode) -> (Bound<Bytes>, Bound<Bytes>) {
-    let next = Inode(
-        inode
-            .0
-            .checked_add(1)
-            .expect("inode numbers stop below the largest value"),
-    );
     (
         Bound::Included(FsKey::new_attributes(inode).into()),
-        Bound::Excluded(FsKey::new_attributes(next).into()),
+        Bound::Excluded(FsKey::new_pending_change_version(inode).into()),
     )
 }
 

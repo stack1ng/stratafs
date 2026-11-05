@@ -15,19 +15,14 @@ struct Holder {
     connection: i64,
 }
 
-#[derive(Deserialize)]
-struct Last {
-    #[serde(with = "serde_bytes")]
-    message: Vec<u8>,
-}
-
 impl StoredMembership {
     pub(crate) fn open(state: Rc<State>) -> Self {
         for table in [
             "CREATE TABLE IF NOT EXISTS holders (key TEXT NOT NULL, connection INTEGER NOT NULL, \
              PRIMARY KEY (key, connection)) WITHOUT ROWID",
             "CREATE INDEX IF NOT EXISTS holders_by_connection ON holders (connection)",
-            "CREATE TABLE IF NOT EXISTS last (key TEXT PRIMARY KEY, message BLOB NOT NULL) WITHOUT ROWID",
+            // last kept each key's last message, which the pub/sub no longer keeps.
+            "DROP TABLE IF EXISTS last",
             "CREATE TABLE IF NOT EXISTS connections (next INTEGER NOT NULL)",
             "INSERT INTO connections (next) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM connections)",
         ] {
@@ -82,23 +77,6 @@ impl Membership for StoredMembership {
             &self.0,
             "DELETE FROM holders WHERE connection = ?",
             vec![(connection.0 as i64).into()],
-        );
-    }
-
-    fn last(&self, key: Key) -> Option<Vec<u8>> {
-        let last: Vec<Last> = rows(
-            &self.0,
-            "SELECT message FROM last WHERE key = ?",
-            vec![text(key).into()],
-        );
-        Some(last.into_iter().next()?.message)
-    }
-
-    fn set_last(&mut self, key: Key, message: &[u8]) {
-        run(
-            &self.0,
-            "INSERT OR REPLACE INTO last (key, message) VALUES (?, ?)",
-            vec![text(key).into(), message.to_vec().into()],
         );
     }
 }

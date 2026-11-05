@@ -28,11 +28,11 @@ use objc2_fs_kit::{
 use stratafs_fs_engine::attributes::FileType;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::error::PosixError;
-use stratafs_fs_engine::observation::KernelCache;
+use stratafs_fs_engine::observation::{Answered, Asked, KernelCache, Uninvalidated};
 use stratafs_fs_engine::{Inode, LARGEST_NAME_LENGTH};
 use stratafs_store::spawn::{SpawnBlocking, ThreadPool};
 
-use super::changes::attribute_change;
+use super::changes::{attribute_change, purge};
 use super::item::{StrataItem, file_name, name_bytes};
 use super::items::Granted;
 use super::operations::{Handed, Reply, VolumeOperations};
@@ -159,22 +159,21 @@ define_class!(
             reply.call(null_mut());
         }
 
-        // reclaim lets go of an item FSKit no longer holds, tells the engine the kernel no longer holds it, then
+        // reclaim lets go of an item FSKit no longer holds, telling the engine the kernel no longer holds it, then
         // deletes it if it has no name, as FSKit asks of a removed item. It replies before the deletion, which the
         // call that let go of the item has no need to wait on.
         #[unsafe(method(reclaimItem:replyHandler:))]
         fn reclaim(&self, item: &FSItem, reply: &SendableBlock<'static, fn(*mut NSError)>) {
             let item = StrataItem::of(item);
             let reclaimed = self.active_operations().and_then(|operations| {
-                let unlinked = operations.items().reclaim(item)?;
+                let unlinked = operations
+                    .items()
+                    .reclaim(item, || operations.forget(*item.inode()))?;
                 Some((operations, unlinked))
             });
             reply.call(null_mut());
-            if let Some((operations, unlinked)) = reclaimed {
-                operations.forget(*item.inode());
-                if unlinked {
-                    operations.delete_if_unlinked(*item.inode());
-                }
+            if let Some((operations, true)) = reclaimed {
+                operations.delete_if_unlinked(*item.inode());
             }
         }
 
@@ -224,9 +223,10 @@ define_class!(
             _context: &FSContext,
             reply: &SendableBlock<'static, fn(*mut FSGetAttributesResult, *mut NSError)>,
         ) {
-            let inode = *StrataItem::of(item).inode();
+            let item = StrataItem::of(item);
+            let (inode, kind) = (*item.inode(), *item.kind());
             self.forward(reply, |operations, reply| {
-                operations.get_attributes(inode, reply)
+                operations.get_attributes(inode, kind, reply)
             });
         }
 
@@ -238,13 +238,14 @@ define_class!(
             _context: &FSContext,
             reply: &SendableBlock<'static, fn(*mut FSSetAttributesResult, *mut NSError)>,
         ) {
-            let inode = *StrataItem::of(item).inode();
+            let item = StrataItem::of(item);
+            let (inode, purge) = (*item.inode(), purge(request, *item.kind()));
             let change = match attribute_change(request) {
                 Ok(change) => change,
                 Err(error) => return reply.call(null_mut(), Retained::as_ptr(&error).cast_mut()),
             };
             self.forward(reply, |operations, reply| {
-                operations.set_attributes(inode, change, reply)
+                operations.set_attributes(inode, change, purge, reply)
             });
         }
 
@@ -605,14 +606,23 @@ impl StrataVolume {
     }
 
     // grant records and returns the most the kernel may cache of an item's contents in the mode it asked for:
-    // writes cached and written back later when it reads and writes.
+    // writes cached and written back later when it reads and writes, if the engine's consistency lets the kernel keep
+    // writes, and reads alone otherwise.
     fn grant(&self, item: &FSItem, cache_mode: FSDataCacheMode) -> FSKernelCacheCoherencyType {
+        let operations = self.active_operations();
+        let write_back = operations
+            .as_ref()
+            .is_some_and(|operations| operations.write_back());
         let coherency = match cache_mode {
-            FSDataCacheMode::ReadWriteWithCache => FSKernelCacheCoherencyType::WriteBack,
-            FSDataCacheMode::ReadWithCache => FSKernelCacheCoherencyType::ReadCache,
+            FSDataCacheMode::ReadWriteWithCache if write_back => {
+                FSKernelCacheCoherencyType::WriteBack
+            }
+            FSDataCacheMode::ReadWriteWithCache | FSDataCacheMode::ReadWithCache => {
+                FSKernelCacheCoherencyType::ReadCache
+            }
             _ => FSKernelCacheCoherencyType::NoCache,
         };
-        if let Some(operations) = self.active_operations() {
+        if let Some(operations) = operations {
             operations.items().grant(
                 *StrataItem::of(item).inode(),
                 Granted {
@@ -676,22 +686,43 @@ unsafe impl Sync for FsKitCache {}
 
 // The kernel calls into the volume while it invalidates, so invalidating waits on a thread of its own.
 impl KernelCache for FsKitCache {
-    fn invalidate(&self, inode: Inode) -> BoxFuture<'static, ()> {
+    fn invalidate(&self, inode: Inode) -> BoxFuture<'static, Result<(), Uninvalidated>> {
         let cache = self.clone();
         Box::pin(ThreadPool.spawn_blocking(move || cache.invalidate_now(inode)))
+    }
+
+    fn invalidate_noting(
+        &self,
+        inode: Inode,
+        asked: Asked,
+        answered: Answered,
+    ) -> BoxFuture<'static, Result<(), Uninvalidated>> {
+        let cache = self.clone();
+        Box::pin(ThreadPool.spawn_blocking(move || {
+            asked();
+            let invalidated = cache.invalidate_now(inode);
+            answered(invalidated.is_ok());
+            invalidated
+        }))
     }
 }
 
 impl FsKitCache {
-    // invalidate_now writes out the item's unwritten contents and drops everything the kernel caches for it,
-    // keeping the caching granted for its contents. It waits for the kernel, so it runs with no lock held.
-    fn invalidate_now(&self, inode: Inode) {
+    // invalidate_now writes out the writes the kernel holds back for the item and drops everything it caches for it,
+    // keeping the caching granted for its contents. It waits for the kernel, so it runs with no lock held. An item
+    // FSKit does not hold has nothing to drop.
+    fn invalidate_now(&self, inode: Inode) -> Result<(), Uninvalidated> {
         let Some((item, granted)) = self
             .0
             .active_operations()
             .and_then(|operations| operations.items().item_to_invalidate(inode))
         else {
-            return;
+            return Ok(());
+        };
+        // Without write back the kernel holds nothing to write out but the data of writes that failed.
+        let action = match granted.coherency {
+            FSKernelCacheCoherencyType::WriteBack => FSKernelCacheCoherencyAction::PushInvalidate,
+            _ => FSKernelCacheCoherencyAction::Invalidate,
         };
         // SAFETY: the item is one the kernel was handed, and the grant is one the kernel was given.
         let failed = unsafe {
@@ -700,11 +731,16 @@ impl FsKitCache {
                     &item,
                     granted.mode,
                     granted.coherency,
-                    FSKernelCacheCoherencyAction::PushInvalidate,
+                    action,
                 )
         };
-        if let Some(error) = failed {
-            tracing::warn!(inode = inode.0, code = error.code(), description = %error.localizedDescription(), "invalidating the kernel's copy failed");
+        match failed {
+            Some(error) => Err(Uninvalidated(format!(
+                "error {}: {}",
+                error.code(),
+                error.localizedDescription()
+            ))),
+            None => Ok(()),
         }
     }
 }

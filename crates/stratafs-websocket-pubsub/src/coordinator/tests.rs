@@ -138,64 +138,6 @@ fn a_publish_with_no_other_holder_is_done_at_once() {
 }
 
 #[test]
-fn a_subscriber_gets_the_last_message_published_to_its_key() {
-    let (mut coordinator, sockets) = subscribed(&[]);
-    received(
-        &mut coordinator,
-        WRITER,
-        ClientFrame::Publish {
-            request: 1,
-            key: KEY,
-            message: b"v2",
-        },
-        &sockets,
-    );
-    received(
-        &mut coordinator,
-        WRITER,
-        ClientFrame::Publish {
-            request: 2,
-            key: KEY,
-            message: b"v3",
-        },
-        &sockets,
-    );
-    sockets.took();
-    received(
-        &mut coordinator,
-        FIRST,
-        ClientFrame::Subscribe { key: KEY },
-        &sockets,
-    );
-    assert_eq!(
-        sockets.took(),
-        vec![(
-            FIRST,
-            ServerFrame::Subscribed {
-                key: KEY,
-                last: Some(b"v3")
-            }
-        )]
-    );
-    received(
-        &mut coordinator,
-        SECOND,
-        ClientFrame::Subscribe { key: Key(8) },
-        &sockets,
-    );
-    assert_eq!(
-        sockets.took(),
-        vec![(
-            SECOND,
-            ServerFrame::Subscribed {
-                key: Key(8),
-                last: None
-            }
-        )]
-    );
-}
-
-#[test]
 fn a_holder_that_closes_or_releases_the_key_no_longer_holds_up_a_publish() {
     let (mut coordinator, sockets) = subscribed(&[WRITER, FIRST, SECOND]);
     received(
@@ -408,13 +350,12 @@ fn acknowledged_publish() -> impl Strategy<Value = AcknowledgedPublish> {
     ]
 }
 
-// Model is what the coordinator should know: the connection in each slot, the last message published to each key,
-// and each publish still waiting on holders, with its key and the holders it waits on.
+// Model is what the coordinator should know: the connection in each slot, and each publish still waiting on holders,
+// with its key and the holders it waits on.
 struct Model {
     connections: [Connection; SLOTS],
     // next is the id of the next connection a slot gets.
     next: u64,
-    last: HashMap<Key, Vec<u8>>,
     pending: HashMap<(ConnectionId, u64), (Key, HashSet<ConnectionId>)>,
 }
 
@@ -450,7 +391,6 @@ impl Model {
         Model {
             connections: std::array::from_fn(|slot| Connection::new(ConnectionId(slot as u64))),
             next: SLOTS as u64,
-            last: HashMap::new(),
             pending: HashMap::new(),
         }
     }
@@ -508,8 +448,7 @@ impl Model {
         match ClientFrame::decode(frame).unwrap() {
             ClientFrame::Subscribe { key } => {
                 self.connections[slot].held.insert(key);
-                let last = self.last.get(&key).map(Vec::as_slice);
-                expected.send(connection, &ServerFrame::Subscribed { key, last }.encode());
+                expected.send(connection, &ServerFrame::Subscribed { key }.encode());
             }
             ClientFrame::Unsubscribe { key } => {
                 self.connections[slot].held.remove(&key);
@@ -529,7 +468,6 @@ impl Model {
                 message,
             } => {
                 self.connections[slot].publishes += 1;
-                self.last.insert(key, message.to_vec());
                 let mut others = HashSet::new();
                 for other in &mut self.connections {
                     if other.id == connection || !other.held.contains(&key) {

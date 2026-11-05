@@ -5,6 +5,7 @@ use stratafs_object_store::ObjectStoreError;
 use stratafs_store::content::ContentHash;
 
 use super::*;
+use crate::Purge;
 use crate::attributes::{Attributes, Restrictions};
 use crate::test_support::{
     InMemoryEngine, MetadataFailure, aborted, new_test_engine, restrict, set_clock,
@@ -49,7 +50,7 @@ fn set_annotation(
     value: &[u8],
     mode: SetAnnotationMode,
 ) -> Result<Attributes, SetAnnotationError<MetadataFailure, Infallible, ObjectStoreError>> {
-    block_on(engine.transact(|mut txn| {
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.set_annotation(inode, key, value, mode).await;
             result.map(|result| (result, txn))
@@ -63,7 +64,7 @@ fn remove_annotation(
     inode: Inode,
     key: AnnotationKey<'_>,
 ) -> Result<Attributes, RemoveAnnotationError<MetadataFailure, Infallible, ObjectStoreError>> {
-    block_on(engine.transact(|mut txn| {
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.remove_annotation(inode, key).await;
             result.map(|result| (result, txn))
@@ -73,7 +74,7 @@ fn remove_annotation(
 }
 
 fn insert_inode(engine: &InMemoryEngine, inode: Inode, attributes: &Attributes) {
-    block_on(engine.transact(|mut txn| {
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.write_attributes(inode, attributes);
             result.map(|result| (result, txn))

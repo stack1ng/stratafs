@@ -1,0 +1,12 @@
+# The engine reads the time and waits only through its runtime, so a test can run it on a clock of its own.
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "sleep on the runtime" },
+    { path = "std::thread::park_timeout", reason = "wait on the runtime" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "wait on the runtime" },
+    { path = "event_listener::Listener::wait_timeout", reason = "wait on the runtime" },
+    { path = "event_listener::Listener::wait_deadline", reason = "wait on the runtime" },
+    { path = "std::time::Instant::now", reason = "read the runtime's clock" },
+    { path = "std::time::Instant::elapsed", reason = "subtract from the runtime's now" },
+    { path = "std::time::SystemTime::now", reason = "read the engine's injected now" },
+    { path = "std::time::SystemTime::elapsed", reason = "read the engine's injected now" },
+]

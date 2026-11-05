@@ -663,6 +663,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
 
 [[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
+
+[[package]]
 name = "futures-util"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1657,16 +1663,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_bytes"
-version = "0.11.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
-dependencies = [
- "serde",
- "serde_core",
-]
-
-[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1905,14 +1901,40 @@ dependencies = [
  "stratafs-mdbx",
  "stratafs-object-store",
  "stratafs-redb",
+ "stratafs-runtime",
  "stratafs-sqlite",
  "stratafs-store",
  "stratafs-tree",
+ "stratafs-websocket-pubsub",
  "thiserror",
+ "tokio",
  "toml",
  "tracing",
  "tracing-oslog",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "stratafs-consistency-conformance"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "event-listener",
+ "futures-channel",
+ "futures-lite",
+ "futures-util",
+ "object_store",
+ "proptest",
+ "redb",
+ "stratafs-fs-engine",
+ "stratafs-lock-synchronized",
+ "stratafs-object-store",
+ "stratafs-pubsub-conformance",
+ "stratafs-redb",
+ "stratafs-runtime",
+ "stratafs-store",
+ "stratafs-tree",
+ "thiserror",
 ]
 
 [[package]]
@@ -1931,7 +1953,9 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "bytes",
+ "event-listener",
  "futures-core",
+ "futures-executor",
  "futures-lite",
  "futures-util",
  "object_store",
@@ -1939,7 +1963,9 @@ dependencies = [
  "storekey",
  "stratafs-lock-synchronized",
  "stratafs-object-store",
+ "stratafs-pubsub",
  "stratafs-redb",
+ "stratafs-runtime",
  "stratafs-serialized",
  "stratafs-store",
  "stratafs-tree",
@@ -1957,6 +1983,7 @@ dependencies = [
  "block2",
  "bytes",
  "clap",
+ "futures-executor",
  "futures-lite",
  "futures-util",
  "hex",
@@ -1970,6 +1997,7 @@ dependencies = [
  "stratafs-lock-synchronized",
  "stratafs-object-store",
  "stratafs-redb",
+ "stratafs-runtime",
  "stratafs-store",
  "stratafs-tree",
  "thiserror",
@@ -1993,8 +2021,8 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "proptest",
- "shuttle",
  "stateright",
+ "stratafs-runtime",
  "stratafs-store",
  "thiserror",
 ]
@@ -2065,9 +2093,11 @@ dependencies = [
 name = "stratafs-pubsub-conformance"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
  "futures-util",
  "rand 0.10.3",
  "stratafs-pubsub",
+ "stratafs-runtime",
  "thiserror",
  "tokio",
 ]
@@ -2096,6 +2126,17 @@ dependencies = [
  "stratafs-store",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "stratafs-runtime"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "futures-executor",
+ "futures-timer",
+ "futures-util",
+ "shuttle",
 ]
 
 [[package]]
@@ -2166,6 +2207,7 @@ name = "stratafs-websocket-pubsub"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "nix",
  "proptest",
  "stratafs-pubsub",
  "stratafs-serialized",
@@ -2180,7 +2222,6 @@ name = "stratafs-websocket-pubsub-durable-object"
 version = "0.1.0"
 dependencies = [
  "serde",
- "serde_bytes",
  "stratafs-websocket-pubsub",
  "wasm-bindgen",
  "worker",
@@ -2191,6 +2232,7 @@ name = "stratafs-websocket-pubsub-native"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures-executor",
  "futures-util",
  "stratafs-pubsub",
  "stratafs-pubsub-conformance",

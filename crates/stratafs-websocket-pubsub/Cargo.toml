@@ -9,6 +9,7 @@ license.workspace = true
 # client is the native client mounts connect to a coordinator with.
 client = [
     "dep:futures-util",
+    "dep:nix",
     "dep:stratafs-serialized",
     "dep:tokio",
     "dep:tokio-tungstenite",
@@ -17,6 +18,7 @@ client = [
 
 [dependencies]
 futures-util = { workspace = true, optional = true, features = ["sink"] }
+nix = { workspace = true, optional = true, features = ["time"] }
 stratafs-pubsub.workspace = true
 stratafs-serialized = { workspace = true, optional = true }
 thiserror.workspace = true

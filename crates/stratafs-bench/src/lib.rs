@@ -5,13 +5,20 @@ pub mod suite;
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+#[cfg(consistency = "strong")]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_executor::ThreadPool as SpawnerPool;
-use futures_util::task::Spawn;
-use stratafs_fs_engine::error::PosixError;
+#[cfg(consistency = "eventual")]
+use stratafs_fs_engine::Eventual;
+#[cfg(consistency = "strong")]
+use stratafs_fs_engine::StrongUntilDisconnectCached;
+use stratafs_fs_engine::error::{EngineFailure, PosixError};
 use stratafs_fs_engine::observation::{KernelCache, NoKernel};
-use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, MountId, Timestamp};
+use stratafs_fs_engine::{Cached, FsConfig, FsEngine, MountId, Timestamp};
+use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
@@ -124,8 +131,18 @@ pub type BenchStore = stratafs_sqlite::SqliteStore<BenchVolume, ThreadPool>;
 #[cfg(store = "mdbx")]
 pub type BenchStore = stratafs_mdbx::MdbxStore<BenchVolume, ThreadPool>;
 
+// The consistency comes from the build's environment too, as STRATAFS_BENCH_CONSISTENCY: eventual, or strong, whose
+// mounts reach the coordinator whose URL is in the store directory's coordinator file.
+#[cfg(consistency = "eventual")]
+pub type BenchConsistency = Eventual;
+#[cfg(consistency = "strong")]
+pub type BenchConsistency =
+    StrongUntilDisconnectCached<stratafs_websocket_pubsub::client::Client<u64>>;
+
 pub type BenchEngine =
-    FsEngine<BenchStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig, Eventual>;
+    FsEngine<BenchStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig, BenchConsistency>;
+
+type ConsistencyFailure = <BenchConsistency as Cached<BenchStore>>::Failure;
 
 // Store is the store directory opened: the tree holding every volume, and the content of every file.
 pub struct Store {
@@ -166,8 +183,15 @@ pub enum OpenVolumeError {
     #[error("the volume's root directory could not be made")]
     Root(
         #[source]
-        TransactError<VolumeRejection, VolumeFailure, StoreError<VolumeRejection, VolumeFailure>>,
+        TransactError<
+            VolumeRejection,
+            EngineFailure<VolumeFailure, ConsistencyFailure>,
+            StoreError<VolumeRejection, VolumeFailure>,
+        >,
     ),
+    #[cfg(consistency = "strong")]
+    #[error("the runtime the coordinator's client runs on could not start")]
+    Runtime(#[source] io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +214,8 @@ impl From<&OpenVolumeError> for PosixError {
             OpenVolumeError::Store(_) | OpenVolumeError::Volume(_) | OpenVolumeError::Root(_) => {
                 PosixError::EIO
             }
+            #[cfg(consistency = "strong")]
+            OpenVolumeError::Runtime(_) => PosixError::EIO,
         }
     }
 }
@@ -242,15 +268,15 @@ fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError
 }
 
 // open_volume opens volume from the store in directory, as an engine that invalidates kernel's cache, running its
-// auto invalidators on spawner.
+// work on runtime.
 pub async fn open_volume(
     directory: &Path,
     volume: TreeVolumeId,
     kernel: impl KernelCache,
-    spawner: impl Spawn + Send + Sync + 'static,
+    runtime: Arc<dyn Runtime>,
 ) -> Result<BenchEngine, OpenVolumeError> {
     let store = open_store(directory).await?;
-    engine(store, volume, kernel, spawner).await
+    engine(directory, store, volume, kernel, runtime).await
 }
 
 // create_volume makes a new, empty volume in the store in directory, and returns its id.
@@ -267,15 +293,17 @@ pub async fn create_volume(directory: &Path) -> Result<TreeVolumeId, CreateVolum
         .pool_size(1)
         .create()
         .map_err(CreateVolumeError::Pool)?;
-    engine(store, volume, NoKernel, pool).await?;
+    let runtime = Arc::new(ThreadPoolRuntime(pool));
+    engine(directory, store, volume, NoKernel, runtime).await?;
     Ok(volume)
 }
 
 async fn engine(
+    directory: &Path,
     store: Store,
     volume: TreeVolumeId,
     kernel: impl KernelCache,
-    spawner: impl Spawn + Send + Sync + 'static,
+    runtime: Arc<dyn Runtime>,
 ) -> Result<BenchEngine, OpenVolumeError> {
     let metadata = store.tree.open(volume).await.map_err(|error| match error {
         StoreError::Rejected(UnknownVolume) => OpenVolumeError::UnknownVolume,
@@ -288,12 +316,72 @@ async fn engine(
         now as fn() -> Timestamp,
         MountId(rand::random()),
         DURABILITY_LIMIT,
-        Eventual,
+        consistency(directory, volume)?,
         kernel,
-        spawner,
+        runtime,
     )
     .await
     .map_err(OpenVolumeError::Root)
+}
+
+#[cfg(consistency = "eventual")]
+fn consistency(
+    _directory: &Path,
+    _volume: TreeVolumeId,
+) -> Result<BenchConsistency, OpenVolumeError> {
+    Ok(Eventual::default())
+}
+
+// PUBLISH_TIMEOUT is how long a write waits for every other mount holding what it changes. It is longer than the
+// coordinator takes to drop a mount that went silent, so only a coordinator that stopped answering fails a write.
+#[cfg(consistency = "strong")]
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+
+// consistency is the strong consistency of a mount of volume. Each connect reads the coordinator's URL from the
+// directory's coordinator file, so making a volume needs no coordinator, and joins /volume/<its id> there, as each
+// volume's inodes are its own keys. The client runs on a Tokio runtime of its own, which the consistency keeps.
+#[cfg(consistency = "strong")]
+fn consistency(
+    directory: &Path,
+    volume: TreeVolumeId,
+) -> Result<BenchConsistency, OpenVolumeError> {
+    use futures_util::FutureExt;
+    use stratafs_fs_engine::strong::ConnectFailure;
+
+    let coordinator = directory.join("coordinator");
+    let volume = hex::encode(bytes::Bytes::from(volume));
+    let client_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(OpenVolumeError::Runtime)?;
+    let connect = move || {
+        let (coordinator, volume) = (coordinator.clone(), volume.clone());
+        let connecting = Connecting(client_runtime.spawn(async move {
+            let url = std::fs::read_to_string(coordinator)?;
+            let url = format!("{}/volume/{volume}", url.trim().trim_end_matches('/'));
+            let client = stratafs_websocket_pubsub::client::Client::connect(&url).await?;
+            Ok::<_, ConnectFailure>(client)
+        }));
+        async move {
+            let mut connecting = connecting;
+            (&mut connecting.0).await.map_err(ConnectFailure::from)?
+        }
+        .boxed()
+    };
+    Ok(StrongUntilDisconnectCached::new(connect, PUBLISH_TIMEOUT))
+}
+
+// Connecting is a connect running on the client's runtime, which stops when nothing waits for it any more, such as
+// once the consistency's connect time limit passes.
+#[cfg(consistency = "strong")]
+struct Connecting<T>(tokio::task::JoinHandle<T>);
+
+#[cfg(consistency = "strong")]
+impl<T> Drop for Connecting<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 // now is the time in nanoseconds since the Unix epoch.

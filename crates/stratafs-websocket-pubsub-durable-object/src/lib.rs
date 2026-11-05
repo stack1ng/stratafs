@@ -4,8 +4,9 @@
 
 mod membership;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use stratafs_websocket_pubsub::coordinator::{Coordinator, Sockets};
 use stratafs_websocket_pubsub::protocol::{ConnectionId, PING, PONG, SILENT};
@@ -17,6 +18,10 @@ use worker::{
 };
 
 use membership::{StoredMembership, next_connection};
+
+// RECHECK is how soon the object looks again for holders gone silent while a publish waits for them. Cloudflare answers
+// pings without waking the object, so it learns a holder went silent only when it asks.
+const RECHECK: Duration = Duration::from_millis(250);
 
 // fetch sends a connection to /volume/<name> to that volume's coordinator.
 #[event(fetch)]
@@ -35,10 +40,13 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
         .await
 }
 
-#[durable_object(websocket)]
+// The object takes WebSocket events, and alarms to look again for silent holders.
+#[durable_object]
 pub struct VolumeCoordinator {
     state: Rc<State>,
     coordinator: RefCell<Coordinator<StoredMembership>>,
+    // rechecking says whether an alarm is set to look again for silent holders.
+    rechecking: Cell<bool>,
 }
 
 impl DurableObject for VolumeCoordinator {
@@ -59,6 +67,7 @@ impl DurableObject for VolumeCoordinator {
         VolumeCoordinator {
             state,
             coordinator: RefCell::new(Coordinator::new(membership)),
+            rechecking: Cell::new(false),
         }
     }
 
@@ -96,7 +105,20 @@ impl DurableObject for VolumeCoordinator {
             WebSocketIncomingMessage::String(_) => sockets.close(connection),
         }
         self.close(sockets.closing.take());
-        Ok(())
+        self.recheck().await
+    }
+
+    // alarm closes the holders a publish waits for that have gone silent, and looks again later while one still waits.
+    async fn alarm(&self) -> Result<Response> {
+        self.rechecking.set(false);
+        let sockets = Connections {
+            state: &self.state,
+            closing: RefCell::default(),
+        };
+        self.coordinator.borrow().silenced(&sockets);
+        self.close(sockets.closing.take());
+        self.recheck().await?;
+        Response::empty()
     }
 
     async fn websocket_close(
@@ -121,6 +143,15 @@ impl DurableObject for VolumeCoordinator {
 }
 
 impl VolumeCoordinator {
+    // recheck sets an alarm to look for silent holders again, while a publish waits and none is set.
+    async fn recheck(&self) -> Result<()> {
+        if self.coordinator.borrow().waiting() && !self.rechecking.get() {
+            self.state.storage().set_alarm(RECHECK).await?;
+            self.rechecking.set(true);
+        }
+        Ok(())
+    }
+
     // close closes each connection in closing and has the coordinator forget it. That can leave publishes done,
     // whose answers can close more.
     fn close(&self, mut closing: Vec<ConnectionId>) {

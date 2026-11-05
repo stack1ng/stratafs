@@ -15,7 +15,7 @@ use zerocopy::{Immutable, KnownLayout, TryFromBytes};
 use crate::attributes::error::SetattrError;
 use crate::error::{IoFailure, refused_or_failed};
 use crate::key::FsKey;
-use crate::{FsConfig, FsTransaction, Inode, MountId, Timestamp};
+use crate::{Change, FsConfig, FsTransaction, Inode, MountId, Timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable)]
 #[repr(u8)]
@@ -143,7 +143,7 @@ serialized_value! {
     }
 }
 
-serialized_shape! {
+serialized_value! {
     // ChangeVersion counts an inode's changes, and names the mount that made the latest. Every change moves the
     // number by one, whichever mount makes it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +217,8 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
         inode: Inode,
         attributes: &Attributes,
     ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
+        self.changes
+            .insert(inode, Change::Written(attributes.clone()));
         self.metadata
             .set(FsKey::new_attributes(inode).into(), Bytes::from(attributes))
             .map_err(refused_or_failed)

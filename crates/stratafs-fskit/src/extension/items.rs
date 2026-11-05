@@ -49,15 +49,17 @@ pub(crate) struct Locked<'a> {
 }
 
 impl Items {
-    // reply locks every inode in reads, in inode order so operations never wait on each other in a cycle,
-    // keeps each read that is newer than the newest attributes already handed out, and calls reply while
-    // the locks are held. A state left with no item afterwards is one a directory listing only handed FSKit the
-    // attributes of, which the kernel keeps nothing of, so it goes, and an operation waiting on it starts over.
+    // reply locks every inode in reads, in inode order so operations never wait on each other in a cycle, and asks
+    // vouch while the locks are held. When it vouches, reply keeps each read that is newer than the newest attributes
+    // already handed out, and calls reply while the locks are held; otherwise it replies nothing and returns None. A
+    // state left with no item afterwards is one a directory listing only handed FSKit the attributes of, which the
+    // kernel keeps nothing of, so it goes, and an operation waiting on it starts over.
     pub(crate) fn reply<R>(
         &self,
         reads: impl IntoIterator<Item = (Inode, Attributes)>,
+        vouch: &dyn Fn() -> bool,
         reply: impl FnOnce(&mut Locked<'_>) -> R,
-    ) -> R {
+    ) -> Option<R> {
         // A reply can read one inode twice, such as a rename within one directory, so keep the newer read.
         let mut reads_by_inode: BTreeMap<u64, Attributes> = BTreeMap::new();
         for (inode, read) in reads {
@@ -91,7 +93,11 @@ impl Items {
             if locked.states.values().any(|state| state.retired) {
                 continue;
             }
-            for (inode, read) in std::mem::take(&mut reads_by_inode) {
+            let vouched = vouch();
+            for (inode, read) in std::mem::take(&mut reads_by_inode)
+                .into_iter()
+                .filter(|_| vouched)
+            {
                 let state = locked
                     .states
                     .get_mut(&inode)
@@ -104,7 +110,7 @@ impl Items {
                     state.newest = Some(read);
                 }
             }
-            let replied = reply(&mut locked);
+            let replied = vouched.then(|| reply(&mut locked));
             let mut map = self.states.lock().unwrap_or_else(PoisonError::into_inner);
             for (inode, state) in &mut locked.states {
                 if state.item.is_none() {
@@ -136,11 +142,11 @@ impl Items {
         }
     }
 
-    // reclaim lets go of item, unless FSKit handed it out again since asking for the reclaim, and says whether
-    // the item it let go of has no name, by the newest attributes handed out for it, or None when it kept the item.
-    // The inode's lock is held throughout, so no lookup can hand the item out meanwhile, as FSItem's tryReclaim
-    // requires.
-    pub(crate) fn reclaim(&self, item: &StrataItem) -> Option<bool> {
+    // reclaim lets go of item, unless FSKit handed it out again since asking for the reclaim, runs forget, and says
+    // whether the item it let go of has no name, by the newest attributes handed out for it, or None when it kept the
+    // item. The inode's lock is held throughout, so no lookup can hand the item out meanwhile, as FSItem's tryReclaim
+    // requires, and none can hand out a new item before forget has run.
+    pub(crate) fn reclaim(&self, item: &StrataItem, forget: impl FnOnce()) -> Option<bool> {
         let inode = *item.inode();
         let state = self.state(inode)?;
         let mut locked = state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -149,6 +155,7 @@ impl Items {
         if !reclaimed {
             return None;
         }
+        forget();
         locked.retired = true;
         self.states
             .lock()
@@ -171,11 +178,14 @@ impl Items {
 
     // item_to_invalidate is inode's item and the caching the kernel holds for it, which invalidating its kernel copy
     // takes. It is None when FSKit holds no item for inode, or the item is a symbolic link, since the kernel
-    // invalidates only files and directories.
+    // invalidates only files and directories, or the root, which the kernel refuses to invalidate (FB25243414).
     pub(crate) fn item_to_invalidate(
         &self,
         inode: Inode,
     ) -> Option<(Retained<StrataItem>, Granted)> {
+        if inode == Inode::ROOT {
+            return None;
+        }
         let state = self.state(inode)?;
         let state = state.lock().unwrap_or_else(PoisonError::into_inner);
         let item = state
@@ -195,6 +205,11 @@ impl Items {
 }
 
 impl Locked<'_> {
+    // holds says whether FSKit holds an item for inode, one of the inodes locked.
+    pub(crate) fn holds(&self, inode: Inode) -> bool {
+        self.states[&inode.0].item.is_some()
+    }
+
     // attributes fills a snapshot of inode's newest attributes.
     pub(crate) fn attributes(&self, inode: Inode) -> Retained<FSItemAttributes> {
         let newest = self.states[&inode.0]

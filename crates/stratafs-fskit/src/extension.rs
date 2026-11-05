@@ -18,7 +18,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use clap::Parser;
 use futures_lite::future::block_on;
-use futures_util::task::Spawn;
 use objc2::ClassType;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -28,6 +27,7 @@ use objc2_foundation::{
 };
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{Cached, FsConfig, FsEngine, Timestamp};
+use stratafs_runtime::Runtime;
 use stratafs_store::store::Store;
 
 use crate::mount_options::MountOptions;
@@ -80,21 +80,20 @@ static OPEN_VOLUME: OnceLock<OpenVolume> = OnceLock::new();
 
 // run starts the FSKit extension and never returns. The extension binary's main calls it.
 // When FSKit activates a mounted volume, run's open_volume opens it from the store directory mount was
-// given and the volume its -o volume option names, as an engine that invalidates the kernel cache it is handed,
-// running its auto invalidators on the spawner it is handed. Its errors reach mount as the POSIX errors they
-// stand for.
+// given and the volume its -o volume option names, as an engine that keeps the kernel cache it is handed in line,
+// running its tasks on the runtime it is handed. Its errors reach mount as the POSIX errors they stand for.
 // FSKit hands every operation over on one thread and does not wait for the reply. Each operation runs on
 // that thread until it finishes or yields, as a store does while it waits for the disk to make commits durable, and then
-// finishes on spawner, so FSKit can hand over the next one. Store work that blocks without yielding, such as
-// file IO on this machine's disk, holds up that thread. spawner must run on threads of its own:
+// finishes on runtime, so FSKit can hand over the next one. Store work that blocks without yielding, such as
+// file IO on this machine's disk, holds up that thread. runtime must run on threads of its own:
 // NSExtensionMain keeps the main thread.
 pub fn run<V, St, A, N, S, C, F>(
-    spawner: impl Spawn + Send + Sync + 'static,
+    runtime: impl Runtime,
     open_volume: impl AsyncFn(
         &Path,
         V,
         FsKitCache,
-        Arc<dyn Spawn + Send + Sync>,
+        Arc<dyn Runtime>,
     ) -> Result<FsEngine<St, A, N, S, C>, F>
     + Send
     + Sync
@@ -110,7 +109,7 @@ where
     F: Error + Send + Sync + 'static,
     for<'e> PosixError: From<&'e F>,
 {
-    if OPEN_VOLUME.set(opener(spawner, open_volume)).is_err() {
+    if OPEN_VOLUME.set(opener(runtime, open_volume)).is_err() {
         panic!("run is called once per extension process");
     }
     // NSExtensionMain finds our classes by the names in Info.plist, so they must exist first.
@@ -135,14 +134,14 @@ where
 const DURABILITY_CADENCE: Duration = Duration::from_secs(30);
 
 // opener wraps open_volume so it takes the store directory and activate's options, and returns the volume
-// as FSKit's classes hold it, running its operations on spawner.
+// as FSKit's classes hold it, running its operations on runtime.
 fn opener<V, St, A, N, S, C, F>(
-    spawner: impl Spawn + Send + Sync + 'static,
+    runtime: impl Runtime,
     open_volume: impl AsyncFn(
         &Path,
         V,
         FsKitCache,
-        Arc<dyn Spawn + Send + Sync>,
+        Arc<dyn Runtime>,
     ) -> Result<FsEngine<St, A, N, S, C>, F>
     + Send
     + Sync
@@ -158,7 +157,7 @@ where
     F: Error + Send + Sync + 'static,
     for<'e> PosixError: From<&'e F>,
 {
-    let spawner: Arc<dyn Spawn + Send + Sync> = Arc::new(spawner);
+    let runtime: Arc<dyn Runtime> = Arc::new(runtime);
     Box::new(move |store, arguments, kernel| {
         let arguments = ActivateArguments::try_parse_from(arguments)
             .map_err(ActivateError::UnreadableOptions)?;
@@ -168,16 +167,22 @@ where
             .parse()
             .map_err(|error| ActivateError::InvalidOptions(Box::new(error)))?;
         let id = options.volume.clone().into();
-        let engine = block_on(open_volume(store, options.volume, kernel, spawner.clone()))
-            .map_err(|error| ActivateError::OpenFailed {
-                posix: PosixError::from(&error),
-                source: Box::new(error),
-            })?;
+        let engine = block_on(open_volume(
+            store,
+            options.volume,
+            kernel.clone(),
+            runtime.clone(),
+        ))
+        .map_err(|error| ActivateError::OpenFailed {
+            posix: PosixError::from(&error),
+            source: Box::new(error),
+        })?;
         let (stops_durability_cadence, durability_cadence_stopped) = mpsc::channel();
         let volume = Arc::new(Volume {
             engine,
-            spawner: spawner.clone(),
+            runtime: runtime.clone(),
             items: Items::default(),
+            kernel,
             stops_durability_cadence,
         });
         make_durable_on_cadence(

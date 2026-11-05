@@ -16,9 +16,9 @@ pub trait Sockets {
     fn silent(&self, connection: ConnectionId) -> bool;
 }
 
-// Membership is the coordinator's state that has to outlive the coordinator itself: which connections hold each key,
-// and the last message published to each key. A host whose coordinator can be dropped while its connections stay
-// open, as a hibernating Durable Object's is, keeps it in storage.
+// Membership is the coordinator's state that has to outlive the coordinator itself: which connections hold each key.
+// A host whose coordinator can be dropped while its connections stay open, as a hibernating Durable Object's is,
+// keeps it in storage.
 pub trait Membership {
     fn holders(&self, key: Key) -> Vec<ConnectionId>;
 
@@ -28,10 +28,6 @@ pub trait Membership {
 
     // release_all releases every key connection holds.
     fn release_all(&mut self, connection: ConnectionId);
-
-    fn last(&self, key: Key) -> Option<Vec<u8>>;
-
-    fn set_last(&mut self, key: Key, message: &[u8]);
 }
 
 pub struct Coordinator<M> {
@@ -63,9 +59,7 @@ impl<M: Membership> Coordinator<M> {
         match frame {
             ClientFrame::Subscribe { key } => {
                 self.membership.hold(key, connection);
-                let last = self.membership.last(key);
-                let last = last.as_deref();
-                sockets.send(connection, &ServerFrame::Subscribed { key, last }.encode());
+                sockets.send(connection, &ServerFrame::Subscribed { key }.encode());
             }
             ClientFrame::Unsubscribe { key } => {
                 self.membership.release(key, connection);
@@ -78,7 +72,6 @@ impl<M: Membership> Coordinator<M> {
                 key,
                 message,
             } => {
-                self.membership.set_last(key, message);
                 let mut missing = HashSet::new();
                 for holder in self.membership.holders(key) {
                     if holder == connection {
@@ -129,6 +122,26 @@ impl<M: Membership> Coordinator<M> {
         }
     }
 
+    // waiting says whether a publish still waits for a holder.
+    pub fn waiting(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    // silenced closes every holder a publish waits for that has gone silent since, for a host that learns of silence
+    // only when it asks.
+    pub fn silenced(&self, sockets: &impl Sockets) {
+        let missing: HashSet<ConnectionId> = self
+            .pending
+            .values()
+            .flat_map(|pending| pending.missing.iter().copied())
+            .collect();
+        for holder in missing {
+            if sockets.silent(holder) {
+                sockets.close(holder);
+            }
+        }
+    }
+
     // closed forgets connection: what it holds, and the publishes it made. Publishes it had not acknowledged are
     // done once nothing else is missing.
     pub fn closed(&mut self, connection: ConnectionId, sockets: &impl Sockets) {
@@ -163,7 +176,6 @@ impl<M: Membership> Coordinator<M> {
 pub struct MemoryMembership {
     holders: HashMap<Key, HashSet<ConnectionId>>,
     held: HashMap<ConnectionId, HashSet<Key>>,
-    last: HashMap<Key, Vec<u8>>,
 }
 
 impl Membership for MemoryMembership {
@@ -203,14 +215,6 @@ impl Membership for MemoryMembership {
                 }
             }
         }
-    }
-
-    fn last(&self, key: Key) -> Option<Vec<u8>> {
-        self.last.get(&key).cloned()
-    }
-
-    fn set_last(&mut self, key: Key, message: &[u8]) {
-        self.last.insert(key, message.to_vec());
     }
 }
 

@@ -146,6 +146,7 @@ fn every_kind_of_key_sorts_together_under_its_inode_in_declaration_order() {
         Bytes::from(FsKey::new_extent(Inode(256), 1)),
         Bytes::from(FsKey::new_extent(Inode(256), 0x0100)),
         Bytes::from(FsKey::new_extent(Inode(256), u64::MAX)),
+        Bytes::from(FsKey::new_pending_change_version(Inode(256))),
         Bytes::from(FsKey::new_attributes(Inode(257))),
     ];
     let mut sorted = ordered.to_vec();
@@ -211,7 +212,7 @@ fn the_hard_link_range_holds_exactly_the_inodes_hard_links() {
 }
 
 #[test]
-fn every_key_of_an_inode_holds_all_its_kinds_and_no_neighbours() {
+fn every_key_of_an_inode_holds_all_its_kinds_but_its_pending_change_version_and_no_neighbours() {
     let range = every_key_of(Inode(256));
     for (key, inside) in [
         (
@@ -233,10 +234,23 @@ fn every_key_of_an_inode_holds_all_its_kinds_and_no_neighbours() {
             Bytes::from(FsKey::new_symbolic_link_target(Inode(256))),
             true,
         ),
+        (Bytes::from(FsKey::new_extent(Inode(256), u64::MAX)), true),
+        (
+            Bytes::from(FsKey::new_pending_change_version(Inode(256))),
+            false,
+        ),
         (Bytes::from(FsKey::new_attributes(Inode(257))), false),
     ] {
         assert_eq!(range.contains(&key), inside, "{key:?}");
     }
+}
+
+#[test]
+fn pending_change_version_keys_are_the_inode_then_the_last_tag() {
+    assert_eq!(
+        Bytes::from(FsKey::new_pending_change_version(Inode(0x0102)))[..],
+        [0, 0, 0, 0, 0, 0, 0x01, 0x02, 8]
+    );
 }
 
 #[test]

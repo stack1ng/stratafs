@@ -12,10 +12,14 @@ pub struct ConnectionId(pub u64);
 pub const PING: &str = "ping";
 pub const PONG: &str = "pong";
 
-// A client pings every PING_EVERY. Either side counts the other gone once it has heard nothing from it for SILENT,
-// two pings, since a connection the network drops does not close.
-pub const PING_EVERY: Duration = Duration::from_secs(1);
+// A client pings every PING_EVERY. A host counts a client gone once it has heard nothing from it for SILENT, eight
+// pings, since a connection the network drops does not close.
+pub const PING_EVERY: Duration = Duration::from_millis(250);
 pub const SILENT: Duration = Duration::from_secs(2);
+// A client counts its host gone once CLIENT_SILENT passes after its last answered ping. It is below SILENT, so a
+// client fails before a host can drop it and let publishes past it. Pings come often, so a ping a busy machine sends
+// late is still answered within CLIENT_SILENT.
+pub const CLIENT_SILENT: Duration = Duration::from_millis(1500);
 
 // ClientFrame is a frame a client sends. A publish is named by its publisher's connection and the request number
 // the publisher gave it.
@@ -45,10 +49,9 @@ pub enum ClientFrame<'a> {
 // ServerFrame is a frame a coordinator sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerFrame<'a> {
-    // Subscribed answers Subscribe once the connection holds key, with the last message published to key.
+    // Subscribed answers Subscribe once the connection holds key.
     Subscribed {
         key: Key,
-        last: Option<&'a [u8]>,
     },
     Deliver {
         publisher: ConnectionId,
@@ -116,11 +119,7 @@ impl<'a> ClientFrame<'a> {
 impl ServerFrame<'_> {
     pub fn encode(&self) -> Vec<u8> {
         match *self {
-            ServerFrame::Subscribed { key, last: None } => frame(6, &[key.0], &[]),
-            ServerFrame::Subscribed {
-                key,
-                last: Some(last),
-            } => frame(7, &[key.0], last),
+            ServerFrame::Subscribed { key } => frame(6, &[key.0], &[]),
             ServerFrame::Deliver {
                 publisher,
                 request,
@@ -139,11 +138,6 @@ impl<'a> ServerFrame<'a> {
         let decoded = match tag {
             6 => ServerFrame::Subscribed {
                 key: Key(reader.integer()?),
-                last: None,
-            },
-            7 => ServerFrame::Subscribed {
-                key: Key(reader.integer()?),
-                last: Some(reader.rest()),
             },
             8 => ServerFrame::Deliver {
                 publisher: ConnectionId(reader.integer()?),

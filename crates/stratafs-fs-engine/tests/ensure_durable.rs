@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
+use futures_executor::ThreadPool;
 use futures_lite::future::block_on;
-use futures_util::task::{FutureObj, Spawn, SpawnError};
 use object_store::memory::InMemory;
 use redb::Database;
 use redb::backends::InMemoryBackend;
@@ -11,19 +11,10 @@ use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_lock_synchronized::{LockSynchronizedMetadata, LockSynchronizedStore};
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
+use stratafs_runtime::ThreadPoolRuntime;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::spawn::Inline;
 use stratafs_store::store::Store;
-
-// ThreadSpawner runs each task on a thread of its own.
-struct ThreadSpawner;
-
-impl Spawn for ThreadSpawner {
-    fn spawn_obj(&self, task: FutureObj<'static, ()>) -> Result<(), SpawnError> {
-        std::thread::spawn(move || block_on(task));
-        Ok(())
-    }
-}
 
 type Log = Arc<Mutex<Vec<DurableAgainst>>>;
 
@@ -80,9 +71,9 @@ fn durable_against(durability_limit: Option<DurableAgainst>) -> Vec<DurableAgain
         now,
         MountId(1),
         durability_limit,
-        Eventual,
+        Eventual::default(),
         NoKernel,
-        ThreadSpawner,
+        Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
     ))
     .unwrap();
     for against in [

@@ -30,18 +30,7 @@ fn every_client_frame_decodes_to_itself() {
 fn every_server_frame_decodes_to_itself() {
     let message = [7u8, 8, 9];
     for frame in [
-        ServerFrame::Subscribed {
-            key: Key(1),
-            last: None,
-        },
-        ServerFrame::Subscribed {
-            key: Key(1),
-            last: Some(&message),
-        },
-        ServerFrame::Subscribed {
-            key: Key(1),
-            last: Some(&[]),
-        },
+        ServerFrame::Subscribed { key: Key(1) },
         ServerFrame::Deliver {
             publisher: ConnectionId(2),
             request: 3,

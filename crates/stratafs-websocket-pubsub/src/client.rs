@@ -1,6 +1,6 @@
 // The client a mount connects to its volume's coordinator with, typed by the message it publishes. One connection
-// carries every subscription and publish, and runs on the Tokio runtime connect is called on. When it fails, every
-// subscription and pending publish fails with it.
+// carries every subscription and publish, and runs on the Tokio runtime connect is called on, so the client's futures
+// can be polled on any executor. When it fails, every subscription and pending publish fails with it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -9,16 +9,22 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
+use nix::time::{ClockId, clock_gettime};
 use stratafs_pubsub::{PubSub, PubSubError};
 use stratafs_serialized::{LittleEndian, ViewError};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Instant, interval, timeout_at};
+use tokio::time::{interval, sleep};
 use tokio_tungstenite::tungstenite::{self, Message as WebSocketMessage};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::protocol::{
-    ClientFrame, Key, MalformedFrame, PING, PING_EVERY, PONG, SILENT, ServerFrame,
+    CLIENT_SILENT, ClientFrame, Key, MalformedFrame, PING, PING_EVERY, PONG, ServerFrame,
 };
+
+// CHECK_EVERY is how often the client looks at the clock for its deadline, since Tokio's timers stop while the
+// machine sleeps.
+const CHECK_EVERY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, thiserror::Error)]
 #[error("connecting to the coordinator failed")]
@@ -44,6 +50,8 @@ pub enum Failure {
 pub struct Client<M> {
     outgoing: mpsc::UnboundedSender<WebSocketMessage>,
     shared: Arc<Mutex<Shared<M>>>,
+    // runtime is the runtime connect was called on, which keeps publish's timer.
+    runtime: Handle,
 }
 
 // Subscription holds its key until it is dropped.
@@ -57,7 +65,6 @@ type OnPublished<M> = Arc<dyn Fn(M) -> BoxFuture<'static, ()> + Send + Sync>;
 
 // Subscribing is a subscribe waiting for its Subscribed.
 struct Subscribing<M> {
-    on_subscribed: Box<dyn FnOnce(Option<M>) + Send>,
     on_published: OnPublished<M>,
     waiter: oneshot::Sender<()>,
 }
@@ -83,8 +90,8 @@ impl<M> Shared<M> {
 }
 
 impl<M: LittleEndian + Send + 'static> Client<M> {
-    // connect connects to the coordinator at url. A connection whose pings go unanswered for SILENT fails. Connecting
-    // has no time limit of its own, so a caller that needs one sets it.
+    // connect connects to the coordinator at url. A connection whose pings go unanswered for CLIENT_SILENT fails.
+    // Connecting has no time limit of its own, so a caller that needs one sets it.
     pub async fn connect(url: &str) -> Result<Self, ConnectError> {
         let (socket, _) = tokio_tungstenite::connect_async_with_config(url, None, true)
             .await
@@ -102,7 +109,11 @@ impl<M: LittleEndian + Send + 'static> Client<M> {
             shared: Arc::clone(&shared),
         };
         tokio::spawn(drive(socket, failing, outgoing.downgrade()));
-        Ok(Client { outgoing, shared })
+        Ok(Client {
+            outgoing,
+            shared,
+            runtime: Handle::current(),
+        })
     }
 
     fn failure(&self) -> Arc<Failure> {
@@ -121,7 +132,6 @@ impl<M: LittleEndian + Send + Sync + 'static> PubSub for Client<M> {
     async fn subscribe<Handled>(
         &self,
         key: Key,
-        on_subscribed: impl FnOnce(Option<M>) + Send + 'static,
         on_published: impl Fn(M) -> Handled + Send + Sync + 'static,
     ) -> Result<Subscription<M>, PubSubError<Arc<Failure>>>
     where
@@ -146,7 +156,6 @@ impl<M: LittleEndian + Send + Sync + 'static> PubSub for Client<M> {
                 .insert(
                     key,
                     Some(Subscribing {
-                        on_subscribed: Box::new(on_subscribed),
                         on_published,
                         waiter,
                     }),
@@ -197,7 +206,12 @@ impl<M: LittleEndian + Send + Sync + 'static> PubSub for Client<M> {
                 message: message.to_little_endian().as_bytes(),
             },
         );
-        match tokio::time::timeout(timeout, done).await {
+        // Made in the runtime's context, so it can be polled outside it.
+        let done = {
+            let _runtime = self.runtime.enter();
+            tokio::time::timeout(timeout, done)
+        };
+        match done.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(PubSubError::Failed(self.failure())),
             Err(_) => Err(PubSubError::TimedOut),
@@ -272,7 +286,8 @@ impl<M> Drop for Failing<M> {
 }
 
 // drive runs the connection until it fails or every handle to it is dropped: it sends what the handles queue, answers
-// what the coordinator sends, and pings it. Every write has to finish before the ping deadline too.
+// what the coordinator sends, and pings it. It fails once CLIENT_SILENT passes after the last answered ping, even in
+// the middle of a write.
 async fn drive<M: LittleEndian + Send + 'static>(
     mut socket: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -281,43 +296,51 @@ async fn drive<M: LittleEndian + Send + 'static>(
     outgoing: mpsc::WeakUnboundedSender<WebSocketMessage>,
 ) {
     let mut pings = interval(PING_EVERY);
-    let mut answered = Instant::now();
+    let mut answered = since_boot();
     let failure = loop {
-        let deadline = answered + SILENT;
-        tokio::select! {
-            received = socket.next() => match received {
-                Some(Ok(WebSocketMessage::Binary(frame))) => {
-                    if let Err(failure) = received_frame(&frame, &failing.shared, &outgoing) {
-                        break failure;
+        let deadline = answered + CLIENT_SILENT;
+        // A machine that slept past the deadline fails before it handles what it reads on waking, which may be a pong
+        // sent before it slept.
+        if since_boot() >= deadline {
+            break Failure::Unanswered;
+        }
+        let message = tokio::select! {
+            received = socket.next() => {
+                match received {
+                    Some(Ok(WebSocketMessage::Binary(frame))) => {
+                        if let Err(failure) = received_frame(&frame, &failing.shared, &outgoing) {
+                            break failure;
+                        }
                     }
+                    Some(Ok(WebSocketMessage::Text(text))) if text.as_str() == PONG => {
+                        let now = since_boot();
+                        if now >= deadline {
+                            break Failure::Unanswered;
+                        }
+                        answered = now;
+                    }
+                    // Tungstenite answers WebSocket pings itself.
+                    Some(Ok(WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_))) => {}
+                    Some(Err(error)) => break Failure::Socket(error),
+                    Some(Ok(_)) | None => break Failure::Closed,
                 }
-                Some(Ok(WebSocketMessage::Text(text))) if text.as_str() == PONG => {
-                    answered = Instant::now();
-                }
-                // Tungstenite answers WebSocket pings itself.
-                Some(Ok(WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_))) => {}
-                Some(Err(error)) => break Failure::Socket(error),
-                Some(Ok(_)) | None => break Failure::Closed,
-            },
+                continue;
+            }
             queued = failing.sent.recv() => match queued {
-                Some(message) => match timeout_at(deadline, socket.send(message)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => break Failure::Socket(error),
-                    Err(_) => break Failure::Unanswered,
-                },
+                Some(message) => message,
                 // Every handle is gone, so nothing is waiting to hear why.
                 None => break Failure::Ended,
             },
-            _ = pings.tick() => {
-                if Instant::now() > deadline {
-                    break Failure::Unanswered;
-                }
-                match timeout_at(deadline, socket.send(WebSocketMessage::Text(PING.into()))).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => break Failure::Socket(error),
-                    Err(_) => break Failure::Unanswered,
+            _ = pings.tick() => WebSocketMessage::Text(PING.into()),
+            () = passed(deadline) => break Failure::Unanswered,
+        };
+        tokio::select! {
+            sent = socket.send(message) => {
+                if let Err(error) = sent {
+                    break Failure::Socket(error);
                 }
             }
+            () = passed(deadline) => break Failure::Unanswered,
         }
     };
     failing
@@ -327,6 +350,28 @@ async fn drive<M: LittleEndian + Send + 'static>(
         .failure = Some(Arc::new(failure));
     drop(failing);
     let _ = tokio::time::timeout(PING_EVERY, socket.close(None)).await;
+}
+
+// passed resolves once deadline has passed on the boot clock, within CHECK_EVERY of it, the machine's sleep included.
+async fn passed(deadline: Duration) {
+    loop {
+        let left = deadline.saturating_sub(since_boot());
+        if left.is_zero() {
+            return;
+        }
+        sleep(left.min(CHECK_EVERY)).await;
+    }
+}
+
+// since_boot is the time on a clock that keeps counting while the machine sleeps, as macOS's CLOCK_MONOTONIC does.
+fn since_boot() -> Duration {
+    #[cfg(target_os = "linux")]
+    const CLOCK: ClockId = ClockId::CLOCK_BOOTTIME;
+    #[cfg(not(target_os = "linux"))]
+    const CLOCK: ClockId = ClockId::CLOCK_MONOTONIC;
+    clock_gettime(CLOCK)
+        .expect("the system has the clock")
+        .into()
 }
 
 // received_frame handles one frame from the coordinator. A frame that is not one, or a message that is not an M,
@@ -339,27 +384,19 @@ fn received_frame<M: LittleEndian + Send + 'static>(
     let frame = ServerFrame::decode(frame).map_err(Failure::Malformed)?;
     let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
     match frame {
-        ServerFrame::Subscribed { key, last } => {
-            let last = last
-                .map(decode::<M>)
-                .transpose()
-                .map_err(Failure::Message)?;
-            match shared.subscribing.remove(&key) {
-                Some(Some(subscribing)) => {
-                    // Delivers read before this belong to an earlier hold of key, so the handler joins only now.
-                    shared.published.insert(key, subscribing.on_published);
-                    drop(shared);
-                    (subscribing.on_subscribed)(last);
-                    let _ = subscribing.waiter.send(());
-                }
-                Some(None) => {
-                    if let Some(outgoing) = outgoing.upgrade() {
-                        send(&outgoing, ClientFrame::Unsubscribe { key });
-                    }
-                }
-                None => {}
+        ServerFrame::Subscribed { key } => match shared.subscribing.remove(&key) {
+            Some(Some(subscribing)) => {
+                // Delivers read before this belong to an earlier hold of key, so the handler joins only now.
+                shared.published.insert(key, subscribing.on_published);
+                let _ = subscribing.waiter.send(());
             }
-        }
+            Some(None) => {
+                if let Some(outgoing) = outgoing.upgrade() {
+                    send(&outgoing, ClientFrame::Unsubscribe { key });
+                }
+            }
+            None => {}
+        },
         ServerFrame::Deliver {
             publisher,
             request,

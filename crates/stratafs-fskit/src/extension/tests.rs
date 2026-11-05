@@ -6,8 +6,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use block2::RcBlock;
-use futures_util::future::FutureObj;
-use futures_util::task::SpawnError;
+use futures_executor::ThreadPool;
 use objc2::encode::RefEncode;
 use objc2::{AllocAnyThread, msg_send};
 use objc2_foundation::{NSError, NSString, NSURL};
@@ -28,6 +27,7 @@ use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, Timestamp
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
+use stratafs_runtime::ThreadPoolRuntime;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::spawn::SpawnBlocking;
 
@@ -62,7 +62,7 @@ impl SpawnBlocking for SimulatedThreadPool {
 
 async fn new_engine(
     kernel: impl KernelCache,
-    spawner: impl Spawn + Send + Sync + 'static,
+    runtime: Arc<dyn Runtime>,
 ) -> Result<TestEngine, io::Error> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
@@ -78,22 +78,12 @@ async fn new_engine(
         now,
         MountId(1),
         Some(DurableAgainst::PowerFailure),
-        Eventual,
+        Eventual::default(),
         kernel,
-        spawner,
+        runtime,
     )
     .await
     .map_err(io::Error::other)
-}
-
-// ThreadSpawner finishes each operation that has to wait on a thread of its own, which is enough for tests.
-struct ThreadSpawner;
-
-impl Spawn for ThreadSpawner {
-    fn spawn_obj(&self, operation: FutureObj<'static, ()>) -> Result<(), SpawnError> {
-        std::thread::spawn(move || block_on(operation));
-        Ok(())
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -132,18 +122,18 @@ fn install() {
         assert!(
             OPEN_VOLUME
                 .set(opener(
-                    ThreadSpawner,
+                    ThreadPoolRuntime(ThreadPool::new().unwrap()),
                     async |mounted: &Path,
                            volume: Bytes,
                            kernel: FsKitCache,
-                           spawner: Arc<dyn Spawn + Send + Sync>| {
+                           runtime: Arc<dyn Runtime>| {
                         if mounted != store() {
                             return Err(TestOpenError::WrongStore(mounted.to_owned()));
                         }
                         match &volume[..] {
                             [0xff] => Err(TestOpenError::Down),
                             [0xbb] => Err(TestOpenError::Busy),
-                            _ => new_engine(kernel, spawner)
+                            _ => new_engine(kernel, runtime)
                                 .await
                                 .map_err(TestOpenError::Engine),
                         }

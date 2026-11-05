@@ -4,8 +4,9 @@ mod execute;
 mod forking;
 mod model;
 mod observation_lifecycle;
-pub mod runtime;
 mod simulation;
+
+pub use stratafs_runtime::replay as runtime;
 
 use std::ops::Bound;
 use std::panic::AssertUnwindSafe;

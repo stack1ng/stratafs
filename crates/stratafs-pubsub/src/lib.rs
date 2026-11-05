@@ -31,13 +31,12 @@ pub trait PubSub: Send + Sync + 'static {
     // Failure is why the client failed.
     type Failure: std::error::Error + Clone + Send + Sync + 'static;
 
-    // subscribe makes the client a holder of key. on_subscribed gets the last message published to key, if any,
-    // before subscribe returns, and must not block. on_published then runs for each message another client
-    // publishes to key, and that publish waits for the future it returns.
+    // subscribe makes the client a holder of key, and returns once it holds it. on_published then runs for each
+    // message another client publishes to key, and that publish waits for the future it returns. A publish that lands
+    // before the client holds key never reaches it, so the subscriber closes that race through its own store.
     fn subscribe<Handled>(
         &self,
         key: Key,
-        on_subscribed: impl FnOnce(Option<Self::Message>) + Send + 'static,
         on_published: impl Fn(Self::Message) -> Handled + Send + Sync + 'static,
     ) -> impl Future<Output = Result<Self::Subscription, PubSubError<Self::Failure>>> + Send
     where

@@ -28,6 +28,7 @@ futures-channel = "0.3.34"
 futures-core = "0.3.34"
 futures-executor = { version = "0.3.34", default-features = false, features = ["std", "thread-pool"] }
 futures-lite = "2.6"
+futures-timer = "3"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hex = "0.4"
 libc = "0.2"
@@ -61,6 +62,7 @@ stratafs-pubsub = { path = "crates/stratafs-pubsub" }
 stratafs-pubsub-conformance = { path = "crates/stratafs-pubsub-conformance" }
 stratafs-range-bounds-map = { path = "crates/stratafs-range-bounds-map" }
 stratafs-redb = { path = "crates/stratafs-redb" }
+stratafs-runtime = { path = "crates/stratafs-runtime" }
 stratafs-serialized = { path = "crates/stratafs-serialized" }
 stratafs-sqlite = { path = "crates/stratafs-sqlite" }
 stratafs-store = { path = "crates/stratafs-store" }

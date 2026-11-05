@@ -1,8 +1,6 @@
 // no_holder_misses_a_publish runs clients that subscribe, unsubscribe, publish, disconnect and are cut at random, all
 // at once, and checks that each publish resolved only after every other client that held its key from before the
-// publish began, and still held it when the publish resolved, had handled it. A subscribe that a publish raced, or
-// that came after it, must instead have got it, or a later message, from on_subscribed. Each round has its own seed
-// and keys.
+// publish began, and still held it when the publish resolved, had handled it. Each round has its own seed and keys.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -62,11 +60,8 @@ struct History {
 struct Hold {
     client: u64,
     key: Key,
-    // subscribing is when its subscribe began, and subscribed when it returned.
-    subscribing: Instant,
+    // subscribed is when its subscribe returned.
     subscribed: Option<Instant>,
-    // last is what its on_subscribed got.
-    last: Option<Option<u64>>,
     // released is when its subscription was dropped.
     released: Option<Instant>,
 }
@@ -100,7 +95,6 @@ impl History {
                 if hold.key != publish.key {
                     continue;
                 }
-                self.check_last(round, hold, publish, hold_index, subscribed);
                 let owed = hold.client != publish.client
                     && subscribed < publish.began
                     && self.held_through(hold, publish.resolved);
@@ -137,45 +131,6 @@ impl History {
         owed_handlings
     }
 
-    // check_last checks that hold's on_subscribed got publish, or a later message, when publish took effect before
-    // the hold began: it resolved before the subscribe began, or it raced the subscribe and the hold, held throughout,
-    // never handled it.
-    fn check_last(
-        &self,
-        round: u64,
-        hold: &Hold,
-        publish: &Publish,
-        hold_index: usize,
-        subscribed: Instant,
-    ) {
-        let raced = hold.client != publish.client
-            && publish.began < subscribed
-            && self.held_through(hold, publish.resolved)
-            && !self.handled.iter().any(|(handled_hold, message, _)| {
-                *handled_hold == hold_index && *message == publish.message
-            });
-        if publish.resolved >= hold.subscribing && !raced {
-            return;
-        }
-        let last = hold
-            .last
-            .expect("on_subscribed runs before subscribe returns");
-        // A later message is one whose publish resolved after this one began, so it can have taken effect after it.
-        let later_or_same = last.is_some_and(|last| {
-            self.publishes.iter().any(|other| {
-                other.key == publish.key
-                    && other.message == last
-                    && (other.message == publish.message || other.resolved > publish.began)
-            })
-        });
-        assert!(
-            later_or_same,
-            "round {round}: client {}'s subscribe to {:?} got {last:?} from on_subscribed, missing client {}'s \
-             publish of {}",
-            hold.client, publish.key, publish.client, publish.message,
-        );
-    }
-
     // held_through says whether hold was still held at at: neither released nor its client gone.
     fn held_through(&self, hold: &Hold, at: Instant) -> bool {
         hold.released.is_none_or(|released| released > at)
@@ -206,32 +161,25 @@ async fn run_client<V: Volume>(
                     history.holds.push(Hold {
                         client,
                         key,
-                        subscribing: Instant::now(),
                         subscribed: None,
-                        last: None,
                         released: None,
                     });
                     history.holds.len() - 1
                 };
-                let seen = Arc::clone(&history);
                 let handled = Arc::clone(&history);
                 let delay = Duration::from_micros(random.random_range(0..1500));
                 let subscription = pubsub
-                    .subscribe(
-                        key,
-                        move |last| seen.lock().unwrap().holds[hold].last = Some(last),
-                        move |message| {
-                            let handled = Arc::clone(&handled);
-                            async move {
-                                tokio::time::sleep(delay).await;
-                                handled.lock().unwrap().handled.push((
-                                    hold,
-                                    message,
-                                    Instant::now(),
-                                ));
-                            }
-                        },
-                    )
+                    .subscribe(key, move |message| {
+                        let handled = Arc::clone(&handled);
+                        async move {
+                            tokio::time::sleep(delay).await;
+                            handled
+                                .lock()
+                                .unwrap()
+                                .handled
+                                .push((hold, message, Instant::now()));
+                        }
+                    })
                     .await
                     .unwrap_or_else(|error| {
                         panic!("round {round}: client {client} could not subscribe: {error:?}")

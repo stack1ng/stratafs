@@ -10,8 +10,8 @@ bytes.workspace = true
 futures-lite.workspace = true
 futures-util = { workspace = true, features = ["channel"] }
 proptest.workspace = true
-shuttle.workspace = true
 stateright.workspace = true
+stratafs-runtime = { workspace = true, features = ["replay"] }
 stratafs-store.workspace = true
 thiserror.workspace = true
 

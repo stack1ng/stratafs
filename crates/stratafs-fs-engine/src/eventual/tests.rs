@@ -3,21 +3,23 @@ use std::pin::pin;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use futures_core::future::BoxFuture;
 use futures_lite::future::{block_on, poll_once};
 
 use super::*;
-use crate::MountId;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::directories::NewItem;
-use crate::test_support::{InMemoryEngine, ThreadSpawner, new_test_engine, new_test_engine_for};
+use crate::observation::{KernelCache, NoKernel, Uninvalidated};
+use crate::test_support::{InMemoryEngine, InMemoryStore, new_test_engine, new_test_engine_for};
+use crate::{FsEngine, MountId, Purge};
 
 // ChannelKernel is a kernel cache that sends each inode it is asked to invalidate.
 struct ChannelKernel(mpsc::Sender<Inode>);
 
 impl KernelCache for ChannelKernel {
-    fn invalidate(&self, inode: Inode) -> BoxFuture<'static, ()> {
+    fn invalidate(&self, inode: Inode) -> BoxFuture<'static, Result<(), Uninvalidated>> {
         let _ = self.0.send(inode);
-        Box::pin(async {})
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -33,11 +35,14 @@ fn another_client(engine: &InMemoryEngine) -> InMemoryEngine {
     FsEngine {
         allocate_inode: engine.allocate_inode,
         now: engine.now,
-        mount: MountId(2),
-        store: Arc::clone(&engine.store),
+        mount: Mount {
+            store: Arc::clone(&engine.mount.store),
+            kernel: Arc::new(NoKernel),
+            runtime: Arc::clone(&engine.mount.runtime),
+            id: MountId(2),
+        },
         durability_limit: None,
-        consistency: Arc::new(Eventual),
-        auto_invalidators: Arc::new(AutoInvalidators::new(NoKernel, ThreadSpawner)),
+        consistency: Eventual::default(),
         config: PhantomData,
     }
 }
@@ -46,7 +51,7 @@ fn another_client(engine: &InMemoryEngine) -> InMemoryEngine {
 const NOTHING_YET: Duration = Duration::from_millis(200);
 
 fn new_file(engine: &InMemoryEngine, name: &'static [u8]) -> (Inode, Attributes) {
-    let created = block_on(engine.transact(|mut txn| {
+    let created = block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.create(Inode::ROOT, name, NewItem::File, |_| {}).await;
             result.map(|result| (result, txn))
@@ -57,7 +62,7 @@ fn new_file(engine: &InMemoryEngine, name: &'static [u8]) -> (Inode, Attributes)
 }
 
 fn write(engine: &InMemoryEngine, inode: Inode, data: &'static [u8]) {
-    block_on(engine.transact(|mut txn| {
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.write(inode, 0, Bytes::from_static(data)).await;
             result.map(|result| (result, txn))
@@ -71,7 +76,7 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_a_write_to_it_commits() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     let (other, _) = new_file(&engine, b"other");
-    let mut invalidated = pin!(engine.invalidated(inode, &seen));
+    let mut invalidated = pin!(invalidated(&*engine.mount.store, inode, &seen));
     assert!(block_on(poll_once(invalidated.as_mut())).is_none());
     write(&engine, other, b"elsewhere");
     assert!(block_on(poll_once(invalidated.as_mut())).is_none());
@@ -85,7 +90,7 @@ fn an_eventual_engine_invalidates_at_once_when_seen_is_already_stale() {
     let (inode, seen) = new_file(&engine, b"cached");
     write(&engine, inode, b"before the watch");
     assert!(
-        block_on(poll_once(engine.invalidated(inode, &seen)))
+        block_on(poll_once(invalidated(&*engine.mount.store, inode, &seen)))
             .unwrap()
             .is_ok()
     );
@@ -95,8 +100,8 @@ fn an_eventual_engine_invalidates_at_once_when_seen_is_already_stale() {
 fn an_eventual_engine_invalidates_a_cached_inode_once_its_annotations_change() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"cached");
-    let invalidated = engine.invalidated(inode, &seen);
-    block_on(engine.transact(|mut txn| {
+    let invalidated = invalidated(&*engine.mount.store, inode, &seen);
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .set_annotation(
@@ -117,7 +122,7 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_its_annotations_change() {
 fn an_eventual_engine_invalidates_a_cached_inode_once_it_is_deleted() {
     let engine = new_test_engine();
     new_file(&engine, b"cached");
-    let unlinked = block_on(engine.transact(|mut txn| {
+    let unlinked = block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.hard_unlink(Inode::ROOT, b"cached", None).await;
             result.map(|result| (result, txn))
@@ -125,9 +130,9 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_it_is_deleted() {
     }))
     .unwrap();
     let (inode, seen) = (unlinked.inode, unlinked.item);
-    let mut invalidated = pin!(engine.invalidated(inode, &seen));
+    let mut invalidated = pin!(invalidated(&*engine.mount.store, inode, &seen));
     assert!(block_on(poll_once(invalidated.as_mut())).is_none());
-    block_on(engine.transact(|mut txn| {
+    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
         Box::pin(async move {
             let result = txn.delete_if_unlinked(inode).await;
             result.map(|result| (result, txn))
@@ -163,6 +168,23 @@ fn an_auto_invalidating_engine_leaves_a_forgotten_inode_alone() {
     engine.forget(inode);
     write(&another_client(&engine), inode, b"elsewhere");
     assert!(invalidated.recv_timeout(NOTHING_YET).is_err());
+}
+
+#[test]
+fn an_eventual_engine_vouches_only_for_a_read_begun_after_the_kernel_last_let_go_of_an_inode() {
+    let engine = new_test_engine();
+    let (inode, seen) = new_file(&engine, b"cached");
+    let reading = || Cached::<InMemoryStore>::reading(&engine.consistency);
+    let reads = [(inode, seen)];
+    let vouched = |ticket| {
+        engine
+            .consistency
+            .vouch(&engine.mount, &reads, &(), ticket, ticket, Purge::Waits)
+    };
+    let before = reading();
+    engine.forget(inode);
+    assert!(!vouched(before));
+    assert!(vouched(reading()));
 }
 
 #[test]
