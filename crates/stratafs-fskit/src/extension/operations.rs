@@ -1058,8 +1058,10 @@ where
             if volume.engine.write_back() {
                 return fail(&reply, error);
             }
-            // The kernel keeps the data of a write that failed. The reply goes as the purge dropping it is asked, so
-            // the purge waits for this write and holds back what the app does next.
+            // UPSTREAM KERNEL BUG (FSKit, macOS 27.2): the kernel caches a write's data before calling us and keeps
+            // it if the write fails, so reads on this mount return bytes that were never stored. Purging at once limits
+            // that to reads queued behind this write and the moment before the purge takes effect. The reply goes as
+            // the purge is asked, since the purge waits for this write. Remove once FSKit drops a failed write's pages.
             let replied = Box::new(move || fail(&reply, error));
             let dropped = volume.kernel.invalidate_noting(inode, replied, Box::new(|_| {}));
             volume.runtime.spawn(Box::pin(async move {

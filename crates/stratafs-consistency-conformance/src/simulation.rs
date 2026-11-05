@@ -41,6 +41,9 @@ pub(crate) enum Event {
     Unchanged(OpId, PosixError),
     // Stalled is an operation that took longer than LONGEST.
     Stalled(OpId, Duration),
+    // UPSTREAM KERNEL BUG PIN: Tainted is a read the kernel answered with a failed write's data it is excused for,
+    // which the check leaves out and counts.
+    Tainted(OpId),
     // Cut and Connected are when a mount's pub/sub connection was cut, or its kernel refused an invalidation, which it
     // drops its connection for, and when it next connected, and Died when it stopped for good.
     Cut(usize),
@@ -83,10 +86,10 @@ pub(crate) fn simulate<R: ReplayingRuntime, C: Consistency>(
     ending: Ending,
     activity: SimulatedActivity,
     seed: u64,
-) -> Result<(), TestCaseError> {
+) -> Result<usize, TestCaseError> {
     let mut planned = vec![Vec::new(); activity.mounts.len()];
     if !activity.faults.is_empty() {
-        let counted = run_once::<R, C>(runtime, ending, &activity, &planned, seed)?;
+        let (counted, _) = run_once::<R, C>(runtime, ending, &activity, &planned, seed)?;
         for fault in &activity.faults {
             let mount = fault.mount % activity.mounts.len();
             let count = counted[mount].of(fault.kind);
@@ -96,18 +99,19 @@ pub(crate) fn simulate<R: ReplayingRuntime, C: Consistency>(
             ));
         }
     }
-    run_once::<R, C>(runtime, ending, &activity, &planned, seed).map(drop)
+    run_once::<R, C>(runtime, ending, &activity, &planned, seed).map(|(_, tainted)| tainted)
 }
 
 // run_once runs the activity with planned faults and checks each execution's ending, and returns what each mount
-// counted in the last.
+// counted in the last, and how many tainted reads the checks left out in all.
+// UPSTREAM KERNEL BUG PIN: the tainted count.
 fn run_once<R: ReplayingRuntime, C: Consistency>(
     runtime: &R,
     ending: Ending,
     activity: &SimulatedActivity,
     planned: &Planned,
     seed: u64,
-) -> Result<Vec<Counted>, TestCaseError> {
+) -> Result<(Vec<Counted>, usize), TestCaseError> {
     let result = Arc::new(Mutex::new(None));
     let run_result = Arc::clone(&result);
     let (activity, planned) = (activity.clone(), planned.clone());
@@ -121,15 +125,19 @@ fn run_once<R: ReplayingRuntime, C: Consistency>(
                 if strict {
                     check_strict(&history)?;
                 }
-                if let Ending::Linearizable = ending {
-                    check_linearizable(made, history)?;
-                }
-                Ok(counted)
+                let tainted = match ending {
+                    Ending::Linearizable => check_linearizable(made, history)?,
+                    Ending::Converges => 0,
+                };
+                Ok((counted, tainted))
             });
             let mut result = run_result.lock().unwrap_or_else(PoisonError::into_inner);
-            if !matches!(*result, Some(Err(_))) {
-                *result = Some(checked);
-            }
+            let before = match &*result {
+                Some(Err(_)) => return,
+                Some(Ok((_, tainted))) => *tainted,
+                None => 0,
+            };
+            *result = Some(checked.map(|(counted, tainted)| (counted, before + tainted)));
         }
     });
     let ran = result.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -493,7 +501,11 @@ impl<C: Consistency> Client<C> {
     async fn read(&mut self, inode: Inode) {
         let invoked = self.invoke(HistoryOperation::Read(inode.0));
         let read = self.mount.read(inode).await;
-        self.end(invoked, read, |(content, attributes)| {
+        // UPSTREAM KERNEL BUG PIN: a read answered with a failed write's data.
+        if let Ok((.., true)) = read {
+            self.history.push(Event::Tainted(invoked.0));
+        }
+        self.end(invoked, read, |(content, attributes, _)| {
             Outcome::Read(content.to_vec(), Seen::from(attributes))
         });
     }
@@ -520,7 +532,7 @@ impl<C: Consistency> Client<C> {
                 return Ok(None);
             };
             let attributes = self.mount.stat(inode).await?;
-            let (content, _) = self.mount.read(inode).await?;
+            let (content, ..) = self.mount.read(inode).await?;
             Ok::<_, Failure>(Some((inode, attributes, content)))
         };
         served.await.ok()
@@ -599,8 +611,10 @@ fn check_strict(history: &[Event]) -> Result<(), TestCaseError> {
 // check_linearizable fails unless some order of the operations' steps, each between its operation's invocation and end,
 // explains what each returned. It leaves out the reads of a mount cut off until it connected again, or dead, and what
 // its writes returned, and a write that failed in a way that may have committed may or may not take effect.
-fn check_linearizable(made: Namespace, history: Vec<Event>) -> Result<(), TestCaseError> {
+fn check_linearizable(made: Namespace, history: Vec<Event>) -> Result<usize, TestCaseError> {
     let mut ends = HashMap::new();
+    // UPSTREAM KERNEL BUG PIN: the reads answered with a failed write's data, left out below.
+    let mut tainted = HashSet::new();
     let mut excused: Vec<(usize, usize, usize)> = Vec::new();
     let mut cut = HashMap::new();
     for (at, event) in history.iter().enumerate() {
@@ -617,6 +631,9 @@ fn check_linearizable(made: Namespace, history: Vec<Event>) -> Result<(), TestCa
                 }
             }
             Event::Died(mount) => excused.push((*mount, at, usize::MAX)),
+            Event::Tainted(id) => {
+                tainted.insert(*id);
+            }
             Event::Invoked(..) | Event::Stalled(..) => {}
         }
     }
@@ -630,6 +647,9 @@ fn check_linearizable(made: Namespace, history: Vec<Event>) -> Result<(), TestCa
         let Event::Invoked(id, operation) = event else {
             continue;
         };
+        if tainted.contains(id) {
+            continue;
+        }
         let (end, ended) = ends[id];
         let not_held = excused
             .iter()
@@ -656,7 +676,7 @@ fn check_linearizable(made: Namespace, history: Vec<Event>) -> Result<(), TestCa
     }
     let threads: Vec<Vec<Step>> = threads.into_values().collect();
     match linearizable(made, &threads) {
-        true => Ok(()),
+        true => Ok(tainted.len()),
         false => Err(TestCaseError::fail(format!(
             "no order of the operations explains this history: {threads:#?}"
         ))),

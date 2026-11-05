@@ -14,7 +14,6 @@ use stratafs_fs_engine::content::error::ReadError;
 use stratafs_fs_engine::directories::error::{LookupError, ReaddirError, RenameError};
 use stratafs_fs_engine::directories::{NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, EngineFailure, IoFailure, Posix, PosixError};
-use stratafs_fs_engine::observation::KernelCache;
 use stratafs_fs_engine::strong::{Pending, StrongFailure};
 use stratafs_fs_engine::{
     Cached, Eventual, FsConfig, FsEngine, Inode, MountId, Purge, StrongUntilDisconnectCached,
@@ -356,7 +355,8 @@ impl<C: Consistency> Mount<C> {
     }
 
     // read is a file's whole content, and the attributes handed over with it, from the kernel's cache when it has them.
-    pub(crate) async fn read(&self, inode: Inode) -> Result<(Bytes, Attributes), Failure> {
+    // UPSTREAM KERNEL BUG PIN: and whether it is a failed write's data the read is excused for.
+    pub(crate) async fn read(&self, inode: Inode) -> Result<(Bytes, Attributes, bool), Failure> {
         if let Some(cached) = self.kernel.cached_content(inode).await {
             return Ok(cached);
         }
@@ -391,7 +391,7 @@ impl<C: Consistency> Mount<C> {
                         .kernel
                         .reply(reads, &content, Some(&operation), vouch)?;
                     Some((
-                        (read.clone(), replied.handed[&inode].clone()),
+                        (read.clone(), replied.handed[&inode].clone(), false),
                         replied.reply,
                     ))
                 },
@@ -424,17 +424,18 @@ impl<C: Consistency> Mount<C> {
                 },
             )
             .await;
-        // As the FSKit volume does, a failure returns as the purge dropping the write's data is asked. This kernel
-        // holds no writes back.
+        // UPSTREAM KERNEL BUG PIN: as the FSKit volume does, a failure returns as the purge dropping the write's data
+        // is asked. This kernel holds no writes back.
         if served.is_err() {
             let (asked, replied) = oneshot::channel();
-            let kernel = KernelHandle(Arc::clone(&self.kernel));
+            let kernel = Arc::clone(&self.kernel);
             let asked = Box::new(move || {
                 let _ = asked.send(());
             });
-            let dropped = kernel.invalidate_noting(inode, asked, Box::new(|_| {}));
             self.runtime.spawn(Box::pin(async move {
-                let _ = dropped.await;
+                let _ = kernel
+                    .invalidate(inode, Some((asked, Box::new(|_| {}))), true)
+                    .await;
             }));
             let _ = replied.await;
         }

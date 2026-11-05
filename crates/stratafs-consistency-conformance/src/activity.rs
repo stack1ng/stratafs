@@ -5,6 +5,7 @@ use proptest::sample::select;
 // Path is a file's name in one of the volume's DIRECTORIES, each with the NAMES the activity gives files, where files
 // at MADE exist when it begins.
 pub type Path = (&'static str, &'static str);
+// UPSTREAM KERNEL BUG PIN: the activity stays out of the volume root, as FSKit cannot purge the root (FB25243414).
 pub(crate) static DIRECTORIES: [&str; 2] = ["d", "e"];
 pub(crate) static NAMES: [&str; 3] = ["a", "b", "c"];
 pub(crate) static MADE: [Path; 2] = [("d", "a"), ("d", "b")];

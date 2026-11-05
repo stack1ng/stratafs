@@ -6,6 +6,13 @@ This works because content is lazy loaded based on when it is read,
 allowing your codebase to stream in as your agent + its tools read it, without any special configuration.
 
 StrataFS is strongly consistent and durable by default.
+On macOS, FSKit (macOS 27.2) forces three gaps in strong consistency, due to underlying bugs:
+
+- A write that fails (another mount writing the same file at the same moment, or a store failure) can be read back on
+  the mount it failed on, by reads waiting on it, until its data is dropped a moment later.
+- Lookups directly in the volume root can miss names another mount creates there, since FSKit cannot drop the root's
+  cached names (FB25243414).
+- On one mount, a chmod, link or rename of a file fails with EBUSY while a write to that file is in flight there.
 
 StrataFS is completely written in Rust for maximum performance and portability. Strata can be used on Linux, macOS, and even WebAssembly.
 

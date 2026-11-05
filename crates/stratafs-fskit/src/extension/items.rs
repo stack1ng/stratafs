@@ -190,7 +190,8 @@ impl Items {
 
     // item_to_invalidate is inode's item and the caching the kernel holds for it, which invalidating its kernel copy
     // takes. It is None when FSKit holds no item for inode, or the item is a symbolic link, since the kernel
-    // invalidates only files and directories, or the root, which the kernel refuses to invalidate (FB25243414).
+    // invalidates only files and directories, or the root.
+    // UPSTREAM KERNEL BUG (FSKit, macOS 27.2): the kernel refuses to invalidate the root (FB25243414).
     pub(crate) fn item_to_invalidate(
         &self,
         inode: Inode,

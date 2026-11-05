@@ -36,6 +36,9 @@ struct State {
     // of the last write begun on each file, so a read begun before it caches nothing.
     content: HashMap<Inode, Bytes>,
     written: HashMap<Inode, u64>,
+    // UPSTREAM KERNEL BUG PIN: unstored is each file whose cached content holds data of a write the volume did not
+    // take, with how far it is.
+    unstored: HashMap<Inode, Unstored>,
     // operations is each operation running on an item that holds something back, by its number, with what it holds.
     operations: HashMap<Inode, BTreeMap<u64, Holding>>,
     // asking is each purge of an item that asked and has not purged, oldest first, with the operations it waits for,
@@ -75,8 +78,19 @@ pub(crate) enum Access {
     Unlink,
 }
 
+// UPSTREAM KERNEL BUG PIN: Unstored is how far a write whose data the kernel caches is: running, failed with the
+// purge its failure asks not yet in the kernel, or past both. It models FSKit keeping a failed write's data (macOS
+// 27.2): a read begun before it is past may see that data and is excused. It goes once FSKit drops those pages itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unstored {
+    Running,
+    Asked,
+    Past,
+}
+
 // Holding is what an operation running on a file holds back: reads and writes, as a write does; stats, as a write that
-// extends the file, a change of times and an unlink do; and purges, as all but an unlink do.
+// extends the file, a change of times and an unlink do; and purges, as all but an unlink do, a read queued for the
+// kernel's cache included.
 #[derive(Clone, Copy)]
 struct Holding {
     reads: bool,
@@ -116,7 +130,7 @@ pub(crate) struct KernelHandle(pub(crate) Arc<Kernel>);
 impl KernelCache for KernelHandle {
     fn invalidate(&self, inode: Inode) -> BoxFuture<'static, Result<(), Uninvalidated>> {
         let kernel = Arc::clone(&self.0);
-        Box::pin(async move { kernel.invalidate(inode, None).await })
+        Box::pin(async move { kernel.invalidate(inode, None, false).await })
     }
 
     fn invalidate_noting(
@@ -126,7 +140,11 @@ impl KernelCache for KernelHandle {
         answered: Answered,
     ) -> BoxFuture<'static, Result<(), Uninvalidated>> {
         let kernel = Arc::clone(&self.0);
-        Box::pin(async move { kernel.invalidate(inode, Some((asked, answered))).await })
+        Box::pin(async move {
+            kernel
+                .invalidate(inode, Some((asked, answered)), false)
+                .await
+        })
     }
 }
 
@@ -171,18 +189,47 @@ impl Kernel {
     }
 
     // cached_content is the data the kernel caches for inode, a file, with its attributes, once no write of it runs
-    // and no purge of it is asking, as a read the kernel answers itself waits for both.
-    pub(crate) async fn cached_content(&self, inode: Inode) -> Option<(Bytes, Attributes)> {
+    // and no purge of it asked before the read queued is asking, as a read the kernel answers itself waits for both,
+    // and whether it is a failed write's data the read is excused for. A purge asked later waits for the read.
+    pub(crate) async fn cached_content(&self, inode: Inode) -> Option<(Bytes, Attributes, bool)> {
         let mut cached = None;
+        let mut queued = None;
         self.until(|state| {
+            let (number, excused) = *queued.get_or_insert_with(|| {
+                state.numbered += 1;
+                let holding = Holding {
+                    reads: false,
+                    stats: false,
+                    purges: true,
+                };
+                let operations = state.operations.entry(inode).or_default();
+                operations.insert(state.numbered, holding);
+                // UPSTREAM KERNEL BUG PIN: a read queued while a failed write's data is cached is excused.
+                let unstored = state.unstored.get(&inode);
+                (
+                    state.numbered,
+                    unstored.is_some_and(|unstored| *unstored != Unstored::Past),
+                )
+            });
+            // UPSTREAM KERNEL BUG PIN: unless a purge dropped that data meanwhile.
+            let excused = excused && state.unstored.contains_key(&inode);
             cached = state
                 .content
                 .get(&inode)
                 .cloned()
-                .zip(state.cached.get(&inode).cloned());
-            !state.holds(inode, |held| held.reads) && !state.asking.contains_key(&inode)
+                .zip(state.cached.get(&inode).cloned())
+                .map(|(content, attributes)| (content, attributes, excused));
+            let asking = state.asking.get(&inode);
+            !state.holds(inode, |held| held.reads)
+                && asking.is_none_or(|asking| asking.iter().all(|(asked, _)| *asked > number))
         })
         .await;
+        let (number, _) = queued.expect("a read queues as it begins");
+        drop(Operation {
+            kernel: self,
+            inode,
+            number,
+        });
         cached
     }
 
@@ -220,6 +267,8 @@ impl Kernel {
                 if let Some(cached) = state.content.get(&inode) {
                     let content = [data, cached.get(data.len()..).unwrap_or_default()].concat();
                     state.content.insert(inode, content.into());
+                    // UPSTREAM KERNEL BUG PIN: FSKit keeps this data if the write fails.
+                    state.unstored.insert(inode, Unstored::Running);
                 }
                 state.written.insert(inode, number);
             }
@@ -296,6 +345,8 @@ impl Kernel {
             // The volume took the write the reply is for, so the kernel drops its data and the next read asks for it.
             if waited.is_some_and(|operation| state.written.get(inode) == Some(&operation.number)) {
                 state.content.remove(inode);
+                // UPSTREAM KERNEL BUG PIN: the volume took this data.
+                state.unstored.remove(inode);
             }
             let unwritten = waited.is_some_and(|operation| {
                 state
@@ -388,6 +439,8 @@ impl Kernel {
         state.newest.remove(&inode);
         state.cached.remove(&inode);
         state.content.remove(&inode);
+        // UPSTREAM KERNEL BUG PIN: a reclaimed item keeps no data.
+        state.unstored.remove(&inode);
         state.deferred.remove(&inode);
         state
             .names
@@ -398,14 +451,28 @@ impl Kernel {
     // invalidate drops the kernel's copy of inode once the operations on it at the ask have ended and the purges asked
     // before have purged, or fails, purging nothing, when the kernel refuses. FSKit invalidates neither the root nor
     // an item it was never handed.
-    async fn invalidate(
+    // UPSTREAM KERNEL BUG PIN: failed_write says it is the purge a failed write's reply asks.
+    pub(crate) async fn invalidate(
         &self,
         inode: Inode,
         noting: Option<(Asked, Answered)>,
+        failed_write: bool,
     ) -> Result<(), Uninvalidated> {
         // FSKit invalidates on a thread of its own, so the caller goes on first.
         yield_now().await;
         let (asked, answered) = noting.unzip();
+        if let Some(asked) = asked {
+            // UPSTREAM KERNEL BUG PIN: reads may still see the data until this purge is in the kernel.
+            if failed_write
+                && let Some(unstored) = self.state().unstored.get_mut(&inode)
+                && *unstored == Unstored::Running
+            {
+                *unstored = Unstored::Asked;
+            }
+            asked();
+            // The asking thread enters the kernel a while after it asked.
+            yield_now().await;
+        }
         let handed = inode != Inode::ROOT && self.state().newest.contains_key(&inode);
         let refused = handed && self.faults.refuses();
         let number = (handed && !refused).then(|| {
@@ -423,8 +490,12 @@ impl Kernel {
                 .push_back((number, waits));
             number
         });
-        if let Some(asked) = asked {
-            asked();
+        // UPSTREAM KERNEL BUG PIN: the purge is in the kernel, so later reads wait for it.
+        if failed_write
+            && let Some(unstored) = self.state().unstored.get_mut(&inode)
+            && *unstored == Unstored::Asked
+        {
+            *unstored = Unstored::Past;
         }
         if let Some(number) = number {
             self.until(|state| {
@@ -492,6 +563,8 @@ impl State {
                 }
                 Update::Content(content) => {
                     self.content.insert(inode, content);
+                    // UPSTREAM KERNEL BUG PIN: a read's data replaced it.
+                    self.unstored.remove(&inode);
                 }
             }
         }
@@ -502,6 +575,8 @@ impl State {
     fn purge(&mut self, inode: Inode) {
         self.cached.remove(&inode);
         self.content.remove(&inode);
+        // UPSTREAM KERNEL BUG PIN: the purge dropped it.
+        self.unstored.remove(&inode);
         self.names.retain(|(directory, _), _| *directory != inode);
         let asking = self
             .asking
@@ -519,6 +594,13 @@ impl Drop for Operation<'_> {
     fn drop(&mut self) {
         {
             let mut state = self.kernel.state();
+            // UPSTREAM KERNEL BUG PIN: a write that ends with its data unstored failed.
+            if state.written.get(&self.inode) == Some(&self.number)
+                && let Some(unstored) = state.unstored.get_mut(&self.inode)
+                && *unstored == Unstored::Running
+            {
+                *unstored = Unstored::Past;
+            }
             let operations = state
                 .operations
                 .get_mut(&self.inode)
