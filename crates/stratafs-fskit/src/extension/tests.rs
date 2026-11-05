@@ -6,7 +6,9 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use block2::RcBlock;
+use bytes::Bytes;
 use futures_executor::ThreadPool;
+use futures_lite::future::block_on;
 use objc2::encode::RefEncode;
 use objc2::{AllocAnyThread, msg_send};
 use objc2_foundation::{NSError, NSString, NSURL};
@@ -22,18 +24,21 @@ use redb::backends::InMemoryBackend;
 use stratafs_fs_engine::attributes::{
     Attributes, ChangeVersion, FileType, Hints, Mode, Ownership, Restrictions, SettableAttributes,
 };
-use stratafs_fs_engine::observation::KernelCache;
-use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, Timestamp};
+use stratafs_fs_engine::content::error::WriteError;
+use stratafs_fs_engine::directories::NewItem;
+use stratafs_fs_engine::observation::{KernelCache, NoKernel};
+use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, Purge, Timestamp};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::ThreadPoolRuntime;
 use stratafs_store::durability::DurableAgainst;
+use stratafs_store::kv::TransactError;
 use stratafs_store::spawn::SpawnBlocking;
 
 use super::changes::attribute_change;
 use super::item::{StrataItem, file_name, flags_of, item_attributes, restrictions_and_hints};
-use super::operations::Reply;
+use super::operations::{Reply, past_end};
 use super::*;
 
 struct TestConfig;
@@ -668,4 +673,89 @@ fn a_removed_file_still_answers() {
         attributes.recv_timeout(Duration::from_secs(10)).unwrap(),
         Ok(())
     );
+}
+
+// append_only_file is a new append only file in engine's root that holds content.
+fn append_only_file(engine: &TestEngine, content: &'static [u8]) -> Inode {
+    block_on(engine.transact(Purge::GoesAhead, |mut transaction| {
+        Box::pin(async move {
+            let created = transaction
+                .create(Inode::ROOT, b"log", NewItem::File, |settable| {
+                    settable.restrictions = Restrictions::OWNER_APPEND_ONLY;
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            transaction
+                .write(created.inode, 0, Bytes::from_static(content))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((created.inode, transaction))
+        })
+    }))
+    .unwrap()
+}
+
+// past_end_of is what past_end makes of a write of data at offset to inode.
+fn past_end_of(
+    engine: &TestEngine,
+    inode: Inode,
+    offset: u64,
+    data: Vec<u8>,
+) -> Result<(u64, Bytes), bool> {
+    let content = engine.content();
+    block_on(engine.transact(Purge::GoesAhead, |transaction| {
+        let data = Bytes::from(data.clone());
+        Box::pin(async move {
+            let trimmed = past_end(&transaction, content, inode, offset, data).await;
+            trimmed.map(|trimmed| (trimmed, transaction))
+        })
+    }))
+    .map_err(|error| {
+        matches!(
+            error,
+            TransactError::Aborted(WriteError::OperationNotPermitted)
+        )
+    })
+}
+
+fn test_engine() -> TestEngine {
+    block_on(new_engine(
+        NoKernel,
+        Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
+    ))
+    .unwrap()
+}
+
+#[test]
+fn an_append_to_an_append_only_file_keeps_only_the_bytes_past_its_end() {
+    let engine = test_engine();
+    let inode = append_only_file(&engine, b"abc");
+    assert_eq!(
+        past_end_of(&engine, inode, 0, b"abcde".to_vec()),
+        Ok((3, Bytes::from_static(b"de")))
+    );
+    assert_eq!(
+        past_end_of(&engine, inode, 1, b"b".to_vec()),
+        Ok((3, Bytes::new()))
+    );
+    assert_eq!(
+        past_end_of(&engine, inode, 3, b"de".to_vec()),
+        Ok((3, Bytes::from_static(b"de")))
+    );
+    assert_eq!(past_end_of(&engine, inode, 0, b"abXde".to_vec()), Err(true));
+}
+
+#[test]
+fn an_append_compares_content_the_store_spilled_out_of_line() {
+    let engine = test_engine();
+    let spilled: &'static [u8] = &[b'a'; 4096];
+    let inode = append_only_file(&engine, spilled);
+    let appended = [spilled, b"tail"].concat();
+    assert_eq!(
+        past_end_of(&engine, inode, 0, appended),
+        Ok((4096, Bytes::from_static(b"tail")))
+    );
+    let mut changed = [spilled, b"tail"].concat();
+    changed[100] = b'b';
+    assert_eq!(past_end_of(&engine, inode, 0, changed), Err(true));
 }

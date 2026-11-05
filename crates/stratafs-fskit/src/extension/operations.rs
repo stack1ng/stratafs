@@ -24,15 +24,16 @@ use objc2_fs_kit::{
 use stratafs_fs_engine::annotations::error::{GetAnnotationError, ListAnnotationsError};
 use stratafs_fs_engine::annotations::{AnnotationKey, AnnotationScope, SetAnnotationMode};
 use stratafs_fs_engine::attributes::{Attributes, FileType};
-use stratafs_fs_engine::content::error::{ReadError, ReadSymbolicLinkError};
+use stratafs_fs_engine::content::error::{ReadError, ReadSymbolicLinkError, WriteError};
 use stratafs_fs_engine::directories::error::{LookupError, ReaddirError, RenameError};
 use stratafs_fs_engine::directories::{EntryChange, NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, EngineFailure, IoFailure, PosixError};
 use stratafs_fs_engine::observation::KernelCache;
-use stratafs_fs_engine::{Cached, FsConfig, FsEngine, Inode, Purge, Timestamp};
+use stratafs_fs_engine::{Cached, FsConfig, FsEngine, FsTransaction, Inode, Purge, Timestamp};
 use stratafs_runtime::Runtime;
+use stratafs_store::content::ContentStore;
 use stratafs_store::durability::DurableAgainst;
-use stratafs_store::kv::TransactError;
+use stratafs_store::kv::{KeyValueTransaction, TransactError};
 use stratafs_store::store::Store;
 
 use super::changes::AttributeChange;
@@ -1014,6 +1015,8 @@ where
         reply: Reply<FSWriteFileResult>,
     ) {
         self.run(move |volume| async move {
+            let content = volume.engine.content();
+            let append_only = volume.items.append_only(inode);
             let served = volume
                 .engine
                 .transact_and_serve(
@@ -1022,6 +1025,11 @@ where
                     |mut transaction| {
                         let contents = contents.clone();
                         Box::pin(async move {
+                            let (offset, contents) = if append_only {
+                                past_end(&transaction, content, inode, offset, contents).await?
+                            } else {
+                                (offset, contents)
+                            };
                             let result = transaction.write(inode, offset, contents).await;
                             result.map(|attributes| (attributes, transaction))
                         })
@@ -1271,6 +1279,48 @@ fn item_type(kind: FileType) -> FSItemType {
 }
 
 // succeed replies with result, or with EIO if FSKit would not make it.
+// past_end is where a write to an append only file starts and what it adds. FSKit hands a write over from the start
+// of its page, so an append comes with the file's stored bytes before its end, which must be what it stores. Like the
+// engine's, it returns `impl Future + Send` rather than being `async fn`, so Send is proven here for every store.
+#[allow(clippy::manual_async_fn, clippy::type_complexity)]
+pub(super) fn past_end<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>(
+    transaction: &FsTransaction<'_, '_, T, C, A, N, S>,
+    content: &C,
+    inode: Inode,
+    offset: u64,
+    mut contents: Bytes,
+) -> impl Future<Output = Result<(u64, Bytes), WriteError<T::Failure, T::Rejection, C::Failure>>> + Send
+{
+    async move {
+        let attributes = transaction.getattr(inode).await?;
+        let size = attributes.ok_or(WriteError::StaleFileHandle)?.settable.size;
+        if offset >= size {
+            return Ok((offset, contents));
+        }
+        let repeated = contents.split_to(contents.len().min((size - offset) as usize));
+        let plan = transaction
+            .read(inode, offset, repeated.len() as u64)
+            .await
+            .map_err(|error| match error {
+                ReadError::StaleFileHandle => WriteError::StaleFileHandle,
+                ReadError::IsADirectory => WriteError::IsADirectory,
+                ReadError::InvalidInput => WriteError::InvalidInput,
+                ReadError::InputOutputError(failure) => WriteError::InputOutputError(failure),
+            })?;
+        let stored = try_join_all(plan.load(content))
+            .await
+            .map_err(IoFailure::ContentRead)?;
+        let stored: Vec<u8> = stored
+            .into_iter()
+            .flat_map(|mut piece| piece.copy_to_bytes(piece.remaining()))
+            .collect();
+        if stored != repeated {
+            return Err(WriteError::OperationNotPermitted);
+        }
+        Ok((size, contents))
+    }
+}
+
 fn succeed<R: Message>(reply: &Reply<R>, result: Option<Retained<R>>) {
     match result {
         Some(result) => reply.call(Retained::as_ptr(&result).cast_mut(), null_mut()),

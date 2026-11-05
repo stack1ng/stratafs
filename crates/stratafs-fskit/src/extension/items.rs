@@ -176,6 +176,18 @@ impl Items {
         }
     }
 
+    // append_only says whether the newest attributes handed out for inode mark it append only.
+    pub(crate) fn append_only(&self, inode: Inode) -> bool {
+        self.state(inode).is_some_and(|state| {
+            state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .newest
+                .as_ref()
+                .is_some_and(|newest| newest.settable.restrictions.append_only())
+        })
+    }
+
     // item_to_invalidate is inode's item and the caching the kernel holds for it, which invalidating its kernel copy
     // takes. It is None when FSKit holds no item for inode, or the item is a symbolic link, since the kernel
     // invalidates only files and directories, or the root, which the kernel refuses to invalidate (FB25243414).
