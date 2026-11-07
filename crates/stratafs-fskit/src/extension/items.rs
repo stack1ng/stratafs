@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2_fs_kit::{FSDataCacheMode, FSItemAttributes, FSKernelCacheCoherencyType};
-use stratafs_fs_engine::Inode;
 use stratafs_fs_engine::attributes::{Attributes, FileType};
+use stratafs_fs_engine::{Inode, ResultHandling};
 
 use super::item::{StrataItem, item_attributes};
 
@@ -49,15 +49,15 @@ pub(crate) struct Locked<'a> {
 }
 
 impl Items {
-    // reply locks every inode in reads, in inode order so operations never wait on each other in a cycle, and asks
-    // vouch while the locks are held. When it vouches, reply keeps each read that is newer than the newest attributes
-    // already handed out, and calls reply while the locks are held; otherwise it replies nothing and returns None. A
-    // state left with no item afterwards is one a directory listing only handed FSKit the attributes of, which the
-    // kernel keeps nothing of, so it goes, and an operation waiting on it starts over.
+    // reply locks every inode in reads, in inode order so operations never wait on each other in a cycle, and asks for
+    // the result handling while the locks are held. When it is Cache, reply keeps each read that is newer than the
+    // newest attributes already handed out, and calls reply while the locks are held; otherwise it replies nothing and
+    // returns None. A state left with no item afterwards is one a directory listing only handed FSKit the attributes
+    // of, which the kernel keeps nothing of, so it goes, and an operation waiting on it starts over.
     pub(crate) fn reply<R>(
         &self,
         reads: impl IntoIterator<Item = (Inode, Attributes)>,
-        vouch: &dyn Fn() -> bool,
+        result_handling: &dyn Fn() -> ResultHandling,
         reply: impl FnOnce(&mut Locked<'_>) -> R,
     ) -> Option<R> {
         // A reply can read one inode twice, such as a rename within one directory, so keep the newer read.
@@ -93,10 +93,13 @@ impl Items {
             if locked.states.values().any(|state| state.retired) {
                 continue;
             }
-            let vouched = vouch();
+            // FSKit caches every reply, so it makes none with NoCache. Waiting instead holds up no purge: a directory's
+            // never waits, and a file's only for that file's operations, which the delivery of the write they wait on
+            // lets go. A write whose serving failed once it committed gets the failure.
+            let cached = result_handling() == ResultHandling::Cache;
             for (inode, read) in std::mem::take(&mut reads_by_inode)
                 .into_iter()
-                .filter(|_| vouched)
+                .filter(|_| cached)
             {
                 let state = locked
                     .states
@@ -110,7 +113,7 @@ impl Items {
                     state.newest = Some(read);
                 }
             }
-            let replied = vouched.then(|| reply(&mut locked));
+            let replied = cached.then(|| reply(&mut locked));
             let mut map = self.states.lock().unwrap_or_else(PoisonError::into_inner);
             for (inode, state) in &mut locked.states {
                 if state.item.is_none() {

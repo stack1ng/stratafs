@@ -21,7 +21,10 @@ pub(crate) enum HistoryOperation {
     Unlink(Path, u64),
     // Rename moves the file from one path to another, replacing the file the kernel found there.
     Rename(Path, Path, u64, Option<u64>),
+    // On Linux a link takes effect as two steps, the kernel finding the new name free, then the volume's link.
     Link(u64, Path),
+    // NameFree is the kernel finding a name free under its directory's lock, failing with EEXIST when it is taken.
+    NameFree(Path),
     // Reclaim deletes the file once no name refers to it, as the kernel letting go of it does.
     Reclaim(u64),
 }
@@ -29,13 +32,15 @@ pub(crate) enum HistoryOperation {
 impl HistoryOperation {
     // reads says whether the operation changes nothing.
     pub(crate) fn reads(&self) -> bool {
-        matches!(
-            self,
+        match *self {
             HistoryOperation::Lookup(_)
-                | HistoryOperation::List(_)
-                | HistoryOperation::Stat(..)
-                | HistoryOperation::Read(_)
-        )
+            | HistoryOperation::List(_)
+            | HistoryOperation::Stat(..)
+            | HistoryOperation::Read(_)
+            | HistoryOperation::NameFree(_) => true,
+            HistoryOperation::Rename(.., inode, replaced) => replaced == Some(inode),
+            _ => false,
+        }
     }
 
     // steps is the operation as each step it takes effect in, in order, with what it returned there. POSIX lets a
@@ -44,6 +49,7 @@ impl HistoryOperation {
     pub(crate) fn steps(
         self,
         returned: Option<Outcome>,
+        finds_names: bool,
     ) -> Vec<(HistoryOperation, Option<Outcome>)> {
         match (self, returned) {
             (HistoryOperation::Lookup(path), Some(Outcome::Found(found))) => {
@@ -53,6 +59,20 @@ impl HistoryOperation {
                     .into_iter()
                     .chain(stat)
                     .collect()
+            }
+            // A link that failed with EEXIST found the name taken at one of its steps.
+            (HistoryOperation::Link(_, path), Some(Outcome::Failed(PosixError::EEXIST)))
+                if finds_names =>
+            {
+                let taken = Outcome::Failed(PosixError::EEXIST);
+                vec![(HistoryOperation::NameFree(path), Some(taken))]
+            }
+            (HistoryOperation::Link(inode, path), returned) if finds_names => {
+                let free = returned.as_ref().map(|_| Outcome::Done);
+                vec![
+                    (HistoryOperation::NameFree(path), free),
+                    (HistoryOperation::Link(inode, path), returned),
+                ]
             }
             (operation, returned) => vec![(operation, returned)],
         }
@@ -65,8 +85,8 @@ pub(crate) enum Outcome {
     // is what its first step finds the name refers to.
     Found(Option<(u64, Box<Outcome>)>),
     Resolved(Option<u64>),
-    // Listed is each entry of a directory, by name.
-    Listed(Vec<(&'static str, u64, Seen)>),
+    // Listed is each entry of a directory, by name, with its attributes when the listing shows them.
+    Listed(Vec<(&'static str, u64, Option<Seen>)>),
     Seen(Seen),
     Read(Vec<u8>, Seen),
     Done,
@@ -93,11 +113,15 @@ impl From<&Attributes> for Seen {
     }
 }
 
-// Namespace is every path of the volume's directories, and every file the activity made, by inode.
+// Namespace is every path of the volume's directories, and every file the activity made, by inode. finds_names says
+// whether the kernel finds the names a change works on under their directories' locks before it asks the volume, and
+// lists_attributes whether a listing shows each entry's attributes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Namespace {
     names: BTreeMap<Path, u64>,
     files: BTreeMap<u64, File>,
+    finds_names: bool,
+    lists_attributes: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -109,6 +133,14 @@ struct File {
 }
 
 impl Namespace {
+    pub(crate) fn new(finds_names: bool, lists_attributes: bool) -> Self {
+        Namespace {
+            finds_names,
+            lists_attributes,
+            ..Namespace::default()
+        }
+    }
+
     pub(crate) fn invoke(&mut self, operation: &HistoryOperation) -> Outcome {
         match *operation {
             HistoryOperation::Lookup(path) => Outcome::Resolved(self.names.get(&path).copied()),
@@ -116,7 +148,10 @@ impl Namespace {
                 self.names
                     .iter()
                     .filter(|((listed, _), _)| *listed == directory)
-                    .filter_map(|((_, name), inode)| Some((*name, *inode, self.seen(*inode)?)))
+                    .filter_map(|((_, name), inode)| {
+                        let seen = self.seen(*inode)?;
+                        Some((*name, *inode, self.lists_attributes.then_some(seen)))
+                    })
                     .collect(),
             ),
             HistoryOperation::Stat(inode) => self.changed(inode, |_| {}),
@@ -151,13 +186,19 @@ impl Namespace {
                     self.changed(inode, |file| file.links -= 1)
                 }
             },
+            // A kernel that finds the names fails a rename whose source is gone with ENOENT, whatever the destination
+            // holds. The FSKit volume checks the destination first.
             HistoryOperation::Rename(from, to, inode, replaced) => {
-                if self.names.get(&to).copied() != replaced {
+                let destination_changed = self.names.get(&to).copied() != replaced;
+                if destination_changed && !self.finds_names {
                     return Outcome::Failed(PosixError::ESTALE);
                 }
                 match self.names.get(&from) {
                     None => Outcome::Failed(PosixError::ENOENT),
                     Some(found) if *found != inode => Outcome::Failed(PosixError::ESTALE),
+                    _ if destination_changed => Outcome::Failed(PosixError::ESTALE),
+                    // A rename between two names of one file does nothing.
+                    Some(_) if replaced == Some(inode) => self.changed(inode, |_| {}),
                     Some(_) => {
                         self.names.remove(&from);
                         self.names.insert(to, inode);
@@ -168,6 +209,10 @@ impl Namespace {
                     }
                 }
             }
+            HistoryOperation::NameFree(path) => match self.names.contains_key(&path) {
+                true => Outcome::Failed(PosixError::EEXIST),
+                false => Outcome::Done,
+            },
             HistoryOperation::Reclaim(inode) => {
                 if self.files.get(&inode).is_some_and(|file| file.links == 0) {
                     self.files.remove(&inode);

@@ -1,7 +1,7 @@
 use stratafs_fs_engine::attributes::{
     ChangeVersion, Hints, Mode, Ownership, Restrictions, SettableAttributes,
 };
-use stratafs_fs_engine::{MountId, Timestamp};
+use stratafs_fs_engine::{MountId, ResultHandling, Timestamp};
 
 use super::*;
 
@@ -34,15 +34,29 @@ fn file() -> Attributes {
 #[test]
 fn a_state_a_reply_hands_fskit_no_item_for_goes_once_the_reply_is_done() {
     let items = Items::default();
-    items.reply([(Inode(5), file())], &|| true, |_| {});
+    items.reply([(Inode(5), file())], &|| ResultHandling::Cache, |_| {});
     assert!(items.state(Inode(5)).is_none());
 }
 
 #[test]
 fn a_state_a_reply_hands_fskit_the_item_for_stays() {
     let items = Items::default();
-    items.reply([(Inode(5), file())], &|| true, |locked| {
+    items.reply([(Inode(5), file())], &|| ResultHandling::Cache, |locked| {
         locked.item(Inode(5));
     });
     assert!(items.state(Inode(5)).is_some());
+}
+
+#[test]
+fn a_result_handled_with_no_cache_replies_nothing() {
+    let items = Items::default();
+    let replied = items.reply(
+        [(Inode(5), file())],
+        &|| ResultHandling::NoCache,
+        |locked| {
+            locked.item(Inode(5));
+        },
+    );
+    assert!(replied.is_none());
+    assert!(items.state(Inode(5)).is_none());
 }

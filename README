@@ -14,6 +14,33 @@ On macOS, FSKit (macOS 27.2) forces three gaps in strong consistency, due to und
   cached names (FB25243414).
 - On one mount, a chmod, link or rename of a file fails with EBUSY while a write to that file is in flight there.
 
+On Linux, FUSE (kernel 6.12) forces these gaps in strong consistency, due to underlying limits:
+
+- A read can see the data of a write in flight on its own mount before the write is stored, even if the write then
+  fails.
+- A read that runs while another mount changes the file's size can copy up to a size the file had earlier, even before
+  changes that returned before the read began, so it can read past a truncate or stop short of a write.
+- On one mount, lookups keep finding a name its own unlink or rename drops until that change returns, since only a
+  notify that takes the directory's lock, which the change holds, can drop the name.
+- While a write that grows a file is in flight on a mount, reads there copy up to the size from before it, as the
+  kernel takes in no new size meanwhile.
+- On one mount, a stat can return a file's size from before another mount's change that already returned, while another
+  stat of the file there takes the new size in, as the kernel marks the attributes current before it stores the size.
+- A file mapped shared and writable loses the bytes it dirtied when another mount writes the file: the kernel writes
+  them out as it drops the file's pages for that write, and writing them fails with EBUSY.
+- On one mount, a change that would wait for another mount's change to the same item fails with EBUSY while the mount
+  drops a copy for any other change, since dropping it can wait for a lock the first change holds.
+- On one mount, a rename, unlink or open can rarely fail with ESTALE while another mount changes the same file, since
+  the kernel would take lookups from different moments as one; it tries once more first.
+- On one mount, a stat can return a file's attributes from before another mount's change, when the kernel let go of
+  the file and looks it up again as the change lands, since FUSE can hand over the lookup before the forget.
+
+StrataFS itself has these open gaps, on macOS and Linux alike:
+
+- A file open on one mount is deleted as soon as another mount unlinks it, so later reads, writes and fstat on the open
+  descriptor fail with ESTALE: the mount that unlinks it deletes it once its own kernel lets go of it, and nothing
+  records the opens other mounts hold.
+
 StrataFS is completely written in Rust for maximum performance and portability. Strata can be used on Linux, macOS, and even WebAssembly.
 
 This project is currently in active development, and should not be relied on (yet).

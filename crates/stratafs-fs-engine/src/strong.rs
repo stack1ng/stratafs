@@ -24,10 +24,11 @@ use stratafs_store::store::Store;
 
 use crate::attributes::{Attributes, ChangeVersion, read_attributes};
 use crate::error::{IoFailure, PosixError, refused_or_failed};
+use crate::kernel_cache::{Answered, Asked, KernelCache, Uninvalidated};
 use crate::key::FsKey;
-use crate::observation::{Answered, Asked, KernelCache};
 use crate::{
     Cached, Change, Consistency, Inode, MetadataFailure, MetadataRejection, Mount, MountId, Purge,
+    ResultHandling,
 };
 
 // SETTLE_MARGIN is how much longer than a publish's timeout a mount waits on another mount's write in flight before
@@ -113,9 +114,11 @@ pub enum StrongFailure<F, R, M> {
     Overtaken,
     #[error("the mount is dropping the kernel's cache after its pub/sub connection failed")]
     Purging,
+    #[error("dropping the kernel's copy of the attributes a write changes failed")]
+    Uninvalidated(#[source] Uninvalidated),
     #[error(
-        "another write is changing an inode this write changes, and cannot end before this mount drops its copy, which \
-         the kernel holds back while this write is in flight"
+        "another write is changing an inode this write changes, and cannot end before this mount drops a copy, which \
+         the kernel may hold back while this write is in flight"
     )]
     Contended,
 }
@@ -132,7 +135,8 @@ impl<F, R, M> From<&StrongFailure<F, R, M>> for PosixError {
             | StrongFailure::Store(_)
             | StrongFailure::Pending(_)
             | StrongFailure::Overtaken
-            | StrongFailure::Purging => PosixError::EIO,
+            | StrongFailure::Purging
+            | StrongFailure::Uninvalidated(_) => PosixError::EIO,
         }
     }
 }
@@ -252,8 +256,8 @@ struct Hold<P: PubSub> {
     // pending counts deliveries still being handled, and pending_highest is the highest version among them.
     pending: u32,
     pending_highest: u64,
-    // replies counts replies handed to the kernel with data older than a pending delivery, so a delivery invalidates
-    // again after any that happened while it invalidated.
+    // replies counts replies handed to the kernel cached with data older than a pending delivery, so a delivery
+    // invalidates again after any that happened while it invalidated.
     replies: u64,
     // asked counts the deliveries invalidating now that have asked the kernel to drop its copy, and round and asked_at
     // are when the first of them asked, by the clock and in time. again counts the deliveries invalidating again.
@@ -312,9 +316,21 @@ fn claimed<P: PubSub>(inner: &Inner<P>, write: u64, inodes: &[Inode]) -> Vec<Ino
 }
 
 // contended says whether a write whose operation the kernel's purge waits for must fail rather than wait on inodes:
-// a delivery of one is being handled here, whose purge the kernel holds back until the write ends.
-fn contended<P: PubSub>(inner: &mut Inner<P>, inodes: &[Inode], purge: Purge) -> bool {
+// a delivery of one is being handled here, or of any inode when a purge may wait on others, whose purge the kernel
+// may hold back until the write ends.
+fn contended<P: PubSub>(
+    inner: &mut Inner<P>,
+    inodes: &[Inode],
+    purge: Purge,
+    kernel: &dyn KernelCache,
+) -> bool {
     match purge {
+        Purge::Waits | Purge::Unknown if kernel.purge_waits_on_others() => {
+            let generation = inner.generation();
+            inner.holds.values().any(|holding| {
+                matches!(holding, Holding::Held(hold) if Some(hold.generation) == generation && hold.pending > 0)
+            })
+        }
         Purge::Waits | Purge::Unknown => inodes
             .iter()
             .any(|inode| inner.held(*inode).is_some_and(|hold| hold.pending > 0)),
@@ -556,9 +572,9 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
         result
     }
 
-    // vouched says whether reads may be handed to the kernel, as vouch says, letting unheld inodes go when listed.
+    // handling is the result handling of reads, as result_handling says, letting unheld inodes go when listed.
     #[allow(clippy::too_many_arguments)]
-    fn vouched(
+    fn handling(
         &self,
         mount: &Mount<impl Store>,
         reads: &[(Inode, Attributes)],
@@ -566,21 +582,29 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
         ticket: u64,
         began: u64,
         purge: Purge,
+        no_cache_honoured: bool,
         listed: bool,
-    ) -> bool {
+    ) -> ResultHandling {
         let mut inner = self.state.lock();
         let mut replies = Vec::new();
+        // behind says whether a read is older than a write this mount knows of, or shows a write in flight it may have
+        // missed, which only that write's end lets it be cached past.
+        let mut behind = false;
         for (inode, read) in reads {
             let Some(hold) = inner.held(*inode) else {
                 // The kernel has an item for no inode this mount never held, nor let go of.
                 if listed && !inner.holds.contains_key(inode) {
                     continue;
                 }
-                return false;
+                return ResultHandling::Retry;
             };
             let version = read.change_version.number;
-            if hold.since >= ticket || version < hold.confirmed {
-                return false;
+            if hold.since >= ticket {
+                return ResultHandling::Retry;
+            }
+            if version < hold.confirmed {
+                behind = true;
+                continue;
             }
             let pending_version = pending.get(inode);
             // A read showing a write in flight older than the delivery goes no further: that write may have finished.
@@ -590,34 +614,43 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
                     || pending_version
                         .is_some_and(|pending| pending.number >= hold.pending_highest))
             {
-                // The purge drops a read it waits for begun before the kernel was asked. One begun since, likely held
-                // back until the kernel purged, waits for the round to end, at most LATE_READS_WAIT as the purge may
-                // wait for it. Any other, such as a write's reply, which must go, makes the delivery invalidate again;
-                // then a read the purge goes ahead of waits for the write, which waits on nothing here.
+                // The purge drops a read it waits for begun before the kernel was asked. Any other the kernel asks
+                // again about goes uncached, as one behind does. One begun since, likely held back until the kernel
+                // purged, waits for the round to end, at most LATE_READS_WAIT as the purge may wait for it. Any other,
+                // such as a write's reply, which must go, makes the delivery invalidate again; then a read the purge
+                // goes ahead of waits for the write, which waits on nothing here.
                 match purge {
-                    Purge::GoesAhead if hold.again > 0 => return false,
+                    Purge::GoesAhead if hold.again > 0 => return ResultHandling::Retry,
                     Purge::Waits if hold.asked == 0 || began < hold.round => {}
+                    _ if no_cache_honoured => behind = true,
                     Purge::Waits
                         if hold
                             .asked_at
                             .is_some_and(|asked| mount.runtime.now() - asked < LATE_READS_WAIT) =>
                     {
-                        return false;
+                        return ResultHandling::Retry;
                     }
                     Purge::GoesAhead | Purge::Waits | Purge::Unknown => replies.push(*inode),
                 }
                 continue;
             }
-            if live(read, pending_version) {
-                return false;
-            }
+            behind |= live(read, pending_version);
+        }
+        // Waiting on a write while the kernel's purge may wait for this operation could hold up a purge that write
+        // waits on, so the reply goes uncached instead: the read was taken while the operation ran, so it may be
+        // returned, only not kept.
+        if behind {
+            return match purge {
+                Purge::Waits | Purge::Unknown => ResultHandling::NoCache,
+                Purge::GoesAhead => ResultHandling::Retry,
+            };
         }
         for inode in replies {
             if let Some(hold) = inner.held(inode) {
                 hold.replies += 1;
             }
         }
-        true
+        ResultHandling::Cache
     }
 
     // replied lets the holds a write's reply held up go on: it has replied, or will not.
@@ -699,8 +732,8 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
     }
 
     // ended waits until no write of in_flight is still in flight, settling any that outlasted its writer. A write whose
-    // operation the kernel's purge waits for fails at once while a delivery to one of their inodes is handled here:
-    // that delivery's write waits for this mount to drop its copy, which the kernel holds back until this write ends.
+    // operation the kernel's purge waits for fails at once while a delivery it is contended by is handled here: that
+    // delivery's write waits for this mount to drop a copy, which the kernel may hold back until this write ends.
     async fn ended<St: Store>(
         &self,
         mount: &Mount<St>,
@@ -710,7 +743,7 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
     ) -> Result<(), Failure<P, St>> {
         loop {
             let inodes: Vec<Inode> = in_flight.iter().map(|(inode, _)| *inode).collect();
-            if contended(&mut self.state.lock(), &inodes, purge) {
+            if contended(&mut self.state.lock(), &inodes, purge, &*mount.kernel) {
                 return Err(StrongFailure::Contended);
             }
             Cached::<St>::settled(self, mount, &in_flight, &pending).await?;
@@ -1310,7 +1343,8 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
                 };
                 announced.extend(fresh.iter().map(|(inode, version)| (*inode, *version)));
                 // No delivery tells this mount of its own write. It drops this mount's copies as one would if the purge
-                // goes ahead of it; one that would wait for it cannot, so the floor keeps reads from going behind it.
+                // goes ahead of it; one that would wait for it cannot, so the floor keeps reads behind it from being
+                // cached, and only the kernel's copy of the attributes goes, which waits for nothing.
                 let mut own = Vec::new();
                 match purge {
                     Purge::GoesAhead => {
@@ -1321,7 +1355,15 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
                             }
                         }
                     }
-                    Purge::Waits | Purge::Unknown => self.floor(&announced),
+                    Purge::Waits | Purge::Unknown => {
+                        self.floor(&announced);
+                        for (inode, _) in &fresh {
+                            mount
+                                .kernel
+                                .invalidate_attributes(*inode)
+                                .map_err(StrongFailure::Uninvalidated)?;
+                        }
+                    }
                 }
                 // The own delivery runs on its own, so a write that yields leaves its purge, which no one can cancel.
                 if !own.is_empty() {
@@ -1517,10 +1559,11 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         Ok(held_before)
     }
 
-    // vouch hands over a read taken after its inodes were held, not older than any write this mount acknowledged,
-    // and with no write in flight it may have missed. A read older than a delivery still being handled may go when
-    // the kernel's purge waits for its operation, since that delivery's purge drops the kernel's copy after it.
-    fn vouch(
+    // result_handling has the kernel cache a read taken after its inodes were held, not older than any write this mount
+    // acknowledged, and with no write in flight it may have missed. One failing only the last two is NoCache when the
+    // purge may wait for its operation. A read older than a delivery being handled may go when the purge waits, or
+    // NoCache when no_cache_honoured.
+    fn result_handling(
         &self,
         mount: &Mount<St>,
         reads: &[(Inode, Attributes)],
@@ -1528,20 +1571,39 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         ticket: u64,
         began: u64,
         purge: Purge,
-    ) -> bool {
-        self.vouched(mount, reads, pending, ticket, began, purge, false)
+        no_cache_honoured: bool,
+    ) -> ResultHandling {
+        self.handling(
+            mount,
+            reads,
+            pending,
+            ticket,
+            began,
+            purge,
+            no_cache_honoured,
+            false,
+        )
     }
 
-    // vouch_listed vouches for the inodes of a listing held already, as vouch does, and lets the others go, but for
-    // lost ones, which settled holds again.
-    fn vouch_listed(
+    // result_handling_listed handles the inodes of a listing held already as result_handling does, and lets the others
+    // go, but for lost ones, which settled holds again.
+    fn result_handling_listed(
         &self,
         mount: &Mount<St>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: u64,
-    ) -> bool {
-        self.vouched(mount, reads, pending, ticket, ticket, Purge::Unknown, true)
+    ) -> ResultHandling {
+        self.handling(
+            mount,
+            reads,
+            pending,
+            ticket,
+            ticket,
+            Purge::Unknown,
+            false,
+            true,
+        )
     }
 
     async fn settled(

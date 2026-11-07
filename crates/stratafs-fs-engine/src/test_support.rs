@@ -20,8 +20,8 @@ use stratafs_tree::tree::{Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
-use crate::observation::{KernelCache, NoKernel};
-use crate::{Eventual, FsConfig, FsEngine, Inode, MountId, Purge, Timestamp};
+use crate::kernel_cache::{KernelCache, NoKernel};
+use crate::{Cached, Eventual, FsConfig, FsEngine, Inode, MountId, Purge, Timestamp};
 
 // TEST_MOUNT is the mount test engines are.
 pub(crate) const TEST_MOUNT: MountId = MountId(1);
@@ -48,8 +48,10 @@ pub(crate) type InMemoryStore = LockSynchronizedStore<
 
 pub(crate) type MetadataFailure = TreeFailure<RedbFailure, Infallible>;
 
-pub(crate) type InMemoryEngine =
-    FsEngine<InMemoryStore, fn() -> u64, fn() -> Timestamp, OneKibInline, Eventual>;
+pub(crate) type InMemoryEngine = TestEngine<Eventual>;
+
+pub(crate) type TestEngine<C> =
+    FsEngine<InMemoryStore, fn() -> u64, fn() -> Timestamp, OneKibInline, C>;
 
 thread_local! {
     static CLOCK: Cell<i64> = const { Cell::new(0) };
@@ -79,6 +81,14 @@ pub(crate) fn new_test_engine() -> InMemoryEngine {
 
 // new_test_engine_for is a test engine whose inodes kernel caches.
 pub(crate) fn new_test_engine_for(kernel: impl KernelCache) -> InMemoryEngine {
+    new_test_engine_with(Eventual::default(), kernel)
+}
+
+// new_test_engine_with is a test engine with consistency, whose inodes kernel caches.
+pub(crate) fn new_test_engine_with<C: Cached<InMemoryStore>>(
+    consistency: C,
+    kernel: impl KernelCache,
+) -> TestEngine<C> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
@@ -98,7 +108,7 @@ pub(crate) fn new_test_engine_for(kernel: impl KernelCache) -> InMemoryEngine {
             now,
             TEST_MOUNT,
             Some(DurableAgainst::PowerFailure),
-            Eventual::default(),
+            consistency,
             kernel,
             Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
         )

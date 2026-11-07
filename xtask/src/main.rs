@@ -1,7 +1,7 @@
 // xtask runs the repository's own build tasks: `cargo xtask <task>`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::SystemTime;
 
 use clap::{Args, Parser, Subcommand};
@@ -25,6 +25,13 @@ enum Task {
         about = "Build JuiceFS 1.4.2 for the benchmark, with the go-m1cpu fix its release lacks for M5 Macs, into target/bench/juicefs"
     )]
     Juicefs,
+    #[command(
+        about = "Build and test stratafs-fuse on Linux, in a Docker container that can mount FUSE volumes; extra arguments go to cargo test"
+    )]
+    FuseTest {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
 }
 
 // Configuration is the build's tuning constants. Each one left out keeps stratafs-bench's default.
@@ -100,6 +107,7 @@ fn main() -> ExitCode {
     let result = match Xtask::parse().task {
         Task::Bundle(configuration) => bundle(&configuration),
         Task::Juicefs => juicefs(),
+        Task::FuseTest { arguments } => fuse_test(&arguments),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -274,6 +282,84 @@ fn juicefs() -> Result<(), String> {
         .arg(&binary)
         .arg("."))?;
     run(Command::new(&binary).arg("version"))
+}
+
+// FUSE_IMAGE is the image stratafs-fuse is tested in, and the FUSE_* volumes keep the sources, cargo's downloads and the
+// Linux build between runs, apart from the repository and its macOS target directory.
+const FUSE_IMAGE: &str = "stratafs-fuse-test";
+const FUSE_SOURCES: &str = "stratafs-fuse-sources";
+const FUSE_CARGO_HOME: &str = "stratafs-fuse-cargo";
+const FUSE_TARGET: &str = "stratafs-fuse-target";
+
+// FUSE_LEFT_OUT are the workspace's paths the container has no use for, by tar's exclude patterns.
+const FUSE_LEFT_OUT: [&str; 4] = ["./target", "./.git", "./.direnv", "node_modules"];
+
+// fuse_test builds the test image, copies the workspace's sources into a volume, and runs stratafs-fuse's tests in a
+// container with /dev/fuse and the right to mount. The copy writes only files whose contents changed, so cargo rebuilds
+// only those, and it needs nothing of Docker's file sharing.
+fn fuse_test(arguments: &[String]) -> Result<(), String> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask sits in the workspace root");
+    run(Command::new("docker")
+        .current_dir(workspace)
+        .args(["build", "--tag", FUSE_IMAGE, "--file"])
+        .arg("crates/stratafs-fuse/Dockerfile")
+        .arg("."))?;
+    let mut archive = Command::new("tar");
+    archive
+        .current_dir(workspace)
+        // Apple's tar would add each file's extended attributes as files of their own.
+        .env("COPYFILE_DISABLE", "1")
+        .args(["--create", "--no-xattrs", "--file", "-"]);
+    for left_out in FUSE_LEFT_OUT {
+        archive.arg(format!("--exclude={left_out}"));
+    }
+    let mut archiving = archive
+        .arg(".")
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("starting {archive:?}: {error}"))?;
+    let sources = archiving.stdout.take().expect("tar's output is piped");
+    let copied = run(Command::new("docker")
+        .args(["run", "--rm", "--interactive", "--volume"])
+        .arg(format!("{FUSE_SOURCES}:/stratafs"))
+        .arg(FUSE_IMAGE)
+        .args([
+            "sh",
+            "-c",
+            "mkdir /copied && tar -x -C /copied && rsync --recursive --links --checksum --delete /copied/ /stratafs/",
+        ])
+        .stdin(sources));
+    let archived = archiving
+        .wait()
+        .map_err(|error| format!("waiting for {archive:?}: {error}"))?;
+    copied?;
+    if !archived.success() {
+        return Err(format!("{archive:?} exited with {archived}"));
+    }
+    run(Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--device",
+            "/dev/fuse",
+            "--cap-add",
+            "SYS_ADMIN",
+            "--security-opt",
+            "apparmor=unconfined",
+            "--env",
+            "CARGO_TARGET_DIR=/target",
+            "--volume",
+        ])
+        .arg(format!("{FUSE_SOURCES}:/stratafs"))
+        .arg("--volume")
+        .arg(format!("{FUSE_CARGO_HOME}:/root/.cargo"))
+        .arg("--volume")
+        .arg(format!("{FUSE_TARGET}:/target"))
+        .arg(FUSE_IMAGE)
+        .args(["cargo", "test", "--locked", "--package", "stratafs-fuse"])
+        .args(arguments))
 }
 
 // signing finds Xcode's provisioning profile for the module on this Mac and a signing identity in the keychain

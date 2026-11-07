@@ -4,13 +4,14 @@ use std::convert::Infallible;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::pin::pin;
 use std::process::{self, Child, Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_lite::future::block_on;
+use futures_lite::future::{self, block_on};
 use stratafs_mdbx::{MdbxMetadata, MdbxOpenError};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
@@ -24,6 +25,7 @@ const STORE: &str = "STRATAFS_MDBX_TEST_STORE";
 const NEXT: Bytes = Bytes::from_static(b"next");
 const COUNT: Bytes = Bytes::from_static(b"count");
 const GO: Bytes = Bytes::from_static(b"go");
+const WATCHED: Bytes = Bytes::from_static(b"watched");
 const COUNTS_PER_PROCESS: u32 = 400;
 
 #[test]
@@ -52,6 +54,15 @@ fn child() {
                     println!("ready");
                 }
             }
+        }
+        Ok("set watched") => {
+            block_on(store.transact(|mut transaction| {
+                Box::pin(async move {
+                    transaction.set(WATCHED, &b"value"[..]).unwrap();
+                    Ok::<_, Infallible>(((), transaction))
+                })
+            }))
+            .unwrap();
         }
         Ok("read forever") => thread::scope(|scope| {
             for _ in 0..8 {
@@ -196,6 +207,31 @@ fn a_process_killed_while_it_holds_a_lock_of_the_store_stalls_no_other() {
             "a {role:?} process killed on kill {kill} stalled this one"
         );
     }
+}
+
+#[test]
+fn a_commit_of_another_process_wakes_a_watch() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.mdbx");
+    let store = Arc::new(configuration::open(&path, ThreadPool).unwrap());
+    let (registered, watching) = mpsc::channel();
+    let (woken, waking) = mpsc::channel();
+    thread::spawn(move || {
+        block_on(async {
+            let mut changed = pin!(store.changed(WATCHED, None));
+            assert!(future::poll_once(changed.as_mut()).await.is_none());
+            registered.send(()).unwrap();
+            changed.await.unwrap();
+        });
+        woken.send(()).unwrap();
+    });
+    watching.recv().unwrap();
+    let mut child = Spawned::new("set watched", &path, Stdio::null());
+    assert!(child.0.wait().unwrap().success());
+    assert!(
+        waking.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "another process's commit woke no watch"
+    );
 }
 
 // commit_until_killed commits numbered entries one at a time, keeping the next number under NEXT. After every

@@ -30,6 +30,7 @@ futures-executor = { version = "0.3.34", default-features = false, features = ["
 futures-lite = "2.6"
 futures-timer = "3"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+fuser = "0.18"
 hex = "0.4"
 libc = "0.2"
 mimalloc = "0.1.52"

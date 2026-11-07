@@ -3,6 +3,8 @@
 // stat, read, write or times change running when asked, later ones for the purge. In a directory, lookups run side by
 // side, a change waits for lookups and changes, a lookup or listing for a change. Replies take effect in order.
 
+mod mount;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -10,16 +12,18 @@ use bytes::Bytes;
 use event_listener::Event;
 use futures_lite::future::yield_now;
 use futures_util::future::BoxFuture;
-use stratafs_fs_engine::Inode;
 use stratafs_fs_engine::attributes::Attributes;
-use stratafs_fs_engine::observation::{Answered, Asked, KernelCache, Uninvalidated};
+use stratafs_fs_engine::kernel_cache::{Answered, Asked, KernelCache, Uninvalidated};
+use stratafs_fs_engine::{Inode, ResultHandling};
 
 use crate::faults::Faults;
+use crate::mount::{KernelModel, References};
 
 pub(crate) struct Kernel {
     state: Mutex<State>,
     changed: Event,
     faults: Arc<Faults>,
+    references: Arc<References>,
 }
 
 #[derive(Default)]
@@ -45,8 +49,6 @@ struct State {
     // and deferred each update of a reply about an item that takes effect after its next purge.
     asking: HashMap<Inode, VecDeque<(u64, BTreeSet<u64>)>>,
     deferred: HashMap<Inode, Vec<(u64, Update)>>,
-    // references counts the operations referring to each item, which the kernel does not reclaim meanwhile.
-    references: HashMap<Inode, usize>,
     // lookups counts the lookups running in each directory, and changing is each directory a change runs in.
     lookups: HashMap<Inode, usize>,
     changing: HashSet<Inode>,
@@ -118,14 +120,8 @@ pub(crate) struct InDirectory<'a> {
     work: Work,
 }
 
-// Reference marks an operation referring to an item, until it is dropped.
-pub(crate) struct Reference {
-    kernel: Arc<Kernel>,
-    inode: Inode,
-}
-
 // KernelHandle is the kernel as the engine reaches it.
-pub(crate) struct KernelHandle(pub(crate) Arc<Kernel>);
+struct KernelHandle(Arc<Kernel>);
 
 impl KernelCache for KernelHandle {
     fn invalidate(&self, inode: Inode) -> BoxFuture<'static, Result<(), Uninvalidated>> {
@@ -146,17 +142,41 @@ impl KernelCache for KernelHandle {
                 .await
         })
     }
+
+    // As the FSKit volume's, it cannot drop an item's attributes alone, and a purge waits only for the item's own.
+    fn invalidate_attributes(&self, _inode: Inode) -> Result<(), Uninvalidated> {
+        Ok(())
+    }
+
+    fn purge_waits_on_others(&self) -> bool {
+        false
+    }
 }
 
-impl Kernel {
-    pub(crate) fn new(faults: &Arc<Faults>) -> Self {
+impl KernelModel for Kernel {
+    // UPSTREAM KERNEL BUG PIN: FSKit keeps a failed write's data.
+    const TAINTED: &'static str = "a failed write's data";
+    // The FSKit volume checks what the kernel found, a rename's destination first.
+    const FINDS_NAMES: bool = false;
+    // A listing shows an app each entry's attributes, as getattrlistbulk does.
+    const LISTS_ATTRIBUTES: bool = true;
+    const REGRESSIONS: &'static str = "proptest-regressions/lib.txt";
+
+    fn new(faults: &Arc<Faults>, references: &Arc<References>) -> Self {
         Kernel {
             state: Mutex::default(),
             changed: Event::new(),
             faults: Arc::clone(faults),
+            references: Arc::clone(references),
         }
     }
 
+    fn cache(self: &Arc<Self>) -> impl KernelCache {
+        KernelHandle(Arc::clone(self))
+    }
+}
+
+impl Kernel {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -314,18 +334,18 @@ impl Kernel {
         InDirectory { kernel: self, work }
     }
 
-    // reply asks vouch while every item of reads is locked, as the FSKit volume's Items does, and if it vouches hands
-    // over each read, or a newer one handed out before, with updates of items. It is what it handed over, or None when
-    // vouch did not vouch. Data goes only with the operation's own file, if no write of it began since.
+    // reply asks for the result handling while every item of reads is locked, as the FSKit volume's Items does, and if
+    // it is Cache hands over each read, or a newer one handed out before, with updates of items. It is what it handed
+    // over, or None otherwise. Data goes only with the operation's own file, if no write of it began since.
     pub(crate) fn reply(
         &self,
         reads: &[(Inode, Attributes)],
         updates: &[(Inode, Update)],
         operation: Option<&Operation<'_>>,
-        vouch: &dyn Fn() -> bool,
+        result_handling: &dyn Fn() -> ResultHandling,
     ) -> Option<Replied> {
         let mut state = self.state();
-        if !vouch() {
+        if result_handling() != ResultHandling::Cache {
             return None;
         }
         state.numbered += 1;
@@ -370,16 +390,17 @@ impl Kernel {
         Some(Replied { handed, reply })
     }
 
-    // reply_listed asks vouch while every item of reads is locked, and if it vouches hands over each read, or a newer
-    // one handed out before, telling cached of each item the kernel holds, which is all the kernel keeps of a listing.
+    // reply_listed asks for the result handling while every item of reads is locked, and if it is Cache hands over each
+    // read, or a newer one handed out before, telling cached of each item the kernel holds, which is all the kernel
+    // keeps of a listing.
     pub(crate) fn reply_listed(
         &self,
         reads: &[(Inode, Attributes)],
-        vouch: &dyn Fn() -> bool,
+        result_handling: &dyn Fn() -> ResultHandling,
         cached: impl Fn(Inode, &Attributes),
     ) -> Option<(Vec<Attributes>, u64)> {
         let mut state = self.state();
-        if !vouch() {
+        if result_handling() != ResultHandling::Cache {
             return None;
         }
         state.numbered += 1;
@@ -419,20 +440,12 @@ impl Kernel {
         .await;
     }
 
-    pub(crate) fn refer(self: &Arc<Self>, inode: Inode) -> Reference {
-        *self.state().references.entry(inode).or_default() += 1;
-        Reference {
-            kernel: Arc::clone(self),
-            inode,
-        }
-    }
-
     // reclaim lets go of inode unless an operation refers to it, dropping what the kernel caches for it and every name
     // in it or of it, and running forget under the item's lock, as the FSKit volume's reclaim does, and says whether
     // it did. XNU purges a reclaimed vnode's name cache entries.
     pub(crate) fn reclaim(&self, inode: Inode, forget: impl FnOnce()) -> bool {
         let mut state = self.state();
-        if state.references.contains_key(&inode) {
+        if self.references.referred(inode) {
             return false;
         }
         forget();
@@ -611,20 +624,6 @@ impl Drop for Operation<'_> {
             }
         }
         self.kernel.changed.notify(usize::MAX);
-    }
-}
-
-impl Drop for Reference {
-    fn drop(&mut self) {
-        let mut state = self.kernel.state();
-        let references = state
-            .references
-            .get_mut(&self.inode)
-            .expect("a reference is counted until it is dropped");
-        *references -= 1;
-        if *references == 0 {
-            state.references.remove(&self.inode);
-        }
     }
 }
 

@@ -28,7 +28,7 @@ use objc2_fs_kit::{
 use stratafs_fs_engine::attributes::FileType;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::error::PosixError;
-use stratafs_fs_engine::observation::{Answered, Asked, KernelCache, Uninvalidated};
+use stratafs_fs_engine::kernel_cache::{Answered, Asked, KernelCache, Uninvalidated};
 use stratafs_fs_engine::{Inode, LARGEST_NAME_LENGTH};
 use stratafs_store::spawn::{SpawnBlocking, ThreadPool};
 
@@ -704,6 +704,17 @@ impl KernelCache for FsKitCache {
             answered(invalidated.is_ok());
             invalidated
         }))
+    }
+
+    // Every purge FSKit has may wait for an operation in flight, so it drops no attributes alone: a stat on this mount
+    // can show an item's attributes from before this mount's own change to it until the change replies.
+    fn invalidate_attributes(&self, _inode: Inode) -> Result<(), Uninvalidated> {
+        Ok(())
+    }
+
+    // FSKit's purge of an item waits only for operations on that item: a directory's waits for none.
+    fn purge_waits_on_others(&self) -> bool {
+        false
     }
 }
 

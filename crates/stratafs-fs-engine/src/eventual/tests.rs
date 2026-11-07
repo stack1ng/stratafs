@@ -9,9 +9,9 @@ use futures_lite::future::{block_on, poll_once};
 use super::*;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::directories::NewItem;
-use crate::observation::{KernelCache, NoKernel, Uninvalidated};
+use crate::kernel_cache::{Answered, Asked, KernelCache, NoKernel, Uninvalidated};
 use crate::test_support::{InMemoryEngine, InMemoryStore, new_test_engine, new_test_engine_for};
-use crate::{FsEngine, MountId, Purge};
+use crate::{FsEngine, MountId, Purge, ResultHandling};
 
 // ChannelKernel is a kernel cache that sends each inode it is asked to invalidate.
 struct ChannelKernel(mpsc::Sender<Inode>);
@@ -20,6 +20,26 @@ impl KernelCache for ChannelKernel {
     fn invalidate(&self, inode: Inode) -> BoxFuture<'static, Result<(), Uninvalidated>> {
         let _ = self.0.send(inode);
         Box::pin(async { Ok(()) })
+    }
+
+    fn invalidate_noting(
+        &self,
+        inode: Inode,
+        asked: Asked,
+        answered: Answered,
+    ) -> BoxFuture<'static, Result<(), Uninvalidated>> {
+        asked();
+        let _ = self.0.send(inode);
+        answered(true);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn invalidate_attributes(&self, _inode: Inode) -> Result<(), Uninvalidated> {
+        Ok(())
+    }
+
+    fn purge_waits_on_others(&self) -> bool {
+        false
     }
 }
 
@@ -171,20 +191,26 @@ fn an_auto_invalidating_engine_leaves_a_forgotten_inode_alone() {
 }
 
 #[test]
-fn an_eventual_engine_vouches_only_for_a_read_begun_after_the_kernel_last_let_go_of_an_inode() {
+fn an_eventual_engine_retries_a_read_begun_before_the_kernel_last_let_go_of_an_inode() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     let reading = || Cached::<InMemoryStore>::reading(&engine.consistency);
     let reads = [(inode, seen)];
-    let vouched = |ticket| {
-        engine
-            .consistency
-            .vouch(&engine.mount, &reads, &(), ticket, ticket, Purge::Waits)
+    let handling = |ticket| {
+        engine.consistency.result_handling(
+            &engine.mount,
+            &reads,
+            &(),
+            ticket,
+            ticket,
+            Purge::Waits,
+            false,
+        )
     };
     let before = reading();
     engine.forget(inode);
-    assert!(!vouched(before));
-    assert!(vouched(reading()));
+    assert_eq!(handling(before), ResultHandling::Retry);
+    assert_eq!(handling(reading()), ResultHandling::Cache);
 }
 
 #[test]

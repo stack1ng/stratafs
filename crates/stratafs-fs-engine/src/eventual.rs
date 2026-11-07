@@ -11,7 +11,7 @@ use stratafs_store::store::Store;
 
 use crate::attributes::{Attributes, read_attributes};
 use crate::key::FsKey;
-use crate::{Cached, Change, Consistency, Inode, MetadataFailure, Mount, Purge};
+use crate::{Cached, Change, Consistency, Inode, MetadataFailure, Mount, Purge, ResultHandling};
 
 // Eventual serves reads from a cache that may lag behind other clients' writes.
 pub struct Eventual {
@@ -157,7 +157,7 @@ impl<St: Store> Cached<St> for Eventual {
 
     // A read begun before the kernel let go of one of its inodes is taken again: once the item is gone, its reply could
     // land after a newer one this mount handed over, which the auto invalidator then takes for the kernel's own.
-    fn vouch(
+    fn result_handling(
         &self,
         _: &Mount<St>,
         reads: &[(Inode, Attributes)],
@@ -165,12 +165,22 @@ impl<St: Store> Cached<St> for Eventual {
         ticket: u64,
         _: u64,
         _: Purge,
-    ) -> bool {
-        self.taken_after(ticket, reads.iter().map(|(inode, _)| *inode))
+        _: bool,
+    ) -> ResultHandling {
+        match self.taken_after(ticket, reads.iter().map(|(inode, _)| *inode)) {
+            true => ResultHandling::Cache,
+            false => ResultHandling::Retry,
+        }
     }
 
-    fn vouch_listed(&self, _: &Mount<St>, _: &[(Inode, Attributes)], (): &(), _: u64) -> bool {
-        true
+    fn result_handling_listed(
+        &self,
+        _: &Mount<St>,
+        _: &[(Inode, Attributes)],
+        (): &(),
+        _: u64,
+    ) -> ResultHandling {
+        ResultHandling::Cache
     }
 
     async fn settled(

@@ -16,7 +16,7 @@ use stratafs_fs_engine::Eventual;
 #[cfg(consistency = "strong")]
 use stratafs_fs_engine::StrongUntilDisconnectCached;
 use stratafs_fs_engine::error::{EngineFailure, PosixError};
-use stratafs_fs_engine::observation::{KernelCache, NoKernel};
+use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
 use stratafs_fs_engine::{Cached, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_store::durability::DurableAgainst;

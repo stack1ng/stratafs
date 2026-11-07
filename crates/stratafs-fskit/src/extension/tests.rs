@@ -26,7 +26,7 @@ use stratafs_fs_engine::attributes::{
 };
 use stratafs_fs_engine::content::error::WriteError;
 use stratafs_fs_engine::directories::NewItem;
-use stratafs_fs_engine::observation::{KernelCache, NoKernel};
+use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
 use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, Purge, Timestamp};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;

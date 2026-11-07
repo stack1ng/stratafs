@@ -22,7 +22,7 @@ pub(crate) struct Faults {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Counted {
     transactions: usize,
-    invalidations: usize,
+    pub(crate) invalidations: usize,
     connects: usize,
 }
 
@@ -111,14 +111,20 @@ impl Faults {
 
     // refuses counts an invalidation the kernel was asked for, and says whether it refuses it.
     pub(crate) fn refuses(&self) -> bool {
-        let invalidation = self.count(|counted| &mut counted.invalidations);
-        let refused = (invalidation.saturating_sub(REFUSALS - 1)..=invalidation)
-            .any(|at| self.planned(FaultKind::Refused, at));
+        let refused = self.refuses_attributes();
         // A mount drops its connection once a delivery's invalidation is refused twice, so it is cut from here on.
         if refused {
             self.link.history.push(Event::Cut(self.link.mount));
         }
         refused
+    }
+
+    // refuses_attributes counts a drop of an item's attributes alone as an invalidation, and says whether the kernel
+    // refuses it, which fails only the write that asked.
+    pub(crate) fn refuses_attributes(&self) -> bool {
+        let invalidation = self.count(|counted| &mut counted.invalidations);
+        (invalidation.saturating_sub(REFUSALS - 1)..=invalidation)
+            .any(|at| self.planned(FaultKind::Refused, at))
     }
 
     // count counts one more of what counter picks, and is how many there were before.

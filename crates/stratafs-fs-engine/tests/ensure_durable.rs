@@ -6,7 +6,7 @@ use futures_lite::future::block_on;
 use object_store::memory::InMemory;
 use redb::Database;
 use redb::backends::InMemoryBackend;
-use stratafs_fs_engine::observation::NoKernel;
+use stratafs_fs_engine::kernel_cache::NoKernel;
 use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_lock_synchronized::{LockSynchronizedMetadata, LockSynchronizedStore};
 use stratafs_object_store::ObjectStoreContentStore;

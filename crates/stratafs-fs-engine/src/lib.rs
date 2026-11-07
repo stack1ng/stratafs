@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use std::future::ready;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_core::future::BoxFuture;
 use storekey::{BorrowDecode, Encode};
@@ -20,7 +21,7 @@ use stratafs_store::store::Store;
 use crate::attributes::Attributes;
 use crate::error::{EngineFailure, Posix};
 pub use crate::eventual::Eventual;
-use crate::observation::KernelCache;
+use crate::kernel_cache::KernelCache;
 pub use crate::strong::StrongUntilDisconnectCached;
 
 pub mod annotations;
@@ -29,8 +30,8 @@ pub mod content;
 pub mod directories;
 pub mod error;
 pub mod eventual;
+pub mod kernel_cache;
 mod key;
-pub mod observation;
 pub mod spillable;
 pub mod strong;
 #[cfg(test)]
@@ -157,9 +158,11 @@ pub trait Cached<St: Store>: Consistency {
         ticket: Self::Ticket,
     ) -> impl Future<Output = Result<bool, Self::Failure>> + Send;
 
-    // vouch says whether reads, taken since ticket by an operation begun at began, may be handed to the kernel. The
-    // engine asks while nothing else can be handed to the kernel for those inodes, so it must not wait.
-    fn vouch(
+    // result_handling says how the result of reads, taken since ticket by an operation begun at began, is handled.
+    // no_cache_honoured says the kernel asks again about a NoCache result, as Linux does for names and attributes. It
+    // must not wait: the engine asks while nothing else can be handed to the kernel for those inodes.
+    #[allow(clippy::too_many_arguments)]
+    fn result_handling(
         &self,
         mount: &Mount<St>,
         reads: &[(Inode, Attributes)],
@@ -167,19 +170,20 @@ pub trait Cached<St: Store>: Consistency {
         ticket: Self::Ticket,
         began: Self::Ticket,
         purge: Purge,
-    ) -> bool;
+        no_cache_honoured: bool,
+    ) -> ResultHandling;
 
-    // vouch_listed says whether a listing's reads, taken since ticket, may be handed to the kernel. Only inodes held
-    // already count, since the kernel keeps nothing of a listing but the attributes of items it holds.
-    fn vouch_listed(
+    // result_handling_listed says how a listing's result, taken since ticket, is handled, as result_handling does.
+    // Only inodes held already count, since the kernel keeps nothing of a listing but the attributes of items it holds.
+    fn result_handling_listed(
         &self,
         mount: &Mount<St>,
         reads: &[(Inode, Attributes)],
         state: &Self::InodeState,
         ticket: Self::Ticket,
-    ) -> bool;
+    ) -> ResultHandling;
 
-    // settled resolves once reads vouch refused are worth taking again.
+    // settled resolves once reads handled with Retry are worth taking again.
     fn settled(
         &self,
         mount: &Mount<St>,
@@ -189,7 +193,7 @@ pub trait Cached<St: Store>: Consistency {
 
     // reread reads again the inodes a write committed for its reply, with their state, failing when another write
     // changed one since. A write's reply may bind names, so it cannot be read again; one not handed over at once is
-    // vouched for as reread, which shows any write in flight since.
+    // handled as reread, which shows any write in flight since.
     #[allow(clippy::type_complexity)]
     fn reread(
         &self,
@@ -216,6 +220,15 @@ pub enum Purge {
     Waits,
     GoesAhead,
     Unknown,
+}
+
+// ResultHandling is how a read's result is handled: handed to the kernel to cache, handed over with the kernel told not
+// to cache it, or dropped so the read runs again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultHandling {
+    Cache,
+    NoCache,
+    Retry,
 }
 
 // StrongUncached reads everything from the store, without any caching.
@@ -396,8 +409,10 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         }
     }
 
-    // transact_and_serve runs work as transact does, and hands the kernel what it committed with hand once the
-    // consistency vouches for every inode and attributes reads finds in its result, as serve does.
+    // transact_and_serve runs work as transact does, and hands the kernel what it committed with hand as the
+    // consistency's result handling for every inode and attributes reads finds in its result says, as serve does. Once
+    // the work committed, a failure to serve hands over what it committed with NoCache instead, so a change that
+    // happened does not fail; only an integration that cannot reply NoCache gets the failure.
     #[allow(clippy::manual_async_fn)]
     pub fn transact_and_serve<'engine, T: Send + 'engine, E: Send + 'engine, R: Send>(
         &'engine self,
@@ -409,7 +424,12 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
             Result<(T, WriteTransaction<'txn, 'engine, St, A, N, S>), E>,
         > + Send,
         reads: impl Fn(&T) -> Vec<(Inode, Attributes)> + Send + Sync,
-        mut hand: impl FnMut(&T, &[(Inode, Attributes)], &(dyn Fn() -> bool + Sync)) -> Option<R> + Send,
+        mut hand: impl FnMut(
+            &T,
+            &[(Inode, Attributes)],
+            &(dyn Fn() -> ResultHandling + Sync),
+        ) -> Option<R>
+        + Send,
     ) -> impl Future<Output = Result<R, Failed<St, C::Failure, E>>> + Send {
         async move {
             let (result, committed, mut state, changes, prepared, mut ticket) =
@@ -425,40 +445,47 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                         at_once = false;
                         continue;
                     }
-                    Err(failure) => break Err(consistency_failed(failure)),
+                    Err(failure) => break Err(failure),
                 }
                 if !at_once {
                     match self.consistency.reread(&self.mount, &committed).await {
                         Ok(reread) => (read, state) = reread,
-                        Err(failure) => break Err(consistency_failed(failure)),
+                        Err(failure) => break Err(failure),
                     }
                 }
-                let vouch = || {
-                    self.consistency.vouch(
+                let cached = AtomicBool::new(false);
+                let result_handling = || {
+                    let handling = self.consistency.result_handling(
                         &self.mount,
                         &read,
                         &state,
                         ticket,
                         ticket,
                         Purge::Unknown,
-                    )
+                        false,
+                    );
+                    cached.store(handling == ResultHandling::Cache, Ordering::Relaxed);
+                    handling
                 };
-                match hand(&result, &read, &vouch) {
-                    Some(replied) => break Ok(self.handed(&read, replied)),
+                match hand(&result, &read, &result_handling) {
+                    Some(replied) => break Ok(self.handed(&read, cached.into_inner(), replied)),
                     None => {
                         at_once = false;
                         if let Err(failure) = self.settled(&read, &state).await {
-                            break Err(consistency_failed(failure));
+                            break Err(failure);
                         }
                     }
                 }
             };
+            let served = served.or_else(|failure| {
+                hand(&result, &committed, &|| ResultHandling::NoCache).ok_or(failure)
+            });
             if let Some(prepared) = prepared {
                 self.consistency
                     .finish(&self.mount, prepared, Some(&changes))
                     .await;
             }
-            served
+            served.map_err(consistency_failed)
         }
     }
 
@@ -567,13 +594,15 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         }
     }
 
-    // serve runs read and hands its result to the kernel with hand, once the consistency vouches for every inode
-    // and attributes reads finds in it, running read again until it does. hand must ask vouch while nothing else can
-    // be handed to the kernel for those inodes, and reply only when it says yes, returning None otherwise. read hands
-    // its transaction back with its result, as transact's work does, so the consistency reads its state in it too.
+    // serve runs read and hands its result to the kernel with hand, as the consistency's result handling for every
+    // inode and attributes reads finds in it says, running read again on Retry. hand must ask for the result handling
+    // while nothing else can be handed to the kernel for those inodes, and reply as it says, returning None on Retry.
+    // An integration that cannot reply NoCache returns None then too, and serve waits as on Retry. read hands its
+    // transaction back with its result, as transact's work does, so the consistency reads its state in it too.
     pub fn serve<'engine, T: Send, E: Send, R: Send>(
         &'engine self,
         purge: Purge,
+        no_cache_honoured: bool,
         read: impl for<'txn> FnMut(
             ReadTransaction<'txn, 'engine, St, A, N, S>,
         ) -> BoxFuture<
@@ -581,9 +610,17 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
             Result<(T, ReadTransaction<'txn, 'engine, St, A, N, S>), E>,
         > + Send,
         reads: impl Fn(&T) -> Vec<(Inode, Attributes)> + Send + Sync,
-        hand: impl FnMut(&T, &[(Inode, Attributes)], &(dyn Fn() -> bool + Sync)) -> Option<R> + Send,
+        hand: impl FnMut(&T, &[(Inode, Attributes)], &(dyn Fn() -> ResultHandling + Sync)) -> Option<R>
+        + Send,
     ) -> impl Future<Output = Result<R, Failed<St, C::Failure, E>>> + Send {
-        self.serve_loaded(purge, read, |result| ready(Ok(result)), reads, hand)
+        self.serve_loaded(
+            purge,
+            no_cache_honoured,
+            read,
+            |result| ready(Ok(result)),
+            reads,
+            hand,
+        )
     }
 
     // serve_loaded serves as serve does, but runs load on what read returns once read's transaction ends, such as to
@@ -592,6 +629,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
     pub fn serve_loaded<'engine, T: Send, U: Send, E: Send, R: Send, L>(
         &'engine self,
         purge: Purge,
+        no_cache_honoured: bool,
         mut read: impl for<'txn> FnMut(
             ReadTransaction<'txn, 'engine, St, A, N, S>,
         ) -> BoxFuture<
@@ -600,7 +638,12 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         > + Send,
         mut load: impl FnMut(T) -> L + Send,
         reads: impl Fn(&T) -> Vec<(Inode, Attributes)> + Send + Sync,
-        mut hand: impl FnMut(&U, &[(Inode, Attributes)], &(dyn Fn() -> bool + Sync)) -> Option<R> + Send,
+        mut hand: impl FnMut(
+            &U,
+            &[(Inode, Attributes)],
+            &(dyn Fn() -> ResultHandling + Sync),
+        ) -> Option<R>
+        + Send,
     ) -> impl Future<Output = Result<R, Failed<St, C::Failure, E>>> + Send
     where
         L: Future<Output = Result<U, E>> + Send,
@@ -616,12 +659,22 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                 if !self.held(ticket, &read).await.map_err(consistency_failed)? {
                     continue;
                 }
-                let vouch = || {
-                    self.consistency
-                        .vouch(&self.mount, &read, &state, ticket, began, purge)
+                let cached = AtomicBool::new(false);
+                let result_handling = || {
+                    let handling = self.consistency.result_handling(
+                        &self.mount,
+                        &read,
+                        &state,
+                        ticket,
+                        began,
+                        purge,
+                        no_cache_honoured,
+                    );
+                    cached.store(handling == ResultHandling::Cache, Ordering::Relaxed);
+                    handling
                 };
-                match hand(&result, &read, &vouch) {
-                    Some(replied) => return Ok(self.handed(&read, replied)),
+                match hand(&result, &read, &result_handling) {
+                    Some(replied) => return Ok(self.handed(&read, cached.into_inner(), replied)),
                     None => self
                         .settled(&read, &state)
                         .await
@@ -643,17 +696,22 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
             Result<(T, ReadTransaction<'txn, 'engine, St, A, N, S>), E>,
         > + Send,
         reads: impl Fn(&T) -> Vec<(Inode, Attributes)> + Send + Sync,
-        mut hand: impl FnMut(&T, &[(Inode, Attributes)], &(dyn Fn() -> bool + Sync)) -> Option<R> + Send,
+        mut hand: impl FnMut(
+            &T,
+            &[(Inode, Attributes)],
+            &(dyn Fn() -> ResultHandling + Sync),
+        ) -> Option<R>
+        + Send,
     ) -> impl Future<Output = Result<R, Failed<St, C::Failure, E>>> + Send {
         async move {
             loop {
                 let ticket = self.consistency.reading();
                 let (result, read, state) = self.read_with_state(&mut read, &reads).await?;
-                let vouch = || {
+                let result_handling = || {
                     self.consistency
-                        .vouch_listed(&self.mount, &read, &state, ticket)
+                        .result_handling_listed(&self.mount, &read, &state, ticket)
                 };
-                match hand(&result, &read, &vouch) {
+                match hand(&result, &read, &result_handling) {
                     Some(replied) => return Ok(replied),
                     None => self
                         .settled(&read, &state)
@@ -728,15 +786,18 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         async move { self.consistency.hold(&self.mount, &inodes, ticket).await }
     }
 
-    // handed tells the consistency the kernel now caches each of reads, which a reply just handed over.
-    fn handed<R>(&self, reads: &[(Inode, Attributes)], replied: R) -> R {
-        for (inode, read) in reads {
-            self.consistency.cached(&self.mount, *inode, read);
+    // handed tells the consistency the kernel now caches each of reads, which a reply just handed over, when the reply
+    // was cached.
+    fn handed<R>(&self, reads: &[(Inode, Attributes)], cached: bool, replied: R) -> R {
+        if cached {
+            for (inode, read) in reads {
+                self.consistency.cached(&self.mount, *inode, read);
+            }
         }
         replied
     }
 
-    // settled resolves once reads the consistency did not vouch for, of state, are worth taking again.
+    // settled resolves once reads the consistency handled with Retry, of state, are worth taking again.
     fn settled<'a>(
         &'a self,
         reads: &'a [(Inode, Attributes)],
@@ -821,3 +882,6 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Send + Sync> FsEngine<St, A, N
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

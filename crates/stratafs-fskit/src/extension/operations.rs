@@ -28,8 +28,10 @@ use stratafs_fs_engine::content::error::{ReadError, ReadSymbolicLinkError, Write
 use stratafs_fs_engine::directories::error::{LookupError, ReaddirError, RenameError};
 use stratafs_fs_engine::directories::{EntryChange, NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, EngineFailure, IoFailure, PosixError};
-use stratafs_fs_engine::observation::KernelCache;
-use stratafs_fs_engine::{Cached, FsConfig, FsEngine, FsTransaction, Inode, Purge, Timestamp};
+use stratafs_fs_engine::kernel_cache::KernelCache;
+use stratafs_fs_engine::{
+    Cached, FsConfig, FsEngine, FsTransaction, Inode, Purge, ResultHandling, Timestamp,
+};
 use stratafs_runtime::Runtime;
 use stratafs_store::content::ContentStore;
 use stratafs_store::durability::DurableAgainst;
@@ -315,6 +317,7 @@ where
                 .engine
                 .serve(
                     purge,
+                    false,
                     |transaction| {
                         Box::pin(async move {
                             let found = transaction.getattr(inode).await;
@@ -327,16 +330,20 @@ where
                             .map(|attributes| (inode, attributes.clone()))
                             .collect()
                     },
-                    |found, reads, vouch| match found {
-                        Some(_) => volume.items.reply(reads.iter().cloned(), vouch, |locked| {
-                            // SAFETY: the attributes are a live, fully populated object.
-                            succeed(&reply, unsafe {
-                                FSGetAttributesResult::initWithAttributes(
-                                    FSGetAttributesResult::alloc(),
-                                    &locked.attributes(inode),
-                                )
-                            })
-                        }),
+                    |found, reads, result_handling| match found {
+                        Some(_) => {
+                            volume
+                                .items
+                                .reply(reads.iter().cloned(), result_handling, |locked| {
+                                    // SAFETY: the attributes are a live, fully populated object.
+                                    succeed(&reply, unsafe {
+                                        FSGetAttributesResult::initWithAttributes(
+                                            FSGetAttributesResult::alloc(),
+                                            &locked.attributes(inode),
+                                        )
+                                    })
+                                })
+                        }
                         None => {
                             fail(&reply, stale());
                             Some(())
@@ -372,17 +379,19 @@ where
                         })
                     },
                     |attributes| vec![(inode, attributes.clone())],
-                    |_, reads, vouch| {
-                        volume.items.reply(reads.iter().cloned(), vouch, |locked| {
-                            // SAFETY: the attributes are a live, fully populated object.
-                            succeed(&reply, unsafe {
-                                FSSetAttributesResult::initWithAttributes_freeSpace(
-                                    FSSetAttributesResult::alloc(),
-                                    &locked.attributes(inode),
-                                    Some(&no_free_space_update()),
-                                )
+                    |_, reads, result_handling| {
+                        volume
+                            .items
+                            .reply(reads.iter().cloned(), result_handling, |locked| {
+                                // SAFETY: the attributes are a live, fully populated object.
+                                succeed(&reply, unsafe {
+                                    FSSetAttributesResult::initWithAttributes_freeSpace(
+                                        FSSetAttributesResult::alloc(),
+                                        &locked.attributes(inode),
+                                        Some(&no_free_space_update()),
+                                    )
+                                })
                             })
-                        })
                     },
                 )
                 .await;
@@ -400,6 +409,7 @@ where
                 .engine
                 .serve(
                     Purge::GoesAhead,
+                    false,
                     |transaction| {
                         let name = name.clone();
                         Box::pin(async move {
@@ -415,9 +425,9 @@ where
                             .chain([(directory, lookup.directory.clone())])
                             .collect()
                     },
-                    |lookup, reads, vouch| match &lookup.found {
+                    |lookup, reads, result_handling| match &lookup.found {
                         Some((inode, _)) => {
-                            volume.items.reply(reads.iter().cloned(), vouch, |locked| {
+                            volume.items.reply(reads.iter().cloned(), result_handling, |locked| {
                                 let item = locked.item(*inode);
                                 // SAFETY: the item, name and attributes are live objects.
                                 succeed(&reply, unsafe {
@@ -430,12 +440,14 @@ where
                                 })
                             })
                         }
-                        None => volume.items.reply(reads.iter().cloned(), vouch, |_| {
-                            fail(
-                                &reply,
-                                posix_error(errno(PosixError::ENOENT), "no item has that name"),
-                            )
-                        }),
+                        None => volume
+                            .items
+                            .reply(reads.iter().cloned(), result_handling, |_| {
+                                fail(
+                                    &reply,
+                                    posix_error(errno(PosixError::ENOENT), "no item has that name"),
+                                )
+                            }),
                     },
                 )
                 .await;
@@ -451,6 +463,7 @@ where
                 .engine
                 .serve(
                     Purge::GoesAhead,
+                    false,
                     |transaction| {
                         Box::pin(async move {
                             let (target, attributes) = join(
@@ -468,17 +481,19 @@ where
                         })
                     },
                     |(_, attributes)| vec![(inode, attributes.clone())],
-                    |(target, _), reads, vouch| {
-                        volume.items.reply(reads.iter().cloned(), vouch, |locked| {
-                            // SAFETY: the target and attributes are live objects.
-                            succeed(&reply, unsafe {
-                                FSReadSymlinkResult::initWithContents_symlinkAttributes(
-                                    FSReadSymlinkResult::alloc(),
-                                    &file_name(target),
-                                    &locked.attributes(inode),
-                                )
+                    |(target, _), reads, result_handling| {
+                        volume
+                            .items
+                            .reply(reads.iter().cloned(), result_handling, |locked| {
+                                // SAFETY: the target and attributes are live objects.
+                                succeed(&reply, unsafe {
+                                    FSReadSymlinkResult::initWithContents_symlinkAttributes(
+                                        FSReadSymlinkResult::alloc(),
+                                        &file_name(target),
+                                        &locked.attributes(inode),
+                                    )
+                                })
                             })
-                        })
                     },
                 )
                 .await;
@@ -516,9 +531,9 @@ where
                             (directory, created.parent.clone()),
                         ]
                     },
-                    |created, reads, vouch| {
+                    |created, reads, result_handling| {
                         let inode = created.inode;
-                        volume.items.reply(reads.iter().cloned(), vouch, |locked| {
+                        volume.items.reply(reads.iter().cloned(), result_handling, |locked| {
                             let item = locked.item(inode);
                             // SAFETY: the item, name and attributes are live objects.
                             succeed(&reply, unsafe {
@@ -574,9 +589,9 @@ where
                             (directory, created.parent.clone()),
                         ]
                     },
-                    |created, reads, vouch| {
+                    |created, reads, result_handling| {
                         let inode = created.inode;
-                        volume.items.reply(reads.iter().cloned(), vouch, |locked| {
+                        volume.items.reply(reads.iter().cloned(), result_handling, |locked| {
                             let item = locked.item(inode);
                             // SAFETY: the item, name and attributes are live objects.
                             succeed(&reply, unsafe {
@@ -624,8 +639,8 @@ where
                             (directory, linked.parent.clone()),
                         ]
                     },
-                    |_, reads, vouch| {
-                        volume.items.reply(reads.iter().cloned(), vouch, |locked| {
+                    |_, reads, result_handling| {
+                        volume.items.reply(reads.iter().cloned(), result_handling, |locked| {
                             // SAFETY: the name and attributes are live objects.
                             succeed(&reply, unsafe {
                                 FSCreateLinkResult::initWithLinkName_linkAttributes_directoryAttributes_freeSpace(
@@ -661,10 +676,11 @@ where
                     (directory, removed.parent.clone()),
                 ]
             };
-            let hand = |_: &EntryChange,
-                        reads: &[(Inode, Attributes)],
-                        vouch: &(dyn Fn() -> bool + Sync)| {
-                volume.items.reply(reads.iter().cloned(), vouch, |locked| {
+            let hand =
+                |_: &EntryChange,
+                 reads: &[(Inode, Attributes)],
+                 result_handling: &(dyn Fn() -> ResultHandling + Sync)| {
+                    volume.items.reply(reads.iter().cloned(), result_handling, |locked| {
                     // SAFETY: the attributes are live objects.
                     succeed(&reply, unsafe {
                         FSRemoveItemResult::initWithItemAttributes_directoryAttributes_freeSpace(
@@ -675,7 +691,7 @@ where
                         )
                     })
                 })
-            };
+                };
             let served = match kind {
                 FileType::Directory => volume
                     .engine
@@ -764,9 +780,9 @@ where
                         .chain(renamed.replaced.clone())
                         .collect()
                     },
-                    |renamed, reads, vouch| {
+                    |renamed, reads, result_handling| {
                         let replaced = renamed.replaced.as_ref().map(|(replaced, _)| *replaced);
-                        volume.items.reply(reads.iter().cloned(), vouch, |locked| {
+                        volume.items.reply(reads.iter().cloned(), result_handling, |locked| {
                             let replaced = replaced.map(|replaced| locked.attributes(replaced));
                             // SAFETY: the name and attributes are live objects.
                             succeed(&reply, unsafe {
@@ -840,8 +856,8 @@ where
                                 })
                                 .collect()
                         },
-                        |(directory_attributes, entries, attributes), reads, vouch| {
-                            volume.items.reply(reads.iter().cloned(), vouch, |locked| {
+                        |(directory_attributes, entries, attributes), reads, result_handling| {
+                            volume.items.reply(reads.iter().cloned(), result_handling, |locked| {
                                 // The kernel keeps a listing's attributes of the items it holds, so the engine learns
                                 // it caches them, while no reclaim of them can come between.
                                 for (inode, read) in reads {
@@ -946,6 +962,7 @@ where
                 .engine
                 .serve_loaded(
                     Purge::Waits,
+                    false,
                     |transaction| {
                         Box::pin(async move {
                             let (plan, attributes) = join(
@@ -972,32 +989,34 @@ where
                         Ok((pieces, attributes))
                     },
                     |(_, attributes)| vec![(inode, attributes.clone())],
-                    |(pieces, _), reads, vouch| {
-                        volume.items.reply(reads.iter().cloned(), vouch, |locked| {
-                            // SAFETY: FSKit's buffer holds length() writable bytes until the reply, and only this
-                            // operation writes to it.
-                            let destination = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    buffer.object().mutableBytes().as_ptr().cast::<u8>(),
-                                    buffer.object().length(),
-                                )
-                            };
-                            let mut filled = 0;
-                            for piece in pieces {
-                                let length = piece.len().min(destination.len() - filled);
-                                destination[filled..filled + length]
-                                    .copy_from_slice(&piece[..length]);
-                                filled += length;
-                            }
-                            // SAFETY: the attributes are a live, fully populated object.
-                            succeed(&reply, unsafe {
-                                FSReadFileResult::initWithBytesRead_itemAttributes(
-                                    FSReadFileResult::alloc(),
-                                    filled,
-                                    &locked.attributes(inode),
-                                )
+                    |(pieces, _), reads, result_handling| {
+                        volume
+                            .items
+                            .reply(reads.iter().cloned(), result_handling, |locked| {
+                                // SAFETY: FSKit's buffer holds length() writable bytes until the reply, and only this
+                                // operation writes to it.
+                                let destination = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        buffer.object().mutableBytes().as_ptr().cast::<u8>(),
+                                        buffer.object().length(),
+                                    )
+                                };
+                                let mut filled = 0;
+                                for piece in pieces {
+                                    let length = piece.len().min(destination.len() - filled);
+                                    destination[filled..filled + length]
+                                        .copy_from_slice(&piece[..length]);
+                                    filled += length;
+                                }
+                                // SAFETY: the attributes are a live, fully populated object.
+                                succeed(&reply, unsafe {
+                                    FSReadFileResult::initWithBytesRead_itemAttributes(
+                                        FSReadFileResult::alloc(),
+                                        filled,
+                                        &locked.attributes(inode),
+                                    )
+                                })
                             })
-                        })
                     },
                 )
                 .await;
@@ -1035,8 +1054,8 @@ where
                         })
                     },
                     |attributes| vec![(inode, attributes.clone())],
-                    |_, reads, vouch| {
-                        volume.items.reply(reads.iter().cloned(), vouch, |locked| {
+                    |_, reads, result_handling| {
+                        volume.items.reply(reads.iter().cloned(), result_handling, |locked| {
                             // SAFETY: the attributes are a live, fully populated object.
                             succeed(&reply, unsafe {
                                 FSWriteFileResult::initWithBytesWritten_itemAttributes_freeSpace(

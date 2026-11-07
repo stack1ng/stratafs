@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Barrier, mpsc};
+use std::sync::{Arc, Barrier, mpsc};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -246,6 +246,32 @@ fn a_cancelled_wait_for_another_writer_leaves_its_transaction_rolled_back() {
     assert_eq!(
         get(&holder, Bytes::from_static(b"held")),
         Some(Bytes::from_static(b"value"))
+    );
+}
+
+#[test]
+fn a_commit_of_another_process_wakes_a_watch() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("metadata.sqlite");
+    // Two stores on one file in one process see each other's commits only as two processes would.
+    let watcher = Arc::new(SqliteMetadata::local(&path, ThreadPool).unwrap());
+    let writer = SqliteMetadata::local(&path, ThreadPool).unwrap();
+    let (registered, watching) = mpsc::channel();
+    let (woken, waking) = mpsc::channel();
+    std::thread::spawn(move || {
+        block_on(async {
+            let mut changed = pin!(watcher.changed(Bytes::from_static(b"watched"), None));
+            assert!(future::poll_once(changed.as_mut()).await.is_none());
+            registered.send(()).unwrap();
+            changed.await.unwrap();
+        });
+        woken.send(()).unwrap();
+    });
+    watching.recv().unwrap();
+    set(&writer, Bytes::from_static(b"watched"), value(0));
+    assert!(
+        waking.recv_timeout(Duration::from_secs(10)).is_ok(),
+        "another process's commit woke no watch"
     );
 }
 

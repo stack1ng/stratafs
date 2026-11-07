@@ -14,9 +14,8 @@ use crate::activity::{
     DIRECTORIES, FaultKind, MADE, NAMES, Path, SimulatedActivity, SimulatedOperation,
 };
 use crate::faults::Counted;
-use crate::kernel::Reference;
 use crate::model::{HistoryOperation, Namespace, Outcome, Seen};
-use crate::mount::{Consistency, Failure, Mount, Volume};
+use crate::mount::{Consistency, Failure, KernelModel, Mount, Operations, Reference, Volume};
 
 // SETTLED is how long mounts are given to settle once the activity is done, longer than a publish's timeout and the
 // engine's settle margin after it. The clock moves only once every task is blocked, so nothing is left to do after.
@@ -41,8 +40,8 @@ pub(crate) enum Event {
     Unchanged(OpId, PosixError),
     // Stalled is an operation that took longer than LONGEST.
     Stalled(OpId, Duration),
-    // UPSTREAM KERNEL BUG PIN: Tainted is a read the kernel answered with a failed write's data it is excused for,
-    // which the check leaves out and counts.
+    // UPSTREAM KERNEL BUG PIN: Tainted is a read the kernel answered with what an upstream bug excuses, which the check
+    // leaves out and counts.
     Tainted(OpId),
     // Cut and Connected are when a mount's pub/sub connection was cut, or its kernel refused an invalidation, which it
     // drops its connection for, and when it next connected, and Died when it stopped for good.
@@ -81,15 +80,23 @@ pub(crate) enum Ending {
 // Planned is each mount's faults, each at its count.
 type Planned = Vec<Vec<(FaultKind, usize)>>;
 
-pub(crate) fn simulate<R: ReplayingRuntime, C: Consistency>(
+// simulate runs the activity, first without faults to count where to place them when it has any, and is how many
+// tainted reads the checks left out.
+pub(crate) fn simulate<R: ReplayingRuntime, C: Consistency, K: KernelModel>(
     runtime: &R,
     ending: Ending,
     activity: SimulatedActivity,
     seed: u64,
-) -> Result<usize, TestCaseError> {
+) -> Result<usize, TestCaseError>
+where
+    Mount<C, K>: Operations,
+{
     let mut planned = vec![Vec::new(); activity.mounts.len()];
+    // UPSTREAM KERNEL BUG PIN: the tainted reads left out in both runs.
+    let mut tainted = 0;
     if !activity.faults.is_empty() {
-        let (counted, _) = run_once::<R, C>(runtime, ending, &activity, &planned, seed)?;
+        let (counted, left_out) = run_once::<R, C, K>(runtime, ending, &activity, &planned, seed)?;
+        tainted += left_out;
         for fault in &activity.faults {
             let mount = fault.mount % activity.mounts.len();
             let count = counted[mount].of(fault.kind);
@@ -99,19 +106,23 @@ pub(crate) fn simulate<R: ReplayingRuntime, C: Consistency>(
             ));
         }
     }
-    run_once::<R, C>(runtime, ending, &activity, &planned, seed).map(|(_, tainted)| tainted)
+    let (_, left_out) = run_once::<R, C, K>(runtime, ending, &activity, &planned, seed)?;
+    Ok(tainted + left_out)
 }
 
 // run_once runs the activity with planned faults and checks each execution's ending, and returns what each mount
 // counted in the last, and how many tainted reads the checks left out in all.
 // UPSTREAM KERNEL BUG PIN: the tainted count.
-fn run_once<R: ReplayingRuntime, C: Consistency>(
+pub(crate) fn run_once<R: ReplayingRuntime, C: Consistency, K: KernelModel>(
     runtime: &R,
     ending: Ending,
     activity: &SimulatedActivity,
     planned: &Planned,
     seed: u64,
-) -> Result<(Vec<Counted>, usize), TestCaseError> {
+) -> Result<(Vec<Counted>, usize), TestCaseError>
+where
+    Mount<C, K>: Operations,
+{
     let result = Arc::new(Mutex::new(None));
     let run_result = Arc::clone(&result);
     let (activity, planned) = (activity.clone(), planned.clone());
@@ -120,13 +131,13 @@ fn run_once<R: ReplayingRuntime, C: Consistency>(
             (activity.clone(), planned.clone(), Arc::clone(&run_result));
         async move {
             let strict = activity.faults.is_empty() && !activity.slow;
-            let ran = run::<_, C>(&replay, ending, activity, planned).await;
+            let ran = run::<_, C, K>(&replay, ending, activity, planned).await;
             let checked = ran.and_then(|(made, history, counted)| {
                 if strict {
                     check_strict(&history)?;
                 }
                 let tainted = match ending {
-                    Ending::Linearizable => check_linearizable(made, history)?,
+                    Ending::Linearizable => check_linearizable::<K>(made, history)?,
                     Ending::Converges => 0,
                 };
                 Ok((counted, tainted))
@@ -144,17 +155,20 @@ fn run_once<R: ReplayingRuntime, C: Consistency>(
     ran.expect("the simulation ran")
 }
 
-async fn run<P: Replay, C: Consistency>(
+async fn run<P: Replay, C: Consistency, K: KernelModel>(
     replay: &P,
     ending: Ending,
     activity: SimulatedActivity,
     planned: Planned,
-) -> Result<(Namespace, Vec<Event>, Vec<Counted>), TestCaseError> {
+) -> Result<(Namespace, Vec<Event>, Vec<Counted>), TestCaseError>
+where
+    Mount<C, K>: Operations,
+{
     let history = History::default();
     let volume = Volume::new(replay.runtime(activity.slow), &history).await;
     let mut mounts = Vec::new();
     for index in 0..activity.mounts.len() {
-        mounts.push(Arc::new(volume.mount::<C>(index).await));
+        mounts.push(Arc::new(volume.mount::<C, K>(index).await));
     }
     let mut directories = Vec::new();
     for name in DIRECTORIES {
@@ -166,8 +180,16 @@ async fn run<P: Replay, C: Consistency>(
             (_, Err(_)) => panic!("making the volume's directories failed"),
         }
     }
+    // Every mount looks the directories up, as its kernel does to reach them.
+    for mount in &mounts {
+        for name in DIRECTORIES {
+            if mount.resolve(Inode::ROOT, name).await.is_err() {
+                panic!("looking up the volume's directories failed");
+            }
+        }
+    }
     let directories: Arc<[Inode]> = directories.into();
-    let mut made = Namespace::default();
+    let mut made = Namespace::new(K::FINDS_NAMES, K::LISTS_ATTRIBUTES);
     for path in MADE {
         match mounts[0]
             .create(directory(&directories, path.0), path.1, NewItem::File)
@@ -225,9 +247,9 @@ async fn run<P: Replay, C: Consistency>(
 
 // announcements_settled fails if a write left an inode's pending change version ahead of its change version, but for
 // a write of a mount a store transaction of which failed on purpose, which may have been its settle.
-async fn announcements_settled<C: Consistency>(
-    client: &Client<C>,
-    mounts: &[Arc<Mount<C>>],
+async fn announcements_settled<C: Consistency, K>(
+    client: &Client<C, K>,
+    mounts: &[Arc<Mount<C, K>>],
     inodes: &[Inode],
 ) -> Result<(), TestCaseError> {
     let Ok(live) = client.mount.live_pending(inodes).await else {
@@ -245,7 +267,12 @@ async fn announcements_settled<C: Consistency>(
 }
 
 // converged fails unless every live mount serves what the store holds now.
-async fn converged<C: Consistency>(live: &[Client<C>]) -> Result<(), TestCaseError> {
+async fn converged<C: Consistency, K: KernelModel>(
+    live: &[Client<C, K>],
+) -> Result<(), TestCaseError>
+where
+    Mount<C, K>: Operations,
+{
     let Some(first) = live.first() else {
         return Ok(());
     };
@@ -278,8 +305,8 @@ fn paths() -> impl Iterator<Item = Path> {
 }
 
 // Client is the app on one mount, which asks it one operation at a time, and records each in the history.
-struct Client<C: Consistency> {
-    mount: Arc<Mount<C>>,
+struct Client<C: Consistency, K> {
+    mount: Arc<Mount<C, K>>,
     history: History,
     // app is the mount and the app on it.
     app: (usize, usize),
@@ -290,9 +317,12 @@ struct Client<C: Consistency> {
     referred: Vec<Reference>,
 }
 
-impl<C: Consistency> Client<C> {
+impl<C: Consistency, K: KernelModel> Client<C, K>
+where
+    Mount<C, K>: Operations,
+{
     fn new(
-        mount: &Arc<Mount<C>>,
+        mount: &Arc<Mount<C, K>>,
         history: &History,
         app: (usize, usize),
         directories: &Arc<[Inode]>,
@@ -324,7 +354,7 @@ impl<C: Consistency> Client<C> {
                             (
                                 *name.expect("only known names are given"),
                                 inode.0,
-                                Seen::from(attributes),
+                                K::LISTS_ATTRIBUTES.then(|| Seen::from(attributes)),
                             )
                         })
                         .collect();
@@ -423,7 +453,16 @@ impl<C: Consistency> Client<C> {
                 ));
                 let at = |(directory, name): Path| (self.directory(directory), name);
                 let renamed = self.mount.rename(at(from), at(to), inode, replaced).await;
-                self.end(invoked, renamed, |renamed| {
+                // The volume may replace another file than the one the app found at the destination.
+                if let Ok((_, found)) = &renamed
+                    && *found != replaced
+                {
+                    let found = found.map(|found| found.0);
+                    let renaming = HistoryOperation::Rename(from, to, inode.0, found);
+                    self.history
+                        .set(invoked.1, Event::Invoked(invoked.0, renaming));
+                }
+                self.end(invoked, renamed, |(renamed, _)| {
                     Outcome::Seen(Seen::from(renamed))
                 });
             }
@@ -460,9 +499,19 @@ impl<C: Consistency> Client<C> {
     // stats it, so the attributes may be of a later moment than the path.
     async fn lookup(&mut self, path: Path) -> Option<Option<Inode>> {
         let invoked = self.invoke(HistoryOperation::Lookup(path));
-        let inode = match self.mount.resolve(self.directory(path.0), path.1).await {
-            Ok(Some(inode)) => inode,
-            resolved => return self.end(invoked, resolved, |_| Outcome::Found(None)),
+        let resolved = self.mount.resolve(self.directory(path.0), path.1).await;
+        let inode = match resolved {
+            Ok((Some(inode), tainted)) => {
+                // UPSTREAM KERNEL BUG PIN: a lookup answered with what an upstream bug excuses.
+                if tainted {
+                    self.history.push(Event::Tainted(invoked.0));
+                }
+                inode
+            }
+            resolved => {
+                let resolved = resolved.map(|(found, _)| found);
+                return self.end(invoked, resolved, |_| Outcome::Found(None));
+            }
         };
         let referred = self.mount.refer(inode);
         // A stat failing with its work's error fails the lookup, which returns that error with the file it found.
@@ -501,7 +550,7 @@ impl<C: Consistency> Client<C> {
     async fn read(&mut self, inode: Inode) {
         let invoked = self.invoke(HistoryOperation::Read(inode.0));
         let read = self.mount.read(inode).await;
-        // UPSTREAM KERNEL BUG PIN: a read answered with a failed write's data.
+        // UPSTREAM KERNEL BUG PIN: a read answered with what an upstream bug excuses.
         if let Ok((.., true)) = read {
             self.history.push(Event::Tainted(invoked.0));
         }
@@ -528,7 +577,7 @@ impl<C: Consistency> Client<C> {
     // operation failed.
     async fn served(&self, path: Path) -> Option<Option<(Inode, Attributes, Bytes)>> {
         let served = async {
-            let Some(inode) = self.mount.resolve(self.directory(path.0), path.1).await? else {
+            let (Some(inode), _) = self.mount.resolve(self.directory(path.0), path.1).await? else {
                 return Ok(None);
             };
             let attributes = self.mount.stat(inode).await?;
@@ -611,9 +660,12 @@ fn check_strict(history: &[Event]) -> Result<(), TestCaseError> {
 // check_linearizable fails unless some order of the operations' steps, each between its operation's invocation and end,
 // explains what each returned. It leaves out the reads of a mount cut off until it connected again, or dead, and what
 // its writes returned, and a write that failed in a way that may have committed may or may not take effect.
-fn check_linearizable(made: Namespace, history: Vec<Event>) -> Result<usize, TestCaseError> {
+fn check_linearizable<K: KernelModel>(
+    made: Namespace,
+    history: Vec<Event>,
+) -> Result<usize, TestCaseError> {
     let mut ends = HashMap::new();
-    // UPSTREAM KERNEL BUG PIN: the reads answered with a failed write's data, left out below.
+    // UPSTREAM KERNEL BUG PIN: the reads answered with what an upstream bug excuses, left out below.
     let mut tainted = HashSet::new();
     let mut excused: Vec<(usize, usize, usize)> = Vec::new();
     let mut cut = HashMap::new();
@@ -662,7 +714,7 @@ fn check_linearizable(made: Namespace, history: Vec<Event>) -> Result<usize, Tes
             Event::Returned(..) => (None, true),
             _ => (None, false),
         };
-        let steps = operation.clone().steps(returned);
+        let steps = operation.clone().steps(returned, K::FINDS_NAMES);
         threads
             .entry(id.app)
             .or_default()
