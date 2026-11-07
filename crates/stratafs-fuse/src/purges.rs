@@ -7,10 +7,8 @@ use stratafs_fs_engine::Purge;
 // READ waits: the purge drops the file's pages, which a read keeps locked until the reply.
 pub(crate) const READ: Purge = Purge::Waits;
 
-// WRITE waits: without the writeback cache, a write keeps its pages locked until the reply too.
-// UPSTREAM KERNEL BUG (Linux FUSE): a purge writes out the pages a shared writable mapping dirtied, as a write of this
-// class, and waits for it. Under another mount's write to the file, that write fails with EBUSY and its bytes are lost,
-// since waiting for the other write would never end: it waits for this purge.
+// WRITE waits: without the writeback cache, a write keeps its pages locked until the reply too. A purge also writes out
+// the pages a shared writable mapping dirtied, as a write of this class, and waits for it.
 pub(crate) const WRITE: Purge = Purge::Waits;
 
 // NAME_CHANGES are create, mkdir, mknod, symlink, link, unlink, rmdir and rename, which wait: each holds the

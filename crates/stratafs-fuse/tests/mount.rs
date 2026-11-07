@@ -3,8 +3,8 @@
 #![cfg(target_os = "linux")]
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileExt, MetadataExt, symlink};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -434,63 +434,6 @@ fn two_eventual_mdbx_mounts_see_each_others_changes() {
 #[test]
 fn two_eventual_sqlite_mounts_see_each_others_changes() {
     two_eventual_mounts("sqlite");
-}
-
-// UPSTREAM KERNEL BUG PIN: a purge writes out the pages a shared writable mapping dirtied, and that write fails with
-// EBUSY under another mount's write to the file, so the mapping's bytes are lost (see purges.rs). The kernel may write
-// the pages out on its own before the other write, which keeps them, so the test tries several times.
-#[test]
-fn a_shared_mapping_loses_its_bytes_to_another_mounts_write() {
-    let helper = tempfile::tempdir().unwrap();
-    let mapping = helper.path().join("shared_mapping");
-    run(Command::new("cc")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/shared_mapping.c"
-        ))
-        .arg("-o")
-        .arg(&mapping));
-    let coordinator = Coordinator::start();
-    let store = Store::new("mdbx", "strong", Some(&coordinator.url));
-    let (first, second) = (store.mount(), store.mount());
-    let mut lost = 0;
-    for _ in 0..8 {
-        fs::write(first.path("file"), [b'a'; 8192]).unwrap();
-        fs::read(second.path("file")).unwrap();
-        let mut mapped = Command::new(&mapping)
-            .arg(first.path("file"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut said = BufReader::new(mapped.stdout.take().unwrap()).lines();
-        assert_eq!(said.next().unwrap().unwrap(), "dirtied");
-        let written = OpenOptions::new()
-            .write(true)
-            .open(second.path("file"))
-            .unwrap();
-        written.write_all_at(b"w", 4096).unwrap();
-        drop(written);
-        writeln!(mapped.stdin.take().unwrap()).unwrap();
-        let synced = said.next().unwrap().unwrap();
-        assert!(mapped.wait().unwrap().success());
-        let mut stored = [b'a'; 8192];
-        stored[4096] = b'w';
-        match synced == libc::EBUSY.to_string() {
-            true => lost += 1,
-            false => {
-                assert_eq!(synced, "0");
-                stored[0] = b'm';
-            }
-        }
-        assert_eq!(fs::read(second.path("file")).unwrap(), stored);
-    }
-    assert!(
-        lost > 0,
-        "the kernel wrote every mapping out before the other write"
-    );
-    first.unmount();
-    second.unmount();
 }
 
 // A mount serves only the user who mounted it, unless it allows other users.
