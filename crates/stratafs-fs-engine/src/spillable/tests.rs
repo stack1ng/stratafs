@@ -3,13 +3,13 @@ use stratafs_store::content::GetRejection;
 use stratafs_store::error::StoreError;
 
 use super::*;
-use crate::Purge;
+use crate::PurgeWaits;
 use crate::test_support::{InMemoryEngine, OneKibInline, new_test_engine};
 
 const KEY: &[u8] = b"key";
 
 fn make_spillable(engine: &InMemoryEngine, prefix_length: usize, content: Bytes) -> SpillableValue {
-    block_on(engine.transact(Purge::GoesAhead, |txn| {
+    block_on(engine.transact(PurgeWaits::No, |txn| {
         let content = content.clone();
         Box::pin(async move {
             let result = txn.make_spillable(KEY, prefix_length, content).await;

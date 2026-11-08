@@ -27,8 +27,8 @@ use crate::error::{IoFailure, PosixError, refused_or_failed};
 use crate::kernel_cache::{Answered, Asked, KernelCache, Uninvalidated};
 use crate::key::FsKey;
 use crate::{
-    Cached, Change, Consistency, Inode, MetadataFailure, MetadataRejection, Mount, MountId, Purge,
-    ResultHandling,
+    Cached, Change, Consistency, Inode, MetadataFailure, MetadataRejection, Mount, MountId,
+    PurgeWaits, ResultHandling,
 };
 
 // SETTLE_MARGIN is how much longer than a publish's timeout a mount waits on another mount's write in flight before
@@ -84,6 +84,7 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
                     seen: HashMap::new(),
                     claims: HashMap::new(),
                     delivering: HashMap::new(),
+                    publishing: 0,
                     generations: 0,
                     connects: 0,
                     unconnected: None,
@@ -197,6 +198,8 @@ struct Inner<P: PubSub> {
     // delivering is each write of this mount whose own delivery runs, and whether a write its purge may wait on asked
     // it to yield.
     delivering: HashMap<u64, bool>,
+    // publishing counts this mount's writes a purge of any inode may wait for publishing now.
+    publishing: usize,
     // generations counts the clients connected so far.
     generations: u64,
     // connects counts the connects begun so far, and unconnected is the last that failed, by its count.
@@ -294,6 +297,16 @@ impl<P: PubSub> State<P> {
     }
 }
 
+// Publishing counts a write a purge of any inode may wait for among those publishing until it is dropped.
+struct Publishing<'a, P: PubSub>(&'a State<P>);
+
+impl<P: PubSub> Drop for Publishing<'_, P> {
+    fn drop(&mut self) {
+        self.0.lock().publishing -= 1;
+        self.0.wake();
+    }
+}
+
 // Next is what hold does next for an inode: nothing more when it is held, wait for a hold another read is making,
 // or make the hold, as the attempt it numbers.
 enum Next<L> {
@@ -321,21 +334,35 @@ fn claimed<P: PubSub>(inner: &Inner<P>, write: u64, inodes: &[Inode]) -> Vec<Ino
 fn contended<P: PubSub>(
     inner: &mut Inner<P>,
     inodes: &[Inode],
-    purge: Purge,
+    purge_waits: PurgeWaits,
     kernel: &dyn KernelCache,
 ) -> bool {
-    match purge {
-        Purge::Waits | Purge::Unknown if kernel.purge_waits_on_others() => {
-            let generation = inner.generation();
-            inner.holds.values().any(|holding| {
-                matches!(holding, Holding::Held(hold) if Some(hold.generation) == generation && hold.pending > 0)
-            })
+    match purge_waits {
+        PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode | PurgeWaits::Unknown
+            if kernel.purge_waits_on_others() =>
+        {
+            handling_delivery(inner)
         }
-        Purge::Waits | Purge::Unknown => inodes
+        PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode | PurgeWaits::Unknown => inodes
             .iter()
             .any(|inode| inner.held(*inode).is_some_and(|hold| hold.pending > 0)),
-        Purge::GoesAhead => false,
+        PurgeWaits::No => false,
     }
+}
+
+// handling_delivery says whether a delivery of any inode is being handled here.
+fn handling_delivery<P: PubSub>(inner: &Inner<P>) -> bool {
+    let generation = inner.generation();
+    inner.holds.values().any(|holding| {
+        matches!(holding, Holding::Held(hold) if Some(hold.generation) == generation && hold.pending > 0)
+    })
+}
+
+// no_room says whether an operation is one of the requests the kernel keeps a limited number of in flight, with no
+// room for another, which a purge may need. It fails rather than wait while a delivery is handled here, so a purge
+// always gets one.
+fn no_room(purge_waits: PurgeWaits, kernel: &dyn KernelCache) -> bool {
+    purge_waits == PurgeWaits::OfAnyInode && !kernel.in_flight_room()
 }
 
 // live says whether a write is in flight on attributes, whose pending change version is pending.
@@ -581,7 +608,7 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
         pending: &Pending,
         ticket: u64,
         began: u64,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         no_cache_honoured: bool,
         listed: bool,
     ) -> ResultHandling {
@@ -619,18 +646,22 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
                 // purged, waits for the round to end, at most LATE_READS_WAIT as the purge may wait for it. Any other,
                 // such as a write's reply, which must go, makes the delivery invalidate again; then a read the purge
                 // goes ahead of waits for the write, which waits on nothing here.
-                match purge {
-                    Purge::GoesAhead if hold.again > 0 => return ResultHandling::Retry,
-                    Purge::Waits if hold.asked == 0 || began < hold.round => {}
+                match purge_waits {
+                    PurgeWaits::No if hold.again > 0 => return ResultHandling::Retry,
+                    PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode
+                        if hold.asked == 0 || began < hold.round => {}
                     _ if no_cache_honoured => behind = true,
-                    Purge::Waits
+                    PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode
                         if hold
                             .asked_at
                             .is_some_and(|asked| mount.runtime.now() - asked < LATE_READS_WAIT) =>
                     {
                         return ResultHandling::Retry;
                     }
-                    Purge::GoesAhead | Purge::Waits | Purge::Unknown => replies.push(*inode),
+                    PurgeWaits::No
+                    | PurgeWaits::OfOwnInode
+                    | PurgeWaits::OfAnyInode
+                    | PurgeWaits::Unknown => replies.push(*inode),
                 }
                 continue;
             }
@@ -640,9 +671,11 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
         // waits on, so the reply goes uncached instead: the read was taken while the operation ran, so it may be
         // returned, only not kept.
         if behind {
-            return match purge {
-                Purge::Waits | Purge::Unknown => ResultHandling::NoCache,
-                Purge::GoesAhead => ResultHandling::Retry,
+            return match purge_waits {
+                PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode | PurgeWaits::Unknown => {
+                    ResultHandling::NoCache
+                }
+                PurgeWaits::No => ResultHandling::Retry,
             };
         }
         for inode in replies {
@@ -739,14 +772,14 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
         mount: &Mount<St>,
         mut in_flight: Vec<(Inode, Attributes)>,
         mut pending: Pending,
-        purge: Purge,
+        purge_waits: PurgeWaits,
     ) -> Result<(), Failure<P, St>> {
         loop {
             let inodes: Vec<Inode> = in_flight.iter().map(|(inode, _)| *inode).collect();
-            if contended(&mut self.state.lock(), &inodes, purge, &*mount.kernel) {
+            if contended(&mut self.state.lock(), &inodes, purge_waits, &*mount.kernel) {
                 return Err(StrongFailure::Contended);
             }
-            Cached::<St>::settled(self, mount, &in_flight, &pending).await?;
+            Cached::<St>::settled(self, mount, &in_flight, &pending, purge_waits).await?;
             let (stored, stored_pending) = self.stored(mount, &inodes).await?;
             in_flight = in_flight
                 .into_iter()
@@ -815,7 +848,8 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
         &self,
         write: u64,
         inodes: &[Inode],
-        purge: Purge,
+        purge_waits: PurgeWaits,
+        kernel: &dyn KernelCache,
     ) -> Result<(), Failure<P, St>> {
         loop {
             let listener = {
@@ -827,7 +861,12 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
                 if let Connection::Down { purging: true, .. } = inner.connection {
                     return Err(StrongFailure::Purging);
                 }
-                if let Purge::Waits | Purge::Unknown = purge {
+                if no_room(purge_waits, kernel) && handling_delivery(&inner) {
+                    return Err(StrongFailure::Contended);
+                }
+                if let PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode | PurgeWaits::Unknown =
+                    purge_waits
+                {
                     let Inner {
                         claims, delivering, ..
                     } = &mut *inner;
@@ -837,6 +876,44 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
                             self.state.wake();
                         }
                     }
+                }
+                self.state.changed.listen()
+            };
+            listener.await;
+        }
+    }
+
+    // publishing waits, for a write a purge of any inode may wait for, while one fewer than the kernel keeps in flight
+    // of such writes publish, then counts it among them until it drops what it returns: a publish cannot stop, and a
+    // purge may need one of them. It fails while the mount purges, and rather than wait while a delivery is handled
+    // with no room.
+    async fn publishing<St: Store>(
+        &self,
+        purge_waits: PurgeWaits,
+        kernel: &dyn KernelCache,
+    ) -> Result<Option<Publishing<'_, P>>, Failure<P, St>> {
+        let Some(limit) = kernel
+            .in_flight_limit()
+            .filter(|_| purge_waits == PurgeWaits::OfAnyInode)
+        else {
+            return Ok(None);
+        };
+        // With a limit of one none may publish, and nothing would wake a wait.
+        if limit < 2 {
+            return Err(StrongFailure::Contended);
+        }
+        loop {
+            let listener = {
+                let mut inner = self.state.lock();
+                if inner.publishing + 1 < limit {
+                    inner.publishing += 1;
+                    return Ok(Some(Publishing(&self.state)));
+                }
+                if let Connection::Down { purging: true, .. } = inner.connection {
+                    return Err(StrongFailure::Purging);
+                }
+                if no_room(purge_waits, kernel) && handling_delivery(&inner) {
+                    return Err(StrongFailure::Contended);
                 }
                 self.state.changed.listen()
             };
@@ -1297,7 +1374,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         mount: &Mount<St>,
         prepared: Option<Prepared>,
         changes: HashMap<Inode, Change>,
-        purge: Purge,
+        purge_waits: PurgeWaits,
     ) -> Result<Prepared, Self::Failure> {
         let (write, mut announced) = match prepared {
             Some(prepared) => {
@@ -1335,6 +1412,12 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
                 }
                 self.hold(mount, &changed, 0).await?;
                 let (client, _) = self.client(mount, None).await?;
+                // It waits to publish before it announces, so other mounts never wait on its announcement for longer
+                // than a publish.
+                let publishing = match existing.is_empty() {
+                    true => None,
+                    false => self.publishing::<St>(purge_waits, &*mount.kernel).await?,
+                };
                 let fresh = match self.announce(mount, &existing, &announced).await? {
                     Ok(fresh) => fresh,
                     Err((in_flight, pending)) => {
@@ -1346,8 +1429,8 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
                 // goes ahead of it; one that would wait for it cannot, so the floor keeps reads behind it from being
                 // cached, and only the kernel's copy of the attributes goes, which waits for nothing.
                 let mut own = Vec::new();
-                match purge {
-                    Purge::GoesAhead => {
+                match purge_waits {
+                    PurgeWaits::No => {
                         let mut inner = self.state.lock();
                         for (inode, version) in &fresh {
                             if let Some(hold) = inner.held(*inode) {
@@ -1355,7 +1438,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
                             }
                         }
                     }
-                    Purge::Waits | Purge::Unknown => {
+                    PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode | PurgeWaits::Unknown => {
                         self.floor(&announced);
                         for (inode, _) in &fresh {
                             mount
@@ -1387,8 +1470,10 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
                     let client = Arc::clone(&client);
                     let (inode, number) = (*inode, version.number);
                     async move { client.publish(Key(inode.0), &number, self.timeout).await }
-                }));
-                if let Some(failure) = published.await.into_iter().find_map(Result::err) {
+                }))
+                .await;
+                drop(publishing);
+                if let Some(failure) = published.into_iter().find_map(Result::err) {
                     return Err(StrongFailure::Publish(failure));
                 }
                 self.own_delivered::<St>(write).await.map(|()| None)
@@ -1413,9 +1498,12 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
             let waited = async {
                 settled?;
                 match waiting {
-                    Waiting::Claimed => self.unclaimed::<St>(write, &changed, purge).await?,
+                    Waiting::Claimed => {
+                        self.unclaimed::<St>(write, &changed, purge_waits, &*mount.kernel)
+                            .await?
+                    }
                     Waiting::InFlight(in_flight, pending) => {
-                        self.ended(mount, in_flight, pending, purge).await?;
+                        self.ended(mount, in_flight, pending, purge_waits).await?;
                     }
                 }
                 Ok(())
@@ -1570,7 +1658,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         pending: &Pending,
         ticket: u64,
         began: u64,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         no_cache_honoured: bool,
     ) -> ResultHandling {
         self.handling(
@@ -1579,7 +1667,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
             pending,
             ticket,
             began,
-            purge,
+            purge_waits,
             no_cache_honoured,
             false,
         )
@@ -1600,7 +1688,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
             pending,
             ticket,
             ticket,
-            Purge::Unknown,
+            PurgeWaits::Unknown,
             false,
             true,
         )
@@ -1611,6 +1699,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         mount: &Mount<St>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
+        purge_waits: PurgeWaits,
     ) -> Result<(), Self::Failure> {
         let listener = self.state.changed.listen();
         let mut stale = HashMap::new();
@@ -1651,6 +1740,9 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         if !lost.is_empty() {
             return self.hold(mount, &lost, 0).await.map(|_| ());
         }
+        if no_room(purge_waits, &*mount.kernel) && handling_delivery(&self.state.lock()) {
+            return Err(StrongFailure::Contended);
+        }
         let _ = select(listener, mount.runtime.sleep(RECHECK)).await;
         Ok(())
     }
@@ -1685,3 +1777,6 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         false
     }
 }
+
+#[cfg(test)]
+mod tests;

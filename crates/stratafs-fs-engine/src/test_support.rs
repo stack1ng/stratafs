@@ -21,7 +21,7 @@ use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
 use crate::kernel_cache::{KernelCache, NoKernel};
-use crate::{Cached, Eventual, FsConfig, FsEngine, Inode, MountId, Purge, Timestamp};
+use crate::{Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
 
 // TEST_MOUNT is the mount test engines are.
 pub(crate) const TEST_MOUNT: MountId = MountId(1);
@@ -129,7 +129,7 @@ pub(crate) fn aborted<R: Debug, F: Debug, E>(error: TransactError<R, F, E>) -> E
 
 // restrict sets inode's restrictions, which a setattr may change whatever they were before.
 pub(crate) fn restrict(engine: &InMemoryEngine, inode: Inode, restrictions: Restrictions) {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .setattr(inode, |settable| settable.restrictions = restrictions)

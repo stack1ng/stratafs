@@ -67,7 +67,7 @@ impl Cached<InMemoryStore> for Scripted {
         _: &Mount<InMemoryStore>,
         _: Option<()>,
         _: HashMap<Inode, Change>,
-        _: Purge,
+        _: PurgeWaits,
     ) -> Result<(), HoldFailed> {
         Ok(())
     }
@@ -97,7 +97,7 @@ impl Cached<InMemoryStore> for Scripted {
         (): &(),
         _: u64,
         _: u64,
-        _: Purge,
+        _: PurgeWaits,
         _: bool,
     ) -> ResultHandling {
         *self.handling.lock().unwrap_or_else(PoisonError::into_inner)
@@ -118,6 +118,7 @@ impl Cached<InMemoryStore> for Scripted {
         _: &Mount<InMemoryStore>,
         _: &[(Inode, Attributes)],
         (): &(),
+        _: PurgeWaits,
     ) -> Result<(), HoldFailed> {
         Ok(())
     }
@@ -156,7 +157,7 @@ fn scripted_engine(handling: ResultHandling) -> ScriptedEngine {
 }
 
 fn new_file(engine: &ScriptedEngine) -> Inode {
-    let created = block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    let created = block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .create(Inode::ROOT, b"file", NewItem::File, |_| {})
@@ -174,7 +175,7 @@ fn getattr(
     mut hand: impl FnMut(ResultHandling) -> bool + Send,
 ) -> ResultHandling {
     let served = block_on(engine.serve(
-        Purge::Waits,
+        PurgeWaits::OfOwnInode,
         false,
         |txn| {
             Box::pin(async move {
@@ -199,7 +200,7 @@ fn chmod(
     mut hand: impl FnMut(ResultHandling) -> bool + Send,
 ) -> Result<(ResultHandling, Attributes), impl std::fmt::Debug> {
     block_on(engine.transact_and_serve(
-        Purge::Waits,
+        PurgeWaits::OfOwnInode,
         |mut txn| {
             Box::pin(async move {
                 let result = txn.setattr(inode, |settable| settable.mode = mode).await;

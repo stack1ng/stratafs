@@ -11,7 +11,9 @@ use stratafs_store::store::Store;
 
 use crate::attributes::{Attributes, read_attributes};
 use crate::key::FsKey;
-use crate::{Cached, Change, Consistency, Inode, MetadataFailure, Mount, Purge, ResultHandling};
+use crate::{
+    Cached, Change, Consistency, Inode, MetadataFailure, Mount, PurgeWaits, ResultHandling,
+};
 
 // Eventual serves reads from a cache that may lag behind other clients' writes.
 pub struct Eventual {
@@ -140,7 +142,7 @@ impl<St: Store> Cached<St> for Eventual {
         _: &Mount<St>,
         _: Option<()>,
         _: HashMap<Inode, Change>,
-        _: Purge,
+        _: PurgeWaits,
     ) -> Result<(), Infallible> {
         Ok(())
     }
@@ -164,7 +166,7 @@ impl<St: Store> Cached<St> for Eventual {
         (): &(),
         ticket: u64,
         _: u64,
-        _: Purge,
+        _: PurgeWaits,
         _: bool,
     ) -> ResultHandling {
         match self.taken_after(ticket, reads.iter().map(|(inode, _)| *inode)) {
@@ -188,6 +190,7 @@ impl<St: Store> Cached<St> for Eventual {
         _: &Mount<St>,
         _: &[(Inode, Attributes)],
         (): &(),
+        _: PurgeWaits,
     ) -> Result<(), Infallible> {
         Ok(())
     }

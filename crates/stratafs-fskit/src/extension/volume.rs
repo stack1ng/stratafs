@@ -239,13 +239,13 @@ define_class!(
             reply: &SendableBlock<'static, fn(*mut FSSetAttributesResult, *mut NSError)>,
         ) {
             let item = StrataItem::of(item);
-            let (inode, purge) = (*item.inode(), purge(request, *item.kind()));
+            let (inode, purge_waits) = (*item.inode(), purge(request, *item.kind()));
             let change = match attribute_change(request) {
                 Ok(change) => change,
                 Err(error) => return reply.call(null_mut(), Retained::as_ptr(&error).cast_mut()),
             };
             self.forward(reply, |operations, reply| {
-                operations.set_attributes(inode, change, purge, reply)
+                operations.set_attributes(inode, change, purge_waits, reply)
             });
         }
 
@@ -715,6 +715,15 @@ impl KernelCache for FsKitCache {
     // FSKit's purge of an item waits only for operations on that item: a directory's waits for none.
     fn purge_waits_on_others(&self) -> bool {
         false
+    }
+
+    // No FSKit operation is one a purge of any inode may wait for.
+    fn in_flight_room(&self) -> bool {
+        true
+    }
+
+    fn in_flight_limit(&self) -> Option<usize> {
+        None
     }
 }
 

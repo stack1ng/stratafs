@@ -11,7 +11,7 @@ use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::directories::NewItem;
 use crate::kernel_cache::{Answered, Asked, KernelCache, NoKernel, Uninvalidated};
 use crate::test_support::{InMemoryEngine, InMemoryStore, new_test_engine, new_test_engine_for};
-use crate::{FsEngine, MountId, Purge, ResultHandling};
+use crate::{FsEngine, MountId, PurgeWaits, ResultHandling};
 
 // ChannelKernel is a kernel cache that sends each inode it is asked to invalidate.
 struct ChannelKernel(mpsc::Sender<Inode>);
@@ -40,6 +40,14 @@ impl KernelCache for ChannelKernel {
 
     fn purge_waits_on_others(&self) -> bool {
         false
+    }
+
+    fn in_flight_room(&self) -> bool {
+        true
+    }
+
+    fn in_flight_limit(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -71,7 +79,7 @@ fn another_client(engine: &InMemoryEngine) -> InMemoryEngine {
 const NOTHING_YET: Duration = Duration::from_millis(200);
 
 fn new_file(engine: &InMemoryEngine, name: &'static [u8]) -> (Inode, Attributes) {
-    let created = block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    let created = block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.create(Inode::ROOT, name, NewItem::File, |_| {}).await;
             result.map(|result| (result, txn))
@@ -82,7 +90,7 @@ fn new_file(engine: &InMemoryEngine, name: &'static [u8]) -> (Inode, Attributes)
 }
 
 fn write(engine: &InMemoryEngine, inode: Inode, data: &'static [u8]) {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.write(inode, 0, Bytes::from_static(data)).await;
             result.map(|result| (result, txn))
@@ -121,7 +129,7 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_its_annotations_change() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     let invalidated = invalidated(&*engine.mount.store, inode, &seen);
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .set_annotation(
@@ -142,7 +150,7 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_its_annotations_change() {
 fn an_eventual_engine_invalidates_a_cached_inode_once_it_is_deleted() {
     let engine = new_test_engine();
     new_file(&engine, b"cached");
-    let unlinked = block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    let unlinked = block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.hard_unlink(Inode::ROOT, b"cached", None).await;
             result.map(|result| (result, txn))
@@ -152,7 +160,7 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_it_is_deleted() {
     let (inode, seen) = (unlinked.inode, unlinked.item);
     let mut invalidated = pin!(invalidated(&*engine.mount.store, inode, &seen));
     assert!(block_on(poll_once(invalidated.as_mut())).is_none());
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.delete_if_unlinked(inode).await;
             result.map(|result| (result, txn))
@@ -203,7 +211,7 @@ fn an_eventual_engine_retries_a_read_begun_before_the_kernel_last_let_go_of_an_i
             &(),
             ticket,
             ticket,
-            Purge::Waits,
+            PurgeWaits::OfOwnInode,
             false,
         )
     };

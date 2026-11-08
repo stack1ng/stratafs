@@ -5,7 +5,7 @@ use futures_lite::future::block_on;
 use stratafs_object_store::ObjectStoreError;
 
 use super::*;
-use crate::Purge;
+use crate::PurgeWaits;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::content::error::ReadSymbolicLinkError;
 use crate::test_support::{
@@ -24,7 +24,7 @@ fn create(
     name: &[u8],
     item: NewItem,
 ) -> Result<EntryChange, Create> {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         let item = item.clone();
         Box::pin(async move {
             let result = txn.create(dir, name, item, |_| {}).await;
@@ -90,7 +90,7 @@ fn hard_link(
     dir: Inode,
     name: &[u8],
 ) -> Result<EntryChange, HardLink> {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.hard_link(inode, dir, name).await;
             result.map(|result| (result, txn))
@@ -105,7 +105,7 @@ fn hard_unlink(
     name: &[u8],
     expected: Option<Inode>,
 ) -> Result<EntryChange, HardUnlink> {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.hard_unlink(dir, name, expected).await;
             result.map(|result| (result, txn))
@@ -115,7 +115,7 @@ fn hard_unlink(
 }
 
 fn rmdir(engine: &InMemoryEngine, dir: Inode, name: &[u8]) -> Result<EntryChange, Rmdir> {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.rmdir(dir, name, None).await;
             result.map(|result| (result, txn))
@@ -132,7 +132,7 @@ fn rename(
     new_name: &[u8],
     mode: RenameMode,
 ) -> Result<RenameChange, Rename> {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.rename(dir, name, new_dir, new_name, mode, None).await;
             result.map(|result| (result, txn))
@@ -142,7 +142,7 @@ fn rename(
 }
 
 fn delete_if_unlinked(engine: &InMemoryEngine, inode: Inode) {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.delete_if_unlinked(inode).await;
             result.map(|()| ((), txn))
@@ -201,7 +201,7 @@ fn create_names_a_new_inode_and_records_the_change_on_its_directory() {
     set_clock(5);
     let engine = new_test_engine();
     set_clock(9);
-    let change = block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    let change = block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .create(Inode::ROOT, b"a", NewItem::File, |settable| {
@@ -451,7 +451,7 @@ fn hard_link_refuses_directories_existing_names_and_missing_inodes() {
 fn hard_unlinking_the_last_name_keeps_the_inode_until_it_is_deleted_if_unlinked() {
     let engine = new_test_engine();
     let a = file(&engine, Inode::ROOT, b"a");
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .set_annotation(
@@ -480,7 +480,7 @@ fn deleting_an_inode_leaves_its_pending_change_version_for_may_commit() {
     let engine = new_test_engine();
     let a = file(&engine, Inode::ROOT, b"a");
     let pending = || Bytes::from(FsKey::new_pending_change_version(a));
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.metadata.set(pending(), Bytes::from_static(b"1"));
             result.map(|()| ((), txn))
@@ -503,7 +503,7 @@ fn an_unlinked_file_can_still_be_written() {
     let engine = new_test_engine();
     let a = file(&engine, Inode::ROOT, b"a");
     hard_unlink(&engine, Inode::ROOT, b"a", None).unwrap();
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.write(a, 0, Bytes::from_static(b"kept")).await;
             result.map(|result| (result, txn))
@@ -585,7 +585,7 @@ fn hard_unlink_refuses_directories_missing_names_and_unexpected_inodes() {
 fn set_hard_link_count(engine: &InMemoryEngine, inode: Inode, hard_link_count: u32) {
     let mut attributes = getattr(engine, inode).unwrap();
     attributes.hard_link_count = hard_link_count;
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         let attributes = attributes.clone();
         Box::pin(async move {
             let result = txn.write_attributes(inode, &attributes);
@@ -899,7 +899,7 @@ fn colliding_names_take_the_next_free_position() {
     let engine = new_test_engine();
     let (first, _) = positions_of(b"x");
     let occupant = file(&engine, Inode::ROOT, b"occupant");
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn.add_name(
                 Inode::ROOT,
@@ -931,7 +931,7 @@ fn a_full_collision_range_is_storage_full() {
     let engine = new_test_engine();
     let (first, last) = positions_of(b"x");
     let occupant = directory(&engine, Inode::ROOT, b"occupant");
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             for position in first.max(FIRST_POSITION)..=last {
                 txn.add_name(

@@ -30,7 +30,7 @@ use stratafs_fs_engine::directories::{EntryChange, NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, EngineFailure, IoFailure, PosixError};
 use stratafs_fs_engine::kernel_cache::KernelCache;
 use stratafs_fs_engine::{
-    Cached, FsConfig, FsEngine, FsTransaction, Inode, Purge, ResultHandling, Timestamp,
+    Cached, FsConfig, FsEngine, FsTransaction, Inode, PurgeWaits, ResultHandling, Timestamp,
 };
 use stratafs_runtime::Runtime;
 use stratafs_store::content::ContentStore;
@@ -80,7 +80,7 @@ pub(crate) trait VolumeOperations: Send + Sync {
         self: Arc<Self>,
         inode: Inode,
         change: AttributeChange,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         reply: Reply<FSSetAttributesResult>,
     );
 
@@ -308,15 +308,15 @@ where
         reply: Reply<FSGetAttributesResult>,
     ) {
         // FSKit's purge of a file waits for a getattr in flight on it; its purge of a directory does not.
-        let purge = match kind {
-            FileType::File => Purge::Waits,
-            FileType::Directory | FileType::SymbolicLink => Purge::GoesAhead,
+        let purge_waits = match kind {
+            FileType::File => PurgeWaits::OfOwnInode,
+            FileType::Directory | FileType::SymbolicLink => PurgeWaits::No,
         };
         self.run(move |volume| async move {
             let served = volume
                 .engine
                 .serve(
-                    purge,
+                    purge_waits,
                     false,
                     |transaction| {
                         Box::pin(async move {
@@ -361,14 +361,14 @@ where
         self: Arc<Self>,
         inode: Inode,
         change: AttributeChange,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         reply: Reply<FSSetAttributesResult>,
     ) {
         self.run(move |volume| async move {
             let served = volume
                 .engine
                 .transact_and_serve(
-                    purge,
+                    purge_waits,
                     |mut transaction| {
                         let change = change.clone();
                         Box::pin(async move {
@@ -408,7 +408,7 @@ where
             let served = volume
                 .engine
                 .serve(
-                    Purge::GoesAhead,
+                    PurgeWaits::No,
                     false,
                     |transaction| {
                         let name = name.clone();
@@ -462,7 +462,7 @@ where
             let served = volume
                 .engine
                 .serve(
-                    Purge::GoesAhead,
+                    PurgeWaits::No,
                     false,
                     |transaction| {
                         Box::pin(async move {
@@ -515,7 +515,7 @@ where
             let served = volume
                 .engine
                 .transact_and_serve(
-                    Purge::GoesAhead,
+                    PurgeWaits::No,
                     |mut transaction| {
                         let (name, item, change) = (name.clone(), item.clone(), change.clone());
                         Box::pin(async move {
@@ -568,7 +568,7 @@ where
             let served = volume
                 .engine
                 .transact_and_serve(
-                    Purge::GoesAhead,
+                    PurgeWaits::No,
                     |mut transaction| {
                         let (name, target, change) = (name.clone(), target.clone(), change.clone());
                         Box::pin(async move {
@@ -625,7 +625,7 @@ where
             let served = volume
                 .engine
                 .transact_and_serve(
-                    Purge::GoesAhead,
+                    PurgeWaits::No,
                     |mut transaction| {
                         let name = name.clone();
                         Box::pin(async move {
@@ -696,7 +696,7 @@ where
                 FileType::Directory => volume
                     .engine
                     .transact_and_serve(
-                        Purge::GoesAhead,
+                        PurgeWaits::No,
                         |mut transaction| {
                             let name = name.clone();
                             Box::pin(async move {
@@ -712,7 +712,7 @@ where
                 FileType::File | FileType::SymbolicLink => volume
                     .engine
                     .transact_and_serve(
-                        Purge::GoesAhead,
+                        PurgeWaits::No,
                         |mut transaction| {
                             let name = name.clone();
                             Box::pin(async move {
@@ -745,7 +745,7 @@ where
             let served = volume
                 .engine
                 .transact_and_serve(
-                    Purge::GoesAhead,
+                    PurgeWaits::No,
                     |mut transaction| {
                         let (from_name, to_name) = (from_name.clone(), to_name.clone());
                         Box::pin(async move {
@@ -961,7 +961,7 @@ where
             let served = volume
                 .engine
                 .serve_loaded(
-                    Purge::Waits,
+                    PurgeWaits::OfOwnInode,
                     false,
                     |transaction| {
                         Box::pin(async move {
@@ -1040,7 +1040,7 @@ where
                 .engine
                 .transact_and_serve(
                     // FSKit's purge of a file waits for a write in flight on it.
-                    Purge::Waits,
+                    PurgeWaits::OfOwnInode,
                     |mut transaction| {
                         let contents = contents.clone();
                         Box::pin(async move {
@@ -1145,7 +1145,7 @@ where
             let changed = match (mode, value) {
                 (Some(mode), Some(value)) => volume
                     .engine
-                    .transact(Purge::GoesAhead, |mut transaction| {
+                    .transact(PurgeWaits::No, |mut transaction| {
                         let (name, value) = (name.clone(), value.clone());
                         Box::pin(async move {
                             let result = transaction
@@ -1158,7 +1158,7 @@ where
                     .map_err(failed),
                 (None, _) => volume
                     .engine
-                    .transact(Purge::GoesAhead, |mut transaction| {
+                    .transact(PurgeWaits::No, |mut transaction| {
                         let name = name.clone();
                         Box::pin(async move {
                             let result = transaction
@@ -1225,7 +1225,7 @@ where
         self.run(move |volume| async move {
             let deleted = volume
                 .engine
-                .transact(Purge::GoesAhead, |mut transaction| {
+                .transact(PurgeWaits::No, |mut transaction| {
                     Box::pin(async move {
                         let result = transaction.delete_if_unlinked(inode).await;
                         result.map(|()| ((), transaction))

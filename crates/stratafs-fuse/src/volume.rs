@@ -1,5 +1,6 @@
 use std::io;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use fuser::Notifier;
 use futures_util::future::BoxFuture;
@@ -14,11 +15,45 @@ use super::items::Items;
 #[derive(Clone)]
 pub struct FuseCache {
     items: Arc<Items>,
+    background: Arc<Background>,
+}
+
+// Background counts the requests in flight the kernel may have sent in the background, of which it keeps at most
+// max_background in flight, as init set it.
+#[derive(Default)]
+struct Background {
+    in_flight: AtomicUsize,
+    max_background: OnceLock<u16>,
+}
+
+// BackgroundRequest counts a request the kernel may have sent in the background until it is dropped, after the reply.
+pub(crate) struct BackgroundRequest(Arc<Background>);
+
+impl Drop for BackgroundRequest {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FuseCache {
     pub(crate) fn new(items: Arc<Items>) -> Self {
-        FuseCache { items }
+        FuseCache {
+            items,
+            background: Arc::default(),
+        }
+    }
+
+    // set_max_background records the most background requests the kernel keeps in flight, as init asked of it.
+    pub(crate) fn set_max_background(&self, max_background: u16) {
+        if self.background.max_background.set(max_background).is_err() {
+            panic!("a volume is mounted once");
+        }
+    }
+
+    // background counts a request the kernel may have sent in the background, from when it is handed over.
+    pub(crate) fn background(&self) -> BackgroundRequest {
+        self.background.in_flight.fetch_add(1, Ordering::SeqCst);
+        BackgroundRequest(Arc::clone(&self.background))
     }
 
     // connect invalidates through the session's notifier from now on.
@@ -88,6 +123,23 @@ impl KernelCache for FuseCache {
     // change holds.
     fn purge_waits_on_others(&self) -> bool {
         true
+    }
+
+    // A purge may need a background request, such as to write out a mapping's dirty page, so one fewer than the limit
+    // may wait while the mount drops a copy. The asking request is counted.
+    fn in_flight_room(&self) -> bool {
+        let in_flight = self.background.in_flight.load(Ordering::SeqCst);
+        self.in_flight_limit()
+            .is_some_and(|limit| in_flight < limit)
+    }
+
+    // Before init sets it, nothing publishes.
+    fn in_flight_limit(&self) -> Option<usize> {
+        self.background
+            .max_background
+            .get()
+            .copied()
+            .map(usize::from)
     }
 }
 

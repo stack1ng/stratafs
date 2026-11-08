@@ -27,7 +27,7 @@ use stratafs_fs_engine::attributes::{
 use stratafs_fs_engine::content::error::WriteError;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
-use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, Purge, Timestamp};
+use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
@@ -677,7 +677,7 @@ fn a_removed_file_still_answers() {
 
 // append_only_file is a new append only file in engine's root that holds content.
 fn append_only_file(engine: &TestEngine, content: &'static [u8]) -> Inode {
-    block_on(engine.transact(Purge::GoesAhead, |mut transaction| {
+    block_on(engine.transact(PurgeWaits::No, |mut transaction| {
         Box::pin(async move {
             let created = transaction
                 .create(Inode::ROOT, b"log", NewItem::File, |settable| {
@@ -703,7 +703,7 @@ fn past_end_of(
     data: Vec<u8>,
 ) -> Result<(u64, Bytes), bool> {
     let content = engine.content();
-    block_on(engine.transact(Purge::GoesAhead, |transaction| {
+    block_on(engine.transact(PurgeWaits::No, |transaction| {
         let data = Bytes::from(data.clone());
         Box::pin(async move {
             let trimmed = past_end(&transaction, content, inode, offset, data).await;

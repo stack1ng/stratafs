@@ -16,7 +16,7 @@ use stratafs_fs_engine::error::{EngineFailure, Posix, PosixError};
 use stratafs_fs_engine::kernel_cache::KernelCache;
 use stratafs_fs_engine::strong::{Pending, StrongFailure};
 use stratafs_fs_engine::{
-    Cached, Eventual, FsConfig, FsEngine, Inode, MountId, Purge, StrongUntilDisconnectCached,
+    Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, StrongUntilDisconnectCached,
     Timestamp,
 };
 use stratafs_pubsub_conformance::{MemoryClient, MemoryVolume};
@@ -315,7 +315,7 @@ impl<C: Consistency, K> Mount<C, K> {
     // delete_if_unlinked deletes a file the kernel let go of if no name refers to it, as the integration does.
     pub(crate) async fn delete_if_unlinked(&self, inode: Inode) -> Result<(), Failure> {
         self.engine
-            .transact(Purge::GoesAhead, |mut transaction| {
+            .transact(PurgeWaits::No, |mut transaction| {
                 Box::pin(async move {
                     let result = transaction.delete_if_unlinked(inode).await;
                     result.map(|()| ((), transaction))

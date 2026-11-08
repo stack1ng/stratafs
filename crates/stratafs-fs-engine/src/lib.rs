@@ -134,7 +134,7 @@ pub trait Cached<St: Store>: Consistency {
         mount: &Mount<St>,
         prepared: Option<Self::Prepared>,
         changes: HashMap<Inode, Change>,
-        purge: Purge,
+        purge_waits: PurgeWaits,
     ) -> impl Future<Output = Result<Self::Prepared, Self::Failure>> + Send;
 
     // finish ends a write prepare readied: once it will not commit, with no changes, or once it committed the changes
@@ -169,7 +169,7 @@ pub trait Cached<St: Store>: Consistency {
         state: &Self::InodeState,
         ticket: Self::Ticket,
         began: Self::Ticket,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         no_cache_honoured: bool,
     ) -> ResultHandling;
 
@@ -183,12 +183,13 @@ pub trait Cached<St: Store>: Consistency {
         ticket: Self::Ticket,
     ) -> ResultHandling;
 
-    // settled resolves once reads handled with Retry are worth taking again.
+    // settled resolves once reads handled with Retry, by an operation of purge_waits, are worth taking again.
     fn settled(
         &self,
         mount: &Mount<St>,
         reads: &[(Inode, Attributes)],
         state: &Self::InodeState,
+        purge_waits: PurgeWaits,
     ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 
     // reread reads again the inodes a write committed for its reply, with their state, failing when another write
@@ -212,13 +213,19 @@ pub trait Cached<St: Store>: Consistency {
     fn write_back(&self) -> bool;
 }
 
-// Purge is whether the kernel's purge of an inode waits for an operation in flight on it. FSKit's waits for a file's
-// getattr, read, write, or change of size or times, and not for a lookup, a listing, a change to a directory, nor
-// any other change to a file.
+// PurgeWaits is which of the kernel's purges wait for an operation in flight. FSKit's purge of an inode waits for a
+// file's getattr, read, write, or change of size or times, and not for a lookup, a listing, a change to a directory,
+// nor any other change to a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Purge {
-    Waits,
-    GoesAhead,
+pub enum PurgeWaits {
+    // OfOwnInode is an operation a purge of its own inode waits for.
+    OfOwnInode,
+    // OfAnyInode is an operation a purge of any inode on the mount may wait for, as the kernel keeps only so many such
+    // requests in flight.
+    OfAnyInode,
+    // No is an operation no purge waits for.
+    No,
+    // Unknown is an operation it is not known which purges wait for.
     Unknown,
 }
 
@@ -341,7 +348,7 @@ where
                 config: PhantomData,
             };
             engine
-                .transact(Purge::GoesAhead, |mut transaction| {
+                .transact(PurgeWaits::No, |mut transaction| {
                     Box::pin(async move {
                         let created = transaction.create_root_if_missing().await;
                         created.map(|()| ((), transaction))
@@ -389,7 +396,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
     #[allow(clippy::manual_async_fn)]
     pub fn transact<'engine, T: Send + 'engine, E: Send + 'engine>(
         &'engine self,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         mut work: impl for<'txn> FnMut(
             WriteTransaction<'txn, 'engine, St, A, N, S>,
         ) -> BoxFuture<
@@ -398,8 +405,9 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         > + Send,
     ) -> impl Future<Output = Result<T, Failed<St, C::Failure, E>>> + Send {
         async move {
-            let (result, _, _, changes, prepared, _) =
-                self.committed(purge, &mut work, |_| Vec::new()).await?;
+            let (result, _, _, changes, prepared, _) = self
+                .committed(purge_waits, &mut work, |_| Vec::new())
+                .await?;
             if let Some(prepared) = prepared {
                 self.consistency
                     .finish(&self.mount, prepared, Some(&changes))
@@ -416,7 +424,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
     #[allow(clippy::manual_async_fn)]
     pub fn transact_and_serve<'engine, T: Send + 'engine, E: Send + 'engine, R: Send>(
         &'engine self,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         mut work: impl for<'txn> FnMut(
             WriteTransaction<'txn, 'engine, St, A, N, S>,
         ) -> BoxFuture<
@@ -433,7 +441,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
     ) -> impl Future<Output = Result<R, Failed<St, C::Failure, E>>> + Send {
         async move {
             let (result, committed, mut state, changes, prepared, mut ticket) =
-                self.committed(purge, &mut work, reads).await?;
+                self.committed(purge_waits, &mut work, reads).await?;
             let mut read = committed.clone();
             // The reply goes as committed while at_once, and as the consistency rereads it after.
             let mut at_once = true;
@@ -461,7 +469,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                         &state,
                         ticket,
                         ticket,
-                        Purge::Unknown,
+                        PurgeWaits::Unknown,
                         false,
                     );
                     cached.store(handling == ResultHandling::Cache, Ordering::Relaxed);
@@ -471,7 +479,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                     Some(replied) => break Ok(self.handed(&read, cached.into_inner(), replied)),
                     None => {
                         at_once = false;
-                        if let Err(failure) = self.settled(&read, &state).await {
+                        if let Err(failure) = self.settled(&read, &state, purge_waits).await {
                             break Err(failure);
                         }
                     }
@@ -494,7 +502,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
     // for it, and the ticket of its committed attempt.
     async fn committed<'engine, T: Send + 'engine, E: Send + 'engine>(
         &'engine self,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         work: &mut (
                  impl for<'txn> FnMut(
             WriteTransaction<'txn, 'engine, St, A, N, S>,
@@ -568,7 +576,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                     reuse = allocated;
                     match self
                         .consistency
-                        .prepare(&self.mount, prepared.take(), changes, purge)
+                        .prepare(&self.mount, prepared.take(), changes, purge_waits)
                         .await
                     {
                         Ok(readied) => {
@@ -601,7 +609,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
     // transaction back with its result, as transact's work does, so the consistency reads its state in it too.
     pub fn serve<'engine, T: Send, E: Send, R: Send>(
         &'engine self,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         no_cache_honoured: bool,
         read: impl for<'txn> FnMut(
             ReadTransaction<'txn, 'engine, St, A, N, S>,
@@ -614,7 +622,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         + Send,
     ) -> impl Future<Output = Result<R, Failed<St, C::Failure, E>>> + Send {
         self.serve_loaded(
-            purge,
+            purge_waits,
             no_cache_honoured,
             read,
             |result| ready(Ok(result)),
@@ -628,7 +636,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
     #[allow(clippy::manual_async_fn)]
     pub fn serve_loaded<'engine, T: Send, U: Send, E: Send, R: Send, L>(
         &'engine self,
-        purge: Purge,
+        purge_waits: PurgeWaits,
         no_cache_honoured: bool,
         mut read: impl for<'txn> FnMut(
             ReadTransaction<'txn, 'engine, St, A, N, S>,
@@ -667,7 +675,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                         &state,
                         ticket,
                         began,
-                        purge,
+                        purge_waits,
                         no_cache_honoured,
                     );
                     cached.store(handling == ResultHandling::Cache, Ordering::Relaxed);
@@ -676,7 +684,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                 match hand(&result, &read, &result_handling) {
                     Some(replied) => return Ok(self.handed(&read, cached.into_inner(), replied)),
                     None => self
-                        .settled(&read, &state)
+                        .settled(&read, &state, purge_waits)
                         .await
                         .map_err(consistency_failed)?,
                 }
@@ -714,7 +722,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                 match hand(&result, &read, &result_handling) {
                     Some(replied) => return Ok(replied),
                     None => self
-                        .settled(&read, &state)
+                        .settled(&read, &state, PurgeWaits::Unknown)
                         .await
                         .map_err(consistency_failed)?,
                 }
@@ -797,13 +805,16 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         replied
     }
 
-    // settled resolves once reads the consistency handled with Retry, of state, are worth taking again.
+    // settled resolves once reads the consistency handled with Retry, of state, by an operation of purge_waits, are
+    // worth taking again.
     fn settled<'a>(
         &'a self,
         reads: &'a [(Inode, Attributes)],
         state: &'a C::InodeState,
+        purge_waits: PurgeWaits,
     ) -> impl Future<Output = Result<(), C::Failure>> + Send + 'a {
-        self.consistency.settled(&self.mount, reads, state)
+        self.consistency
+            .settled(&self.mount, reads, state, purge_waits)
     }
 
     // cached tells the consistency the kernel caches inode as seen, for a reply serve did not hand over.

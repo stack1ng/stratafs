@@ -25,6 +25,14 @@ pub trait KernelCache: Send + Sync + 'static {
     // purge_waits_on_others says whether the kernel's purge of an inode may wait for an operation on another, such as a
     // change to a file whose lock an unlink holding the inode, its directory, waits for.
     fn purge_waits_on_others(&self) -> bool;
+
+    // in_flight_room says whether there is room for another operation a purge of any inode may wait for, counting the
+    // asking one: the kernel keeps only so many such requests in flight, and any purge may need one.
+    fn in_flight_room(&self) -> bool;
+
+    // in_flight_limit is how many operations a purge of any inode may wait for the kernel keeps in flight at once, if
+    // it limits them.
+    fn in_flight_limit(&self) -> Option<usize>;
 }
 
 // Asked is called right as the kernel is asked to drop its copy of an inode, and Answered right as it answers, with
@@ -62,5 +70,13 @@ impl KernelCache for NoKernel {
 
     fn purge_waits_on_others(&self) -> bool {
         false
+    }
+
+    fn in_flight_room(&self) -> bool {
+        true
+    }
+
+    fn in_flight_limit(&self) -> Option<usize> {
+        None
     }
 }

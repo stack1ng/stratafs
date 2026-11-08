@@ -29,12 +29,16 @@ On Linux, FUSE (kernel 6.12) forces these gaps in strong consistency, due to und
 - On one mount, a stat can return a file's attributes from before another mount's change, when the kernel let go of
   the file and looks it up again as the change lands, since FUSE can hand over the forget after the new lookup. Kernels
   before 6.12.110 and 6.13 can also take a lookup's reply in after letting go of the file during the lookup.
+- A read, or a write from a shared mapping, can fail with EBUSY while its mount drops a copy for a change and 255 other
+  such requests are in flight on it (fewer when the fuse module's max_user_bgreq is lower), as the kernel keeps only so
+  many in flight and dropping the copy may need one. A read for a mapped page then raises SIGBUS.
 
 StrataFS itself has these open gaps, on macOS and Linux alike:
 
-- When two mounts change the same file at the same moment, one of the changes fails with EBUSY. On Linux, a change can
-  also fail with EBUSY while its mount drops a copy for any other mount's change, since the mount cannot see which of
-  the kernel's locks are held.
+- When two mounts change the same file at the same moment, one of the changes fails with EBUSY, even when they change
+  different byte ranges. Letting changes to different ranges go together is not worth the complexity, as only something
+  like a distributed database has writers fast enough to collide on one file. On Linux, name changes in the same
+  directory fail the same way, since a directory is an inode too.
 - On one mount, a rename, unlink or open can rarely fail with ESTALE while another mount changes the same file, since
   the kernel would take lookups from different moments as one; it tries once more first.
 - A file open on one mount is deleted as soon as another mount unlinks it, so later reads, writes and fstat on the open

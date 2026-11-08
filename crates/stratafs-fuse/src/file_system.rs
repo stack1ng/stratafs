@@ -28,6 +28,21 @@ const REPORTED_BYTES: u64 = 1 << 50;
 // SYMBOLIC_LINK_MODE is every symbolic link's mode: the kernel never checks a link's own permissions.
 const SYMBOLIC_LINK_MODE: u32 = 0o777;
 
+// MAX_BACKGROUND is how many background requests, read aheads and writes from a mapping, the kernel is asked to keep in
+// flight, unless the fuse module's max_user_bgreq is lower.
+const MAX_BACKGROUND: u16 = 256;
+const MAX_USER_BGREQ_PATH: &str = "/sys/module/fuse/parameters/max_user_bgreq";
+
+// max_background is MAX_BACKGROUND, or max_user_bgreq when lower, which the kernel then keeps to with or without
+// CAP_SYS_ADMIN, as it only lowers a limit above max_user_bgreq.
+fn max_background() -> io::Result<u16> {
+    let max_user_bgreq: u64 = std::fs::read_to_string(MAX_USER_BGREQ_PATH)?
+        .trim()
+        .parse()
+        .map_err(io::Error::other)?;
+    Ok(MAX_BACKGROUND.min(u16::try_from(max_user_bgreq).unwrap_or(u16::MAX)))
+}
+
 // StrataFileSystem is the file system FUSE serves. It turns each request into the volume's own terms and forwards it
 // to the volume's operations.
 pub(crate) struct StrataFileSystem<St, A, N, S, C>
@@ -69,7 +84,8 @@ where
     // init asks the kernel to list directories with attributes when that saves it lookups, to drop cached pages only
     // when the volume says so, to look names up in one directory at once, and to share a mapping of a file opened to
     // append: lookups and listings are read transactions, and Items locks each inode a reply hands over. A kernel
-    // without one goes without it.
+    // without one goes without it. It also sets how many background requests the kernel keeps in flight, which the
+    // volume needs to know, as a purge may need one.
     fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> io::Result<()> {
         // No consistency asks for the writeback cache, though eventual allows it: the kernel would keep a failed
         // write's data, and hide other mounts' changes to a file's size and times.
@@ -81,6 +97,11 @@ where
         config
             .add_capabilities(wanted & config.capabilities())
             .expect("the kernel has every capability it says it has");
+        let max_background = max_background()?;
+        config
+            .set_max_background(max_background)
+            .expect("the kernel keeps max_user_bgreq above 0");
+        self.volume.kernel.set_max_background(max_background);
         Ok(())
     }
 
@@ -283,13 +304,14 @@ where
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let appends =
-            flags.0 & libc::O_APPEND != 0 && !write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
+        let from_page_cache = write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
+        let appends = flags.0 & libc::O_APPEND != 0 && !from_page_cache;
         self.volume().write(
             inode(node),
             offset,
             Bytes::copy_from_slice(data),
             appends,
+            from_page_cache,
             reply,
         );
     }

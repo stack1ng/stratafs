@@ -151,6 +151,15 @@ impl KernelCache for KernelHandle {
     fn purge_waits_on_others(&self) -> bool {
         false
     }
+
+    // As the FSKit volume's, no operation is one a purge of any inode may wait for.
+    fn in_flight_room(&self) -> bool {
+        true
+    }
+
+    fn in_flight_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl KernelModel for Kernel {

@@ -12,7 +12,7 @@ use crate::test_support::{
     InMemoryEngine, MetadataFailure, OneKibInline, TEST_MOUNT, aborted, new_test_engine, restrict,
     set_clock,
 };
-use crate::{Purge, Timestamp};
+use crate::{PurgeWaits, Timestamp};
 
 fn stored(extent: &ExtentValue) -> Bytes {
     let mut stored = extent.to_stored();
@@ -70,7 +70,7 @@ fn decoding_rejects_a_header_that_is_too_short_or_a_corrupt_spillable_value() {
 }
 
 fn write_extent(engine: &InMemoryEngine, inode: Inode, end: u64, extent: &ExtentValue) {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .metadata
@@ -105,7 +105,7 @@ fn file_of_size(engine: &InMemoryEngine, inode: Inode, size: u64) {
             number: 0,
         },
     };
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         let attributes = attributes.clone();
         Box::pin(async move {
             let result = txn.write_attributes(inode, &attributes);
@@ -257,7 +257,7 @@ fn a_hole_past_the_last_extent_stays_inside_the_planned_size() {
 #[test]
 fn read_needs_an_existing_regular_file() {
     let engine = new_test_engine();
-    let link = block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    let link = block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .create(
@@ -423,7 +423,7 @@ fn write(
     data: &[u8],
 ) -> Result<Attributes, Write> {
     let data = Bytes::copy_from_slice(data);
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         let data = data.clone();
         Box::pin(async move {
             let result = txn.write(inode, offset, data).await;
@@ -807,7 +807,7 @@ fn an_empty_write_changes_nothing() {
 #[test]
 fn write_needs_an_existing_regular_file() {
     let engine = new_test_engine();
-    let link = block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    let link = block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
                 .create(
@@ -854,7 +854,7 @@ fn setattr(
     inode: Inode,
     update: impl Fn(&mut SettableAttributes) + Send + Sync,
 ) -> Result<Attributes, Setattr> {
-    block_on(engine.transact(Purge::GoesAhead, |mut txn| {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
         let update = &update;
         Box::pin(async move {
             let result = txn.setattr(inode, update).await;

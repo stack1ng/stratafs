@@ -229,6 +229,15 @@ impl KernelCache for KernelHandle {
     fn purge_waits_on_others(&self) -> bool {
         true
     }
+
+    // The model keeps no limited number of requests in flight, so it always has room.
+    fn in_flight_room(&self) -> bool {
+        true
+    }
+
+    fn in_flight_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl KernelModel for Kernel {

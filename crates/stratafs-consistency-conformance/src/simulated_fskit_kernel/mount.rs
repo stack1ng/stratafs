@@ -10,7 +10,7 @@ use stratafs_fs_engine::content::error::ReadError;
 use stratafs_fs_engine::directories::error::{LookupError, ReaddirError, RenameError};
 use stratafs_fs_engine::directories::{NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, IoFailure, PosixError};
-use stratafs_fs_engine::{Inode, Purge, Timestamp};
+use stratafs_fs_engine::{Inode, PurgeWaits, Timestamp};
 
 use crate::mount::{Consistency, Failure, LISTING_BATCH, Mount, Operations, READ_LENGTH, failed};
 use crate::simulated_fskit_kernel::{Access, Kernel, Update, Work};
@@ -61,7 +61,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .serve(
-                Purge::GoesAhead,
+                PurgeWaits::No,
                 false,
                 |transaction| {
                     Box::pin(async move {
@@ -147,7 +147,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .serve(
-                Purge::Waits,
+                PurgeWaits::OfOwnInode,
                 false,
                 |transaction| {
                     Box::pin(async move {
@@ -185,7 +185,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .serve_loaded(
-                Purge::Waits,
+                PurgeWaits::OfOwnInode,
                 false,
                 |transaction| {
                     Box::pin(async move {
@@ -227,7 +227,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .transact_and_serve(
-                Purge::Waits,
+                PurgeWaits::OfOwnInode,
                 |mut transaction| {
                     Box::pin(async move {
                         let result = transaction.write(inode, 0, Bytes::from_static(data)).await;
@@ -267,7 +267,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .transact_and_serve(
-                Purge::Waits,
+                PurgeWaits::OfOwnInode,
                 |mut transaction| {
                     Box::pin(async move {
                         let result = transaction
@@ -293,7 +293,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .transact_and_serve(
-                Purge::GoesAhead,
+                PurgeWaits::No,
                 |mut transaction| {
                     Box::pin(async move {
                         let result = transaction
@@ -326,7 +326,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let created = self
             .engine
             .transact_and_serve(
-                Purge::GoesAhead,
+                PurgeWaits::No,
                 |mut transaction| {
                     let (item, made) = (item.clone(), Arc::clone(&made));
                     Box::pin(async move {
@@ -369,7 +369,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .transact_and_serve(
-                Purge::GoesAhead,
+                PurgeWaits::No,
                 |mut transaction| {
                     Box::pin(async move {
                         let result = transaction
@@ -416,7 +416,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .transact_and_serve(
-                Purge::GoesAhead,
+                PurgeWaits::No,
                 |mut transaction| {
                     Box::pin(async move {
                         let at_destination = transaction
@@ -475,7 +475,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let served = self
             .engine
             .transact_and_serve(
-                Purge::GoesAhead,
+                PurgeWaits::No,
                 |mut transaction| {
                     Box::pin(async move {
                         let result = transaction

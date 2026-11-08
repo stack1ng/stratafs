@@ -837,8 +837,11 @@ where
         });
     }
 
+    // read may be a read ahead, which the kernel sends in the background, so it is counted as one.
     pub(crate) fn read(self: Arc<Self>, inode: Inode, offset: u64, size: u32, reply: ReplyData) {
+        let background = self.kernel.background();
         self.run(move |volume| async move {
+            let _background = background;
             let mut reply = Some(reply);
             let content = volume.engine.content();
             let served = volume
@@ -872,8 +875,9 @@ where
                     },
                     |(_, attributes)| vec![(inode, attributes.clone())],
                     // The kernel keeps a read's data whatever the reply, so a read never goes uncached and waits
-                    // instead, holding up no purge: only a write to the file purges its pages, and its delivery lets
-                    // the read go.
+                    // instead: only a write to the file purges its pages, and its delivery lets the read go. A read
+                    // ahead holds a background request while it waits, which a purge may need, so one fails rather
+                    // than wait while the mount drops a copy and too many are in flight.
                     |(data, _), reads, result_handling| {
                         let cached = || match result_handling() {
                             ResultHandling::NoCache => ResultHandling::Retry,
@@ -893,23 +897,30 @@ where
 
     // write writes contents at offset, or at the file's stored end when it appends: the kernel sends an append at the
     // end it caches, which another mount may have moved since. The kernel keeps the contents where it sent them, so a
-    // write that lands elsewhere drops the kernel's copy of the file once it has replied.
+    // write that lands elsewhere drops the kernel's copy of the file once it has replied. A write from the page cache
+    // is sent in the background, so it is counted as one.
     pub(crate) fn write(
         self: Arc<Self>,
         inode: Inode,
         offset: u64,
         contents: Bytes,
         appends: bool,
+        from_page_cache: bool,
         reply: ReplyWrite,
     ) {
+        let (purge_waits, background) = match from_page_cache {
+            true => (purges::WRITEBACK, Some(self.kernel.background())),
+            false => (purges::WRITE, None),
+        };
         self.run(move |volume| async move {
+            let _background = background;
             let mut reply = Some(reply);
             let written = u32::try_from(contents.len())
                 .expect("the kernel writes at most max_write bytes at once");
             let served = volume
                 .engine
                 .transact_and_serve(
-                    purges::WRITE,
+                    purge_waits,
                     |mut transaction| {
                         let contents = contents.clone();
                         Box::pin(async move {
