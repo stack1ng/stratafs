@@ -160,6 +160,8 @@ impl KernelModel for Kernel {
     const FINDS_NAMES: bool = false;
     // A listing shows an app each entry's attributes, as getattrlistbulk does.
     const LISTS_ATTRIBUTES: bool = true;
+    // A read takes the attributes and the data from one reply.
+    const STATS_BEFORE_COPYING: bool = false;
     const REGRESSIONS: &'static str = "proptest-regressions/lib.txt";
 
     fn new(faults: &Arc<Faults>, references: &Arc<References>) -> Self {

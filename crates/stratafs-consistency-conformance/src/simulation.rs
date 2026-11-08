@@ -189,7 +189,7 @@ where
         }
     }
     let directories: Arc<[Inode]> = directories.into();
-    let mut made = Namespace::new(K::FINDS_NAMES, K::LISTS_ATTRIBUTES);
+    let mut made = Namespace::new(K::FINDS_NAMES, K::LISTS_ATTRIBUTES, K::STATS_BEFORE_COPYING);
     for path in MADE {
         match mounts[0]
             .create(directory(&directories, path.0), path.1, NewItem::File)
@@ -279,8 +279,15 @@ where
     for path in paths() {
         let stored = first.stored(path).await;
         for client in live {
-            let served = client.served(path).await;
-            if stored.is_none() || served != stored {
+            let (served, stale) = client.served(path).await;
+            // UPSTREAM KERNEL BUG PIN: attributes a reply brought in after the kernel let go of the item stay stale, so
+            // only the rest is compared.
+            let same = if stale {
+                without_attributes(&served) == without_attributes(&stored)
+            } else {
+                served == stored
+            };
+            if stored.is_none() || !same {
                 return Err(TestCaseError::fail(format!(
                     "mount {} serves {path:?} as {served:?}, but the store holds {stored:?}",
                     client.app.0
@@ -289,6 +296,14 @@ where
         }
     }
     Ok(())
+}
+
+// without_attributes is the file served or stored as without its attributes.
+fn without_attributes(
+    file: &Option<Option<(Inode, Attributes, Bytes)>>,
+) -> Option<Option<(Inode, &Bytes)>> {
+    file.as_ref()
+        .map(|file| file.as_ref().map(|(inode, _, content)| (*inode, content)))
 }
 
 // directory is the inode of the directory named name, of directories, the inode of each of DIRECTORIES.
@@ -516,7 +531,13 @@ where
         let referred = self.mount.refer(inode);
         // A stat failing with its work's error fails the lookup, which returns that error with the file it found.
         let stat = match self.mount.stat(inode).await {
-            Ok(attributes) => Ok(Outcome::Seen(Seen::from(&attributes))),
+            Ok((attributes, tainted)) => {
+                // UPSTREAM KERNEL BUG PIN: a stat answered with what an upstream bug excuses.
+                if tainted {
+                    self.history.push(Event::Tainted(invoked.0));
+                }
+                Ok(Outcome::Seen(Seen::from(&attributes)))
+            }
             Err(Failure::Posix(posix)) => Ok(Outcome::Failed(posix)),
             Err(failure) => Err(failure),
         };
@@ -532,7 +553,11 @@ where
     async fn stat(&mut self, inode: Inode) {
         let invoked = self.invoke(HistoryOperation::Stat(inode.0));
         let attributes = self.mount.stat(inode).await;
-        self.end(invoked, attributes, |attributes| {
+        // UPSTREAM KERNEL BUG PIN: a stat answered with what an upstream bug excuses.
+        if let Ok((_, true)) = attributes {
+            self.history.push(Event::Tainted(invoked.0));
+        }
+        self.end(invoked, attributes, |(attributes, _)| {
             Outcome::Seen(Seen::from(attributes))
         });
     }
@@ -574,17 +599,20 @@ where
     }
 
     // served is the file path refers to, with its attributes and content, as the mount serves them, or None when an
-    // operation failed.
-    async fn served(&self, path: Path) -> Option<Option<(Inode, Attributes, Bytes)>> {
+    // operation failed, and whether an upstream bug excuses its attributes.
+    async fn served(&self, path: Path) -> (Option<Option<(Inode, Attributes, Bytes)>>, bool) {
+        let mut stale = false;
         let served = async {
             let (Some(inode), _) = self.mount.resolve(self.directory(path.0), path.1).await? else {
                 return Ok(None);
             };
-            let attributes = self.mount.stat(inode).await?;
+            let attributes;
+            (attributes, stale) = self.mount.stat(inode).await?;
             let (content, ..) = self.mount.read(inode).await?;
             Ok::<_, Failure>(Some((inode, attributes, content)))
         };
-        served.await.ok()
+        let served = served.await.ok();
+        (served, stale)
     }
 
     // invoke records operation as invoked, and is its id, its place in the history, and when it was invoked.
@@ -714,7 +742,9 @@ fn check_linearizable<K: KernelModel>(
             Event::Returned(..) => (None, true),
             _ => (None, false),
         };
-        let steps = operation.clone().steps(returned, K::FINDS_NAMES);
+        let steps = operation
+            .clone()
+            .steps(returned, K::FINDS_NAMES, K::STATS_BEFORE_COPYING);
         threads
             .entry(id.app)
             .or_default()

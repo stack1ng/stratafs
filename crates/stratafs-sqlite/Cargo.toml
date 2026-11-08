@@ -6,9 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-lock.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
-futures-util.workspace = true
 rusqlite = { version = "0.41.0", default-features = false, features = ["blob", "bundled", "cache", "fallible_uint", "hooks"] }
 stratafs-keyed-notify.workspace = true
 stratafs-store.workspace = true

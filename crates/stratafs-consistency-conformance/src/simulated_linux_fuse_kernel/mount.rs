@@ -346,22 +346,23 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
     }
 
     // stat is a file's attributes, from the kernel's cache when they are not out of date.
-    async fn stat(&self, inode: Inode) -> Result<Attributes, Failure> {
+    // UPSTREAM KERNEL BUG PIN: and whether they are stale ones a reply brought in after the item was let go of.
+    async fn stat(&self, inode: Inode) -> Result<(Attributes, bool), Failure> {
         match self.kernel.attributes(inode) {
             Some(cached) => Ok(cached),
-            None => self.get_attributes(inode).await,
+            None => Ok((self.get_attributes(inode).await?, false)),
         }
     }
 
     // read is one read past the size the kernel takes the file to have: it asks for the attributes unless cached, then
     // copies up to that size as it stands then from the cached pages, or those a read request brings in, padded with
-    // zeros, and hands over those attributes with the size it copied.
-    // UPSTREAM KERNEL BUG PIN: it says whether it copied a write's data the volume had not stored, or copied up to a
-    // size the kernel may have from before the data it copied.
+    // zeros, and hands over those attributes as the stat had them.
+    // UPSTREAM KERNEL BUG PIN: it says whether it copied a write's data the volume had not stored, copied up to a size
+    // the kernel may have from before the data it copied, or its stat found stale attributes.
     async fn read(&self, inode: Inode) -> Result<(Bytes, Attributes, bool), Failure> {
         // UPSTREAM KERNEL BUG PIN: began numbers when the read began, so what left the size out of date after it shows.
         let began = self.kernel.sent();
-        let mut attributes = self.stat(inode).await?;
+        let (attributes, stale) = self.stat(inode).await?;
         let size = self.kernel.size(inode);
         let (pages, unstored) = match size {
             0 => (Bytes::new(), false),
@@ -377,8 +378,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         let out_of_date = other_size && self.kernel.size_out_of_date(inode, began);
         let mut read = pages.to_vec();
         read.resize(copied as usize, 0);
-        attributes.settable.size = read.len() as u64;
-        Ok((read.into(), attributes, unstored || out_of_date))
+        Ok((read.into(), attributes, unstored || out_of_date || stale))
     }
 
     // write writes data at the start of a file, holding its lock, so writes to it go one at a time, and its pages.
@@ -473,6 +473,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
                 |created, reads, result_handling| {
                     let inode = created.inode;
                     self.kernel.reply(reads, result_handling, |handing| {
+                        handing.invalidate_attributes([directory]);
                         handing.hand(directory, name, inode);
                         let attributes = handing.attr(inode);
                         let entries = vec![(name, inode, attributes.clone(), Kept::Nothing)];
@@ -536,6 +537,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
                 },
                 |removed, reads, result_handling| {
                     self.kernel.reply(reads, result_handling, |handing| {
+                        handing.invalidate_attributes([directory]);
                         handing.unname(directory, name);
                         let update = Update::Unlinked {
                             directory,
@@ -578,7 +580,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
         // then finds it.
         if replaced == Some(inode) {
             drop(renaming);
-            let attributes = self.stat(inode).await?;
+            let (attributes, _) = self.stat(inode).await?;
             return Ok((attributes, replaced));
         }
         let items = [inode].into_iter().chain(replaced);
@@ -629,6 +631,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
                 },
                 |renamed, reads, result_handling| {
                     self.kernel.reply(reads, result_handling, |handing| {
+                        handing.invalidate_attributes([from_directory, to_directory, inode]);
                         handing.unname(from_directory, from);
                         handing.name(to_directory, to, inode);
                         let update = Update::Renamed {
@@ -682,6 +685,7 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
                 // The kernel takes a link's attributes in whatever purge came since, so it keeps them for no time.
                 |_, reads, result_handling| {
                     self.kernel.reply(reads, result_handling, |handing| {
+                        handing.invalidate_attributes([directory]);
                         handing.hand(directory, name, inode);
                         let attributes = handing.attr(inode);
                         let kept = match handing.cached {

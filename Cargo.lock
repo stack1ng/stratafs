@@ -2174,10 +2174,10 @@ dependencies = [
 name = "stratafs-mdbx"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "bytes",
  "futures-core",
  "futures-lite",
- "futures-util",
  "libc",
  "mdbx-sys",
  "stratafs-content-conformance",
@@ -2240,11 +2240,11 @@ dependencies = [
 name = "stratafs-redb"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "bytes",
  "cfg_aliases",
  "futures-core",
  "futures-lite",
- "futures-util",
  "nix",
  "redb",
  "stratafs-keyed-notify",
@@ -2278,10 +2278,10 @@ dependencies = [
 name = "stratafs-sqlite"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "bytes",
  "futures-core",
  "futures-lite",
- "futures-util",
  "nix",
  "rusqlite",
  "stratafs-content-conformance",

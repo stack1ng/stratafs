@@ -139,9 +139,9 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
     }
 
     // stat is a file's attributes, from the kernel's cache when it has them.
-    async fn stat(&self, inode: Inode) -> Result<Attributes, Failure> {
+    async fn stat(&self, inode: Inode) -> Result<(Attributes, bool), Failure> {
         if let Some(cached) = self.kernel.cached(inode).await {
-            return Ok(cached);
+            return Ok((cached, false));
         }
         let operation = self.kernel.begin(inode, Access::Stat).await;
         let served = self
@@ -170,7 +170,8 @@ impl<C: Consistency> Operations for Mount<C, Kernel> {
                 },
             )
             .await;
-        self.returned(served.map_err(failed)?).await
+        let attributes = self.returned(served.map_err(failed)?).await?;
+        Ok((attributes, false))
     }
 
     // read is a file's whole content, and the attributes handed over with it, from the kernel's cache when it has them.

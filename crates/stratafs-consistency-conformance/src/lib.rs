@@ -376,6 +376,99 @@ mod tests {
         assert!(left_out > 0, "no read got a size from before its data");
     }
 
+    // UPSTREAM KERNEL BUG PIN: on Linux before 6.12.110 and 6.13 a listing's reply that brings back in a file the
+    // kernel let go of while it waited gives the file the listing's attributes, however old, so another mount's change
+    // meanwhile goes unseen, which the random activity seldom reaches.
+    #[test]
+    fn simulated_linux_fuse_strong_leaves_out_stats_of_attributes_a_listing_brought_back_in() {
+        let file = ("d", "a");
+        let activity = SimulatedActivity {
+            mounts: vec![
+                vec![
+                    vec![
+                        SimulatedOperation::Stat(file),
+                        SimulatedOperation::List("d"),
+                    ],
+                    vec![SimulatedOperation::Reclaim(file)],
+                ],
+                vec![vec![SimulatedOperation::Chmod(file, 0o600)]],
+            ],
+            faults: Vec::new(),
+            slow: false,
+        };
+        let mut left_out = 0;
+        for seed in 0..1024 {
+            let simulated = simulate::<_, Strong, simulated_linux_fuse_kernel::Kernel>(
+                &pct(3, 4),
+                Ending::Linearizable,
+                activity.clone(),
+                seed,
+            );
+            left_out += simulated.expect("the history is linearizable");
+        }
+        assert!(
+            left_out > 0,
+            "no stat found attributes a listing brought back in"
+        );
+    }
+
+    // UPSTREAM KERNEL BUG PIN: the same stale attributes stay in the kernel's cache, so eventual mode leaves them out
+    // of what each mount must converge on.
+    #[test]
+    fn simulated_linux_fuse_eventual_leaves_out_attributes_a_listing_brought_back_in() {
+        let file = ("d", "a");
+        let activity = SimulatedActivity {
+            mounts: vec![
+                vec![
+                    vec![
+                        SimulatedOperation::Stat(file),
+                        SimulatedOperation::List("d"),
+                    ],
+                    vec![SimulatedOperation::Reclaim(file)],
+                ],
+                vec![vec![SimulatedOperation::Chmod(file, 0o600)]],
+            ],
+            faults: Vec::new(),
+            slow: false,
+        };
+        for seed in 0..1024 {
+            simulate::<_, Eventual, simulated_linux_fuse_kernel::Kernel>(
+                &pct(3, 4),
+                Ending::Converges,
+                activity.clone(),
+                seed,
+            )
+            .expect("every mount converges");
+        }
+    }
+
+    // A rename's reply only marks the moved file's attributes out of date, so a stat's reply read before the rename
+    // would be cached after it unless the volume moves their version.
+    #[test]
+    fn simulated_linux_fuse_eventual_converges_on_attributes_of_a_moved_file() {
+        let (file, moved) = (("d", "b"), ("e", "a"));
+        let activity = SimulatedActivity {
+            mounts: vec![vec![
+                vec![
+                    SimulatedOperation::Touch(file, 1),
+                    SimulatedOperation::Lookup(file),
+                ],
+                vec![SimulatedOperation::Rename(file, moved)],
+            ]],
+            faults: Vec::new(),
+            slow: false,
+        };
+        for seed in 0..1024 {
+            simulate::<_, Eventual, simulated_linux_fuse_kernel::Kernel>(
+                &seeded(),
+                Ending::Converges,
+                activity.clone(),
+                seed,
+            )
+            .expect("every mount converges");
+        }
+    }
+
     // On Linux a change that would wait for another mount's change fails while any delivery is handled here, since that
     // delivery's purge may wait for the lock of a directory a system call holds while it waits for the lock of a file
     // the change holds, as an unlink of the file does.

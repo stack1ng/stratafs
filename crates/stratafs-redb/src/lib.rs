@@ -5,9 +5,9 @@ use std::ops::Bound;
 use std::ops::RangeBounds;
 use std::sync::{Arc, PoisonError};
 
+use async_lock::Mutex;
 use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
-use futures_util::lock::Mutex;
 #[cfg(disk)]
 use redb::BackendError;
 use redb::{

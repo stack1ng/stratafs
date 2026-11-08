@@ -9,9 +9,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Arc, PoisonError};
 
+use async_lock::Mutex;
 use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
-use futures_util::lock::Mutex;
 use mdbx_sys as ffi;
 
 use stratafs_keyed_notify::KeyedNotify;

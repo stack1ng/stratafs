@@ -112,6 +112,9 @@ pub(crate) trait KernelModel: Sized + Send + Sync + 'static {
     const FINDS_NAMES: bool;
     // LISTS_ATTRIBUTES says whether a listing shows the app each entry's attributes, or only its name and inode.
     const LISTS_ATTRIBUTES: bool;
+    // STATS_BEFORE_COPYING says whether a read stats the file at one moment and copies the data at a later one, rather
+    // than taking both from one reply.
+    const STATS_BEFORE_COPYING: bool;
     // REGRESSIONS is the file the checks of mounts with this kernel keep the failing cases they found in, so they
     // replay only their own.
     const REGRESSIONS: &'static str;
@@ -133,7 +136,11 @@ pub(crate) trait Operations: Send + Sync {
         &self,
         directory: Inode,
     ) -> impl Future<Output = Result<Vec<(Bytes, Inode, Attributes)>, Failure>> + Send;
-    fn stat(&self, inode: Inode) -> impl Future<Output = Result<Attributes, Failure>> + Send;
+    // stat is a file's attributes, and whether the check leaves them out.
+    fn stat(
+        &self,
+        inode: Inode,
+    ) -> impl Future<Output = Result<(Attributes, bool), Failure>> + Send;
     // read is a file's whole content and the attributes handed over with it, and whether the check leaves it out.
     fn read(
         &self,

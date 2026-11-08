@@ -424,6 +424,7 @@ where
                     },
                     |created, reads, result_handling| {
                         let inode = created.inode;
+                        volume.invalidate_attributes([directory]);
                         volume
                             .items
                             .reply(reads.iter().cloned(), result_handling, |locked| {
@@ -466,6 +467,7 @@ where
                         ]
                     },
                     |_, reads, result_handling| {
+                        volume.invalidate_attributes([directory]);
                         volume
                             .items
                             .reply(reads.iter().cloned(), result_handling, |locked| {
@@ -508,6 +510,7 @@ where
                 |_: &EntryChange,
                  reads: &[(Inode, Attributes)],
                  result_handling: &(dyn Fn() -> ResultHandling + Sync)| {
+                    volume.invalidate_attributes([directory]);
                     volume
                         .items
                         .reply(reads.iter().cloned(), result_handling, |locked| {
@@ -592,6 +595,14 @@ where
                         .collect()
                     },
                     |renamed, reads, result_handling| {
+                        let exchanged = renamed
+                            .replaced
+                            .as_ref()
+                            .filter(|_| mode == RenameMode::Exchange)
+                            .map(|(other, _)| *other);
+                        volume.invalidate_attributes(
+                            [from, to, renamed.inode].into_iter().chain(exchanged),
+                        );
                         volume
                             .items
                             .reply(reads.iter().cloned(), result_handling, |locked| {
@@ -996,6 +1007,7 @@ where
                 .await;
             match changed {
                 Ok(attributes) => {
+                    volume.invalidate_attributes([inode]);
                     volume.engine.cached(inode, &attributes);
                     reply.ok()
                 }
@@ -1020,6 +1032,7 @@ where
                 .await;
             match changed {
                 Ok(attributes) => {
+                    volume.invalidate_attributes([inode]);
                     volume.engine.cached(inode, &attributes);
                     reply.ok()
                 }
@@ -1106,6 +1119,16 @@ where
                 tracing::warn!(inode = inode.0, %error, "deleting an item with no name failed");
             }
         });
+    }
+
+    // invalidate_attributes moves the kernel's attribute version of inodes once a change to them commits, as its reply
+    // only marks their attributes out of date, so a getattr reply read before the change is not cached after it.
+    fn invalidate_attributes(&self, inodes: impl IntoIterator<Item = Inode>) {
+        for inode in inodes {
+            if let Err(error) = self.kernel.invalidate_attributes(inode) {
+                tracing::warn!(inode = inode.0, %error, "dropping the kernel's attributes after a change failed");
+            }
+        }
     }
 
     // run runs an operation, handing it the volume, on FUSE's thread until it finishes or has to wait, such as while

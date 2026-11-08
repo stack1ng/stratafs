@@ -42,8 +42,10 @@ struct State {
     // paging is the read or write holding each file's pages, by its number. numbered is the last number given to one or
     // to an entry.
     paging: HashMap<Inode, u64>,
-    // changes counts the changes to attributes the kernel took in, numbering each, as its attr_version does.
+    // changes counts the changes to attributes the kernel took in, numbering each, as its attr_version does, and the
+    // items it let go of. evicted is the number of the last time it let go of each item.
     changes: u64,
+    evicted: HashMap<Inode, u64>,
     numbered: u64,
     // replies numbers the volume's replies, as stratafs-fuse's Items does.
     replies: u64,
@@ -83,6 +85,9 @@ struct Held {
     // reply it took none of while a write grew the file. uncached says whether the size came from an uncached reply.
     purged: u64,
     uncached: bool,
+    // UPSTREAM KERNEL BUG PIN: stale says whether its attributes came with a reply that brought the item back in after
+    // the kernel let go of it while the request was out, which kernels before 6.12.110 and 6.13 take in however old.
+    stale: bool,
     // UPSTREAM KERNEL BUG PIN: growing is the write in flight that grows the file, until which the kernel takes no
     // attributes in, as FUSE_I_SIZE_UNSTABLE has it.
     growing: Option<u64>,
@@ -228,15 +233,18 @@ impl KernelCache for KernelHandle {
 
 impl KernelModel for Kernel {
     // UPSTREAM KERNEL BUG PIN: Linux shows reads of cached pages a write's data before the volume stores it, a read
-    // copies up to a size the kernel took in before the data it copies, and a mount's lookups find the names its own
-    // change drops until that change replies.
-    const TAINTED: &'static str =
-        "an unstored write's data, a size older than its data, or a name its own change drops";
+    // copies up to a size the kernel took in before the data it copies, a mount's lookups find the names its own
+    // change drops until that change replies, and a stat finds the attributes, however old, of a reply that brought
+    // back in an item the kernel let go of while it waited.
+    const TAINTED: &'static str = "an unstored write's data, a size older than its data, a name its own change drops, \
+         or the attributes a reply brought an item back in with";
     // Linux finds a rename's source and a link's new name under the directories' locks, as fs/namei.c does.
     const FINDS_NAMES: bool = true;
     // getdents shows an app each entry's name and inode alone, as fs/readdir.c does. readdirplus hands the attributes
     // to the kernel, which a stat may find later.
     const LISTS_ATTRIBUTES: bool = false;
+    // A read stats the file before it copies the pages, as fuse_cache_read_iter does.
+    const STATS_BEFORE_COPYING: bool = true;
     const REGRESSIONS: &'static str = "proptest-regressions/linux_fuse.txt";
 
     // new is the kernel of a volume just mounted, which holds the root from the mount on, without a lookup.
@@ -340,9 +348,11 @@ impl Kernel {
     }
 
     // attributes are the attributes the kernel caches for inode, unless they are out of date.
-    pub(crate) fn attributes(&self, inode: Inode) -> Option<Attributes> {
+    // UPSTREAM KERNEL BUG PIN: and whether they are stale ones a reply brought in after the item was let go of.
+    pub(crate) fn attributes(&self, inode: Inode) -> Option<(Attributes, bool)> {
         let state = self.state();
-        state.held.get(&inode)?.attributes.clone()
+        let held = state.held.get(&inode)?;
+        Some((held.attributes.clone()?, held.stale))
     }
 
     // size is the size the kernel takes inode to have.
@@ -486,6 +496,8 @@ impl Kernel {
         let Some(held) = state.held.remove(&inode) else {
             return false;
         };
+        let evicted = state.change();
+        state.evicted.insert(inode, evicted);
         state
             .entries
             .retain(|(directory, _), (item, ..)| *directory != inode && *item != inode);
@@ -647,10 +659,11 @@ impl State {
                     let entry = (inode, kept != Kept::Nothing, self.numbered);
                     self.entries.insert((directory, name), entry);
                     // A reply bringing in an item the kernel does not hold gives it these attributes, however old.
-                    let sent = match self.held.get_mut(&inode) {
+                    // UPSTREAM KERNEL BUG PIN: they are stale when the kernel let go of it since the request.
+                    let (sent, stale) = match self.held.get_mut(&inode) {
                         Some(held) => {
                             held.lookups += 1;
-                            sent
+                            (sent, false)
                         }
                         None => {
                             let held = Held {
@@ -658,11 +671,18 @@ impl State {
                                 ..Held::default()
                             };
                             self.held.insert(inode, held);
-                            None
+                            let evicted = self.evicted.get(&inode).copied();
+                            let stale = sent
+                                .zip(evicted)
+                                .is_some_and(|(sent, evicted)| evicted > sent);
+                            (None, stale)
                         }
                     };
                     let kept = kept == Kept::NameAndAttributes;
                     self.take(inode, attributes, sent, kept, cached);
+                    if stale && let Some(held) = self.held.get_mut(&inode) {
+                        held.stale = stale;
+                    }
                 }
             }
             Update::Attributes {
@@ -800,6 +820,7 @@ impl State {
         held.size = size;
         // UPSTREAM KERNEL BUG PIN: an uncached reply's size may be from before a write in flight.
         held.uncached = !cached;
+        held.stale = false;
         held.attributes = kept.then_some(attributes);
     }
 
@@ -825,6 +846,14 @@ impl Handing<'_> {
         let item = self.state.items.get(&inode);
         let newest = item.and_then(|item| item.newest.clone());
         newest.expect("a reply keeps a read for every inode it read")
+    }
+
+    // invalidate_attributes moves the kernel's attribute version of inodes before the reply, as stratafs-fuse does once
+    // a change to them commits, since the reply only marks their attributes out of date.
+    pub(crate) fn invalidate_attributes(&mut self, inodes: impl IntoIterator<Item = Inode>) {
+        for inode in inodes {
+            self.state.invalidate_attributes(inode);
+        }
     }
 
     // hand records that the reply hands the kernel a lookup of inode, under name in directory.

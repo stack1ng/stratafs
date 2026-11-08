@@ -6,9 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-lock.workspace = true
 bytes.workspace = true
 futures-core.workspace = true
-futures-util.workspace = true
 libc.workspace = true
 mdbx-sys = "=14.4.0"
 stratafs-keyed-notify.workspace = true

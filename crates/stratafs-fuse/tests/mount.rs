@@ -4,6 +4,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -78,6 +80,8 @@ impl Store {
             .args(["--volume", &self.volume])
             .args(&self.flags)
             .stdin(Stdio::null())
+            // The daemon writes nothing to its output, so the pipe's one event is closing when the daemon exits.
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
         let (unmounted, watched) = mpsc::channel();
@@ -86,17 +90,7 @@ impl Store {
             mount_point,
             _unmounted: unmounted,
         };
-        let started = Instant::now();
-        while !mounted.is_mounted() {
-            if let Some(status) = mounted.daemon.try_wait().unwrap() {
-                panic!("the daemon exited with {status} before mounting");
-            }
-            assert!(
-                started.elapsed() < MOUNT_TIMEOUT,
-                "the mount never appeared"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        mounted.wait_until_mounted(true);
         // The kernel numbers a FUSE connection by its mount's device minor.
         let connection = libc::minor(fs::metadata(mounted.mount_point.path()).unwrap().dev());
         std::thread::spawn(move || {
@@ -135,6 +129,32 @@ impl Mounted {
 
     fn is_mounted(&self) -> bool {
         is_mounted(self.mount_point.path())
+    }
+
+    // wait_until_mounted blocks until is_mounted says mounted, waking at each change to the mount table, and fails if
+    // the daemon exits first or MOUNT_TIMEOUT passes.
+    fn wait_until_mounted(&mut self, mounted: bool) {
+        // Opened before the first check, so a change after it wakes the poll.
+        let table = File::open("/proc/self/mountinfo").unwrap();
+        let deadline = Instant::now() + MOUNT_TIMEOUT;
+        while self.is_mounted() != mounted {
+            let output = self.daemon.stdout.as_ref().unwrap();
+            let mut events = [
+                PollFd::new(table.as_fd(), PollFlags::POLLPRI),
+                PollFd::new(output.as_fd(), PollFlags::empty()),
+            ];
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ready = poll(&mut events, PollTimeout::try_from(left).unwrap()).unwrap();
+            let change = if mounted { "mounting" } else { "detaching" };
+            assert!(
+                ready > 0,
+                "the mount table never showed the daemon {change}"
+            );
+            if events[1].revents().is_some_and(|events| !events.is_empty()) {
+                let status = self.daemon.wait().unwrap();
+                panic!("the daemon exited with {status} before {change}");
+            }
+        }
     }
 
     // unmount unmounts the volume, as a person would, and waits for the daemon to exit cleanly.
@@ -493,14 +513,7 @@ fn sigterm_while_a_file_is_open_unmounts_once_it_closes() {
     open.write_all(b"kept").unwrap();
     let daemon = Pid::from_raw(i32::try_from(mounted.daemon.id()).unwrap());
     kill(daemon, Signal::SIGTERM).unwrap();
-    let started = Instant::now();
-    while mounted.is_mounted() {
-        assert!(
-            started.elapsed() < MOUNT_TIMEOUT,
-            "the mount was never detached"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    mounted.wait_until_mounted(false);
     open.write_all(b" while detached").unwrap();
     assert!(mounted.daemon.try_wait().unwrap().is_none());
     drop(open);

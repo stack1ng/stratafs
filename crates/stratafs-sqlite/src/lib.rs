@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
+use async_lock::{Mutex, MutexGuard, MutexGuardArc};
 use bytes::{Buf, Bytes};
 use futures_core::future::BoxFuture;
-use futures_util::lock::{Mutex, MutexGuard, OwnedMutexGuard};
 use rusqlite::hooks::Wal;
 use rusqlite::wal::CheckpointMode;
 use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, ffi, params};
@@ -287,7 +287,7 @@ impl<S> Database<S> {
             checkpointed => checkpointed?,
         }
         if kept_growing {
-            let writer = Arc::clone(&self.writer).lock_owned().await;
+            let writer = self.writer.lock_arc().await;
             let mut transaction = begin_write(writer, &self.spawner).await?;
             let (caught_up, checkpointed) = self
                 .spawner
@@ -324,7 +324,7 @@ impl<S> Database<S> {
         S: SpawnBlocking,
     {
         let running = Running::start(&self.running);
-        let writer = Arc::clone(&self.writer).lock_owned().await;
+        let writer = self.writer.lock_arc().await;
         let mut transaction = begin_write(writer, &self.spawner)
             .await
             .map_err(TransactError::Failed)?;
@@ -414,7 +414,7 @@ impl<S> Database<S> {
         S: SpawnBlocking,
     {
         let called = self.syncs_started.load(Ordering::SeqCst);
-        let syncer = Arc::clone(&self.syncer).lock_owned().await;
+        let syncer = self.syncer.lock_arc().await;
         let last = syncer.last_against(against);
         // A sync that started after the call made every commit before it durable.
         if last.is_some_and(|last| last.number > called) {
@@ -728,7 +728,7 @@ fn read_content(
 // begin_write begins the writer's transaction. While another process writes it waits on the spawner, trying again
 // until that process commits.
 async fn begin_write<S: SpawnBlocking>(
-    writer: OwnedMutexGuard<Writer>,
+    writer: MutexGuardArc<Writer>,
     spawner: &S,
 ) -> rusqlite::Result<WriteTransaction> {
     let begun = execute(&lock(&writer.connection), BEGIN_WRITE);
@@ -813,7 +813,7 @@ impl Drop for Running<'_> {
 
 // WriteTransaction is the writer with its transaction begun, rolled back when dropped before it ends, even where a
 // cancelled transact leaves it, on the spawner.
-struct WriteTransaction(OwnedMutexGuard<Writer>);
+struct WriteTransaction(MutexGuardArc<Writer>);
 
 impl WriteTransaction {
     // commit commits the transaction, and fails once SQLite rolled it back after a failure.

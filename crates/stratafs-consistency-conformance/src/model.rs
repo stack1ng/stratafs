@@ -12,6 +12,8 @@ pub(crate) enum HistoryOperation {
     Lookup(Path),
     List(&'static str),
     Stat(u64),
+    // Where the kernel stats the file before it copies the data, a read takes effect as two steps, a stat of the file,
+    // then its own, copying the data.
     Read(u64),
     Write(u64, &'static [u8]),
     Touch(u64, i64),
@@ -45,11 +47,12 @@ impl HistoryOperation {
 
     // steps is the operation as each step it takes effect in, in order, with what it returned there. POSIX lets a
     // lookup find the path at one moment and read the attributes at a later one, so a rename meanwhile on the same
-    // mount can show the old path with the new attributes.
+    // mount can show the old path with the new attributes, as a read that stats first can show new data with old ones.
     pub(crate) fn steps(
         self,
         returned: Option<Outcome>,
         finds_names: bool,
+        stats_before_copying: bool,
     ) -> Vec<(HistoryOperation, Option<Outcome>)> {
         match (self, returned) {
             (HistoryOperation::Lookup(path), Some(Outcome::Found(found))) => {
@@ -59,6 +62,17 @@ impl HistoryOperation {
                     .into_iter()
                     .chain(stat)
                     .collect()
+            }
+            (HistoryOperation::Read(inode), Some(Outcome::Read(content, seen)))
+                if stats_before_copying =>
+            {
+                vec![
+                    (HistoryOperation::Stat(inode), Some(Outcome::Seen(seen))),
+                    (
+                        HistoryOperation::Read(inode),
+                        Some(Outcome::Copied(content)),
+                    ),
+                ]
             }
             // A link that failed with EEXIST found the name taken at one of its steps.
             (HistoryOperation::Link(_, path), Some(Outcome::Failed(PosixError::EEXIST)))
@@ -88,7 +102,10 @@ pub(crate) enum Outcome {
     // Listed is each entry of a directory, by name, with its attributes when the listing shows them.
     Listed(Vec<(&'static str, u64, Option<Seen>)>),
     Seen(Seen),
+    // Read is what a read returned: the content with the attributes handed over with it. Copied is what its own step
+    // copies when the kernel stats the file first.
     Read(Vec<u8>, Seen),
+    Copied(Vec<u8>),
     Done,
     Failed(PosixError),
 }
@@ -114,14 +131,16 @@ impl From<&Attributes> for Seen {
 }
 
 // Namespace is every path of the volume's directories, and every file the activity made, by inode. finds_names says
-// whether the kernel finds the names a change works on under their directories' locks before it asks the volume, and
-// lists_attributes whether a listing shows each entry's attributes.
+// whether the kernel finds the names a change works on under their directories' locks before it asks the volume,
+// lists_attributes whether a listing shows each entry's attributes, and stats_before_copying whether a read stats the
+// file before it copies the data.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Namespace {
     names: BTreeMap<Path, u64>,
     files: BTreeMap<u64, File>,
     finds_names: bool,
     lists_attributes: bool,
+    stats_before_copying: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -133,10 +152,15 @@ struct File {
 }
 
 impl Namespace {
-    pub(crate) fn new(finds_names: bool, lists_attributes: bool) -> Self {
+    pub(crate) fn new(
+        finds_names: bool,
+        lists_attributes: bool,
+        stats_before_copying: bool,
+    ) -> Self {
         Namespace {
             finds_names,
             lists_attributes,
+            stats_before_copying,
             ..Namespace::default()
         }
     }
@@ -156,6 +180,7 @@ impl Namespace {
             ),
             HistoryOperation::Stat(inode) => self.changed(inode, |_| {}),
             HistoryOperation::Read(inode) => match self.files.get(&inode) {
+                Some(file) if self.stats_before_copying => Outcome::Copied(file.content.clone()),
                 Some(file) => Outcome::Read(file.content.clone(), file.seen()),
                 None => Outcome::Failed(PosixError::ESTALE),
             },
