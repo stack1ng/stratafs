@@ -1,8 +1,11 @@
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use futures_channel::oneshot;
+use stratafs_runtime::Runtime;
 use stratafs_serialized::serialized_value;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
@@ -24,6 +27,9 @@ pub trait TreeConfig: Send + Sync + 'static {
     type Range: AddressableRange;
     const NODE_CAPACITY: usize;
     const MERGE_BELOW_PERCENT: u8;
+    const GARBAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
+    // GARBAGE_COLLECTION_BATCH is the most jobs the garbage collector applies in one transaction.
+    const GARBAGE_COLLECTION_BATCH: usize = 32;
 }
 
 pub(crate) trait TreeConfigLimits: TreeConfig {
@@ -75,6 +81,8 @@ pub(crate) struct TreeShared<S: KeyValueStore, A, C> {
     pub(crate) id_allocator: A,
     // watches holds each watch that waiters share, for as long as one of them still waits on it
     pub(crate) watches: Mutex<SharedWatches<S::Failure>>,
+    // runtime runs each opened volume's garbage collector
+    pub(crate) runtime: Arc<dyn Runtime>,
     config: PhantomData<C>,
 }
 
@@ -89,6 +97,7 @@ where
     pub async fn new(
         store: S,
         id_allocator: A,
+        runtime: Arc<dyn Runtime>,
     ) -> Result<
         Self,
         TransactError<S::Rejection, S::Failure, PinnedConfigError<S::Rejection, S::Failure>>,
@@ -153,6 +162,7 @@ where
             store,
             id_allocator,
             watches: Mutex::default(),
+            runtime,
             config: PhantomData,
         })))
     }
@@ -208,7 +218,8 @@ where
         Ok(id)
     }
 
-    // open opens an existing volume by its id. If the volume does not exist, it returns UnknownVolume.
+    // open opens an existing volume by its id, starting its garbage collector, which runs until the volume is dropped.
+    // If the volume does not exist, it returns UnknownVolume.
     async fn open(
         &self,
         id: TreeVolumeId,
@@ -221,10 +232,21 @@ where
             })
             .await;
         match header {
-            Ok(Some(_)) => Ok(TreeVolume {
-                shared: Arc::clone(&self.0),
-                id,
-            }),
+            Ok(Some(_)) => {
+                let (stop_garbage_collection, stopped) = oneshot::channel();
+                let garbage_collection = TreeShared::collect_garbage_until(
+                    Arc::downgrade(&self.0),
+                    Arc::clone(&self.0.runtime),
+                    id,
+                    stopped,
+                );
+                self.0.runtime.spawn(Box::pin(garbage_collection));
+                Ok(TreeVolume {
+                    shared: Arc::clone(&self.0),
+                    id,
+                    _stop_garbage_collection: stop_garbage_collection,
+                })
+            }
             Ok(None) => Err(StoreError::Rejected(UnknownVolume)),
             Err(TransactError::Rejected(rejection)) => Err(StoreError::Failed(
                 TreeFailure::RefusedTransaction(rejection),

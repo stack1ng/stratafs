@@ -2,9 +2,10 @@
 // mount reaches it through its own handle, which yields to other tasks around each transaction and fails those its
 // faults say to.
 
+use std::cell::Cell;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use futures_lite::future::yield_now;
 use futures_util::future::BoxFuture;
@@ -13,6 +14,7 @@ use redb::backends::InMemoryBackend;
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::{RedbFailure, RedbStore};
+use stratafs_runtime::Runtime;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
@@ -31,6 +33,8 @@ impl TreeConfig for TestTreeConfig {
     type Range = u16;
     const NODE_CAPACITY: usize = 4096;
     const MERGE_BELOW_PERCENT: u8 = 25;
+    // a run lasts seconds of virtual time, so its garbage collector runs among its operations
+    const GARBAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(1);
 }
 
 pub(crate) type InMemoryStore = LockSynchronizedStore<
@@ -73,15 +77,17 @@ fn injected_failure() -> MetadataFailure<InMemoryStore> {
     )))
 }
 
-// new_store is a fresh, empty store for one volume.
-pub(crate) async fn new_store() -> Arc<InMemoryStore> {
+// new_store is a fresh, empty store for one volume, whose garbage collector runs on runtime.
+pub(crate) async fn new_store(runtime: Arc<dyn Runtime>) -> Arc<InMemoryStore> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .expect("redb opens a database in memory");
+    NEXT_NODE.set(1);
     let allocate_node: fn() -> u128 = next_node;
     let tree = Tree::new(
         RedbStore::new(database, Inline).expect("redb starts a store in memory"),
         allocate_node,
+        runtime,
     )
     .await
     .expect("a tree starts in an empty store");
@@ -95,10 +101,15 @@ pub(crate) async fn new_store() -> Arc<InMemoryStore> {
     ))
 }
 
-// next_node allocates a tree node id no other node of any test tree has.
+thread_local! {
+    // NEXT_NODE is the next node id of the store a run made, from 1 in every replay, since its garbage collector times
+    // its passes by them. A run's tasks all run on its thread.
+    static NEXT_NODE: Cell<u128> = const { Cell::new(1) };
+}
+
+// next_node allocates a node id no other node of the run's tree has.
 fn next_node() -> u128 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    u128::from(NEXT.fetch_add(1, Ordering::Relaxed))
+    NEXT_NODE.replace(NEXT_NODE.get() + 1)
 }
 
 impl<S: Store> Store for Shared<S> {

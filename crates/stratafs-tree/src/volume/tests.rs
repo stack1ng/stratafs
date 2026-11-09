@@ -2,12 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use futures_lite::future::block_on;
 use proptest::prelude::RngExt;
 use proptest::test_runner::{RngAlgorithm, TestRng};
 use redb::backends::InMemoryBackend;
+use stratafs_kv_conformance::runtime::{Replay, ReplayingRuntime, seeded};
 use stratafs_redb::{RedbFailure, RedbStore};
+use stratafs_runtime::{Runtime, TaskDroppingRuntime};
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::spawn::Inline;
 use zerocopy::little_endian::{U64, U128};
@@ -25,6 +28,8 @@ impl TreeConfig for SmallNodeConfig {
     type Range = u8;
     const NODE_CAPACITY: usize = 128;
     const MERGE_BELOW_PERCENT: u8 = 25;
+    const GARBAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(1);
+    const GARBAGE_COLLECTION_BATCH: usize = 3;
 }
 
 type TestTree = Tree<RedbStore<Inline>, fn() -> u128, SmallNodeConfig>;
@@ -38,13 +43,19 @@ fn allocate_id() -> u128 {
     u128::from(NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+// new_tree is a tree whose volumes' garbage collectors never run, so only a test collects garbage.
 fn new_tree() -> TestTree {
+    new_tree_on(Arc::new(TaskDroppingRuntime))
+}
+
+fn new_tree_on(runtime: Arc<dyn Runtime>) -> TestTree {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
     block_on(Tree::new(
         RedbStore::new(database, Inline).unwrap(),
         allocate_id as fn() -> u128,
+        runtime,
     ))
     .unwrap()
 }
@@ -543,4 +554,191 @@ fn the_check_catches_a_lost_header() {
     }))
     .unwrap();
     assert!(!counts_match_parents(&volume));
+}
+
+fn collect_garbage(volume: &TestVolume) {
+    block_on(volume.shared.collect_garbage(volume.id)).unwrap();
+}
+
+// reachable are the ids of every node in the volumes' trees.
+fn reachable(volumes: &[TestVolume]) -> HashSet<u128> {
+    volumes
+        .iter()
+        .flat_map(|volume| tree_parents(volume).into_keys())
+        .collect()
+}
+
+// job_counts maps each node with pending jobs to how many it has.
+fn job_counts(volume: &TestVolume) -> HashMap<u128, usize> {
+    let mut counts = HashMap::new();
+    for (_, node) in jobs(volume) {
+        *counts.entry(node.0.get()).or_insert(0) += 1;
+    }
+    counts
+}
+
+// change_randomly forks, writes to, clears or range clears a random volume, or collects its garbage when garbage_collecting
+// is set, and returns the volume's index.
+fn change_randomly(
+    tree: &TestTree,
+    volumes: &mut Vec<TestVolume>,
+    rng: &mut TestRng,
+    garbage_collecting: bool,
+) -> usize {
+    let index = rng.random_range(0..volumes.len());
+    let volume = &volumes[index];
+    let start = rng.random_range(0..KEY_COUNT);
+    let end = rng.random_range(start + 1..=KEY_COUNT.min(start + 80));
+    match rng.random_range(0..5) {
+        0 if volumes.len() < 8 => {
+            let forked = block_on(tree.open(fork(volume))).unwrap();
+            volumes.push(forked);
+        }
+        0 | 1 => set_keys(volume, start..end),
+        2 => clear_keys(volume, start..end),
+        3 => clear_range(
+            volume,
+            Bytes::from(format!("key/{start:04}"))..Bytes::from(format!("key/{end:04}")),
+        ),
+        _ if garbage_collecting => collect_garbage(volume),
+        _ => set_keys(volume, start..end),
+    }
+    index
+}
+
+#[test]
+fn garbage_collecting_every_volume_frees_each_node_no_tree_reaches_after_random_changes() {
+    let tree = new_tree();
+    let mut volumes = vec![new_volume(&tree)];
+    let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+    for _ in 0..300 {
+        let index = change_randomly(&tree, &mut volumes, &mut rng, true);
+        assert!(counts_match_parents(&volumes[index]));
+    }
+    let stored_before = stored_nodes(&volumes[0]).len();
+    for volume in &volumes {
+        collect_garbage(volume);
+    }
+    assert!(jobs(&volumes[0]).is_empty());
+    assert!(counts_match_parents(&volumes[0]));
+    assert_eq!(stored_nodes(&volumes[0]), reachable(&volumes));
+    assert!(stored_nodes(&volumes[0]).len() < stored_before);
+}
+
+#[test]
+fn a_root_two_volumes_diverged_from_is_freed_level_by_level() {
+    let tree = new_tree();
+    let volume = new_volume(&tree);
+    set_keys(&volume, 0..KEY_COUNT);
+    let levels = depth(&volume) + 1;
+    assert!(levels >= 4);
+    let shared_root = root(&volume);
+    let shared = tree_parents(&volume);
+    let forked = block_on(tree.open(fork(&volume))).unwrap();
+    set_keys(&forked, 0..1);
+    set_keys(&volume, 0..1);
+    // the forked volume's job only takes its header off the shared root
+    collect_garbage(&forked);
+    assert_eq!(jobs(&volume), [(volume.id, shared_root)]);
+    assert!(stored_nodes(&volume).contains(&shared_root.0.get()));
+    // each batch writes one job for each child of a node it frees
+    loop {
+        let (nodes_before, jobs_before) = (stored_nodes(&volume), job_counts(&volume));
+        if !block_on(volume.shared.apply_jobs(volume.id, NodeId(U128::new(0)))).unwrap() {
+            break;
+        }
+        let nodes_after = stored_nodes(&volume);
+        let freed: HashSet<_> = nodes_before.difference(&nodes_after).collect();
+        let expected: HashMap<_, _> = shared
+            .iter()
+            .filter(|(_, parent)| parent.is_some_and(|parent| freed.contains(&parent)))
+            .map(|(id, _)| (*id, 1))
+            .collect();
+        let written: HashMap<_, _> = job_counts(&volume)
+            .into_iter()
+            .filter_map(|(id, count)| {
+                let before = jobs_before.get(&id).copied().unwrap_or(0);
+                (count > before).then_some((id, count - before))
+            })
+            .collect();
+        assert_eq!(written, expected);
+        assert!(counts_match_parents(&volume));
+    }
+    // only the path both writes copied lost every parent, from the root down to the leaf
+    let volumes = [volume, forked];
+    let freed: Vec<_> = shared
+        .keys()
+        .filter(|id| !stored_nodes(&volumes[0]).contains(id))
+        .collect();
+    assert_eq!(freed.len(), levels);
+    assert_eq!(stored_nodes(&volumes[0]), reachable(&volumes));
+}
+
+#[test]
+fn two_garbage_collectors_taking_turns_on_one_volume_apply_each_job_once() {
+    let tree = new_tree();
+    let mut volumes = vec![new_volume(&tree)];
+    let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+    for _ in 0..200 {
+        change_randomly(&tree, &mut volumes, &mut rng, false);
+    }
+    for volume in &volumes {
+        // each garbage collector starts at a node with a pending job, so their batches overlap
+        let mut starts: Vec<_> = jobs(volume)
+            .into_iter()
+            .filter(|(id, _)| *id == volume.id)
+            .map(|(_, node)| node)
+            .collect();
+        let Some(&last) = starts.last() else {
+            continue;
+        };
+        starts = vec![starts[rng.random_range(0..starts.len())], last];
+        let mut garbage_collecting = [true, true];
+        while garbage_collecting.contains(&true) {
+            let turn = rng.random_range(0..2);
+            garbage_collecting[turn] =
+                block_on(volume.shared.apply_jobs(volume.id, starts[turn])).unwrap();
+            assert!(counts_match_parents(volume));
+        }
+    }
+    assert!(jobs(&volumes[0]).is_empty());
+    assert_eq!(stored_nodes(&volumes[0]), reachable(&volumes));
+}
+
+#[test]
+fn garbage_collectors_free_the_garbage_of_their_volumes_on_their_own() {
+    seeded().run(0, |replay| async move {
+        let runtime = replay.runtime(false);
+        let tree = new_tree_on(Arc::clone(&runtime));
+        let volume = new_volume(&tree);
+        // a second handle runs a second garbage collector on the same volume
+        let second = block_on(tree.open(volume.id)).unwrap();
+        set_keys(&volume, 0..KEY_COUNT);
+        let forked = block_on(tree.open(fork(&volume))).unwrap();
+        clear_keys(&forked, 0..KEY_COUNT);
+        set_keys(&second, 0..1);
+        assert!(!jobs(&volume).is_empty());
+        runtime
+            .sleep(SmallNodeConfig::GARBAGE_COLLECTION_INTERVAL * 2)
+            .await;
+        assert!(jobs(&volume).is_empty());
+        assert!(counts_match_parents(&volume));
+        assert_eq!(stored_nodes(&volume), reachable(&[volume, forked]));
+    });
+}
+
+#[test]
+fn dropping_a_volume_stops_its_garbage_collector() {
+    seeded().run(0, |replay| async move {
+        let runtime = replay.runtime(false);
+        let tree = new_tree_on(Arc::clone(&runtime));
+        let kept = new_volume(&tree);
+        let dropped = block_on(tree.open(kept.id)).unwrap();
+        runtime.sleep(Duration::from_millis(1)).await;
+        // each handle's garbage collector holds the tree weakly, and only it does
+        assert_eq!(Arc::weak_count(&kept.shared), 2);
+        drop(dropped);
+        runtime.sleep(Duration::from_millis(1)).await;
+        assert_eq!(Arc::weak_count(&kept.shared), 1);
+    });
 }

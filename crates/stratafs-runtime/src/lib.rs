@@ -60,3 +60,18 @@ impl Runtime for ThreadPoolRuntime {
         ))
     }
 }
+
+// TaskDroppingRuntime drops each task it is given and never fires a timer, for tests that run no background task.
+pub struct TaskDroppingRuntime;
+
+impl Runtime for TaskDroppingRuntime {
+    fn spawn(&self, _task: BoxFuture<'static, ()>) {}
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep_until(&self, _deadline: Instant) -> BoxFuture<'static, ()> {
+        Box::pin(std::future::pending())
+    }
+}

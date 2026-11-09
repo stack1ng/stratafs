@@ -1,6 +1,7 @@
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
 use stratafs_redb::RedbStore;
+use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::spawn::Inline;
 
 use super::*;
@@ -22,6 +23,7 @@ fn accepts_config<C: TreeConfig>() {
     drop(Tree::<RedbStore<Inline>, fn() -> u128, C>::new(
         memory_store(),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ));
 }
 
@@ -51,11 +53,13 @@ fn a_store_accepts_the_config_it_was_first_given() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         into_store(tree),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
 }
@@ -65,11 +69,13 @@ fn a_store_rejects_a_different_node_capacity() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     let reopened = block_on(Tree::<_, _, TestConfig<u16, 4067, 25>>::new(
         into_store(tree),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ));
     assert!(matches!(
         reopened,
@@ -83,11 +89,13 @@ fn a_store_rejects_a_different_address_length() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 65535, 25>>::new(
         memory_store(),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     let reopened = block_on(Tree::<_, _, TestConfig<u32, 65536, 25>>::new(
         into_store(tree),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ));
     assert!(matches!(
         reopened,
@@ -101,11 +109,13 @@ fn a_store_rejects_a_different_merge_threshold() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     let reopened = block_on(Tree::<_, _, TestConfig<u16, 16355, 30>>::new(
         into_store(tree),
         || 1,
+        Arc::new(TaskDroppingRuntime),
     ));
     assert!(matches!(
         reopened,
@@ -124,7 +134,11 @@ fn a_corrupt_pinned_config_is_reported() {
         })
     }))
     .unwrap();
-    let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(store, || 1));
+    let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
+        store,
+        || 1,
+        Arc::new(TaskDroppingRuntime),
+    ));
     assert!(matches!(
         tree,
         Err(TransactError::Aborted(PinnedConfigError::Corrupt(
@@ -138,6 +152,7 @@ fn create_writes_a_header_and_an_empty_root() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
         || 7,
+        Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     let volume = block_on(tree.create()).unwrap();

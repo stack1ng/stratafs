@@ -95,7 +95,7 @@ where
 }
 
 // stored_count is a node's reference count as stored, where a missing count is 1.
-fn stored_count(stored: Option<&[u8]>) -> Result<u64, CorruptValue> {
+pub(crate) fn stored_count(stored: Option<&[u8]>) -> Result<u64, CorruptValue> {
     match stored {
         None => Ok(1),
         Some(stored) => U64::read_from_bytes(stored)

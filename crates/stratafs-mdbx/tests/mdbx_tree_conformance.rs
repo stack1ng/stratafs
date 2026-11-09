@@ -1,11 +1,13 @@
 mod configuration;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_lite::future::block_on;
 use stratafs_kv_conformance::runtime::seeded;
 use stratafs_mdbx::MdbxMetadata;
+use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::spawn::Inline;
 use stratafs_tree::tree::{Tree, TreeConfig};
 
@@ -34,7 +36,7 @@ fn new_tree<C: TreeConfig>(
     let store = configuration::open(directory.join("store.mdbx"), Inline).unwrap();
     let next_id = AtomicU64::new(1);
     let allocate_id = move || u128::from(next_id.fetch_add(1, Ordering::Relaxed));
-    block_on(Tree::new(store, allocate_id)).unwrap()
+    block_on(Tree::new(store, allocate_id, Arc::new(TaskDroppingRuntime))).unwrap()
 }
 
 #[test]

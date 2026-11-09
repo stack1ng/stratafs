@@ -79,7 +79,10 @@ where
             shuttle::future::block_on(body(ShuttleReplay {
                 clock: Arc::clone(&clock),
             }));
+            // The clock's task outlives the body, so Timed still picks it only once no other task can run.
+            let task = clock.state().task;
             clock.set_back();
+            clock.state().task = task;
         });
     }
 }

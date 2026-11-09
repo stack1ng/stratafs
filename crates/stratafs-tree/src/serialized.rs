@@ -28,6 +28,10 @@ pub enum CorruptValue {
     UnevenLeafDepth,
     #[error("an internal node has no children")]
     EmptyInternalNode,
+    #[error("a stored key is not a valid tree key")]
+    InvalidKey,
+    #[error("a node has more pending dereference jobs than its reference count")]
+    RefCountBelowZero,
 }
 
 impl From<ViewError> for CorruptValue {

@@ -10,7 +10,7 @@ use redb::backends::InMemoryBackend;
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::{RedbFailure, RedbStore};
-use stratafs_runtime::ThreadPoolRuntime;
+use stratafs_runtime::{TaskDroppingRuntime, ThreadPoolRuntime};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::TransactError;
@@ -98,9 +98,14 @@ pub(crate) fn new_test_engine_with<C: Cached<InMemoryStore>>(
     let allocate_node: fn() -> u128 = next_node;
     let now: fn() -> Timestamp = clock;
     block_on(async {
-        let tree = Tree::new(RedbStore::new(database, Inline).unwrap(), allocate_node)
-            .await
-            .unwrap();
+        // node ids count per thread, so the tree runs no garbage collector on another thread
+        let tree = Tree::new(
+            RedbStore::new(database, Inline).unwrap(),
+            allocate_node,
+            Arc::new(TaskDroppingRuntime),
+        )
+        .await
+        .unwrap();
         let volume = tree.open(tree.create().await.unwrap()).await.unwrap();
         FsEngine::new(
             LockSynchronizedStore::new(volume, ObjectStoreContentStore::new(InMemory::new())),

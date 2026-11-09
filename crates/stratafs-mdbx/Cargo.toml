@@ -20,6 +20,7 @@ thiserror.workspace = true
 futures-lite.workspace = true
 stratafs-content-conformance.workspace = true
 stratafs-kv-conformance.workspace = true
+stratafs-runtime.workspace = true
 stratafs-tree.workspace = true
 tempfile = "3"
 

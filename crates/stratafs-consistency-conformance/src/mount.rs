@@ -233,7 +233,7 @@ pub(crate) struct Reference {
 impl Volume {
     pub(crate) async fn new(runtime: Arc<dyn Runtime>, history: &History) -> Self {
         Volume {
-            store: new_store().await,
+            store: new_store(Arc::clone(&runtime)).await,
             pubsub: Arc::new(MemoryVolume::new(Arc::clone(&runtime))),
             runtime,
             history: History::clone(history),

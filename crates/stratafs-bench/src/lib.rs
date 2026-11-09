@@ -220,12 +220,16 @@ impl From<&OpenVolumeError> for PosixError {
     }
 }
 
-// open_store opens the store in directory, making it first if the directory holds none.
-pub async fn open_store(directory: &Path) -> Result<Store, OpenStoreError> {
+// open_store opens the store in directory, making it first if the directory holds none. Its volumes' garbage
+// collectors run on runtime.
+pub async fn open_store(
+    directory: &Path,
+    runtime: Arc<dyn Runtime>,
+) -> Result<Store, OpenStoreError> {
     std::fs::create_dir_all(directory).map_err(OpenStoreError::Directory)?;
     let (metadata, content) = open_database(directory)?;
     let allocate_node: fn() -> u128 = rand::random;
-    let tree = Tree::new(metadata, allocate_node)
+    let tree = Tree::new(metadata, allocate_node, runtime)
         .await
         .map_err(OpenStoreError::Tree)?;
     Ok(Store { tree, content })
@@ -275,25 +279,25 @@ pub async fn open_volume(
     kernel: impl KernelCache,
     runtime: Arc<dyn Runtime>,
 ) -> Result<BenchEngine, OpenVolumeError> {
-    let store = open_store(directory).await?;
+    let store = open_store(directory, Arc::clone(&runtime)).await?;
     engine(directory, store, volume, kernel, runtime).await
 }
 
 // create_volume makes a new, empty volume in the store in directory, and returns its id.
 pub async fn create_volume(directory: &Path) -> Result<TreeVolumeId, CreateVolumeError> {
-    let store = open_store(directory).await?;
+    // No kernel caches the volume's inodes, so its pool runs only the volume's garbage collector.
+    let pool = SpawnerPool::builder()
+        .pool_size(1)
+        .create()
+        .map_err(CreateVolumeError::Pool)?;
+    let runtime: Arc<dyn Runtime> = Arc::new(ThreadPoolRuntime(pool));
+    let store = open_store(directory, Arc::clone(&runtime)).await?;
     let volume = store
         .tree
         .create()
         .await
         .map_err(CreateVolumeError::Create)?;
-    // Opening the engine makes the volume's root directory, so a mount finds it ready. No kernel caches its inodes,
-    // so its pool runs nothing.
-    let pool = SpawnerPool::builder()
-        .pool_size(1)
-        .create()
-        .map_err(CreateVolumeError::Pool)?;
-    let runtime = Arc::new(ThreadPoolRuntime(pool));
+    // Opening the engine makes the volume's root directory, so a mount finds it ready.
     engine(directory, store, volume, NoKernel, runtime).await?;
     Ok(volume)
 }

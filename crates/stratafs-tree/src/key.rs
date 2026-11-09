@@ -1,10 +1,9 @@
 use bytes::Bytes;
-use storekey::Encode;
+use storekey::{Decode, Encode};
 
 use crate::header::{JobId, NodeId, TreeVolumeId};
 
-#[derive(Encode)]
-#[cfg_attr(test, derive(storekey::Decode))]
+#[derive(Encode, Decode)]
 pub(crate) enum TreeKey {
     VolumeHeader(TreeVolumeId),
     Node(NodeId),

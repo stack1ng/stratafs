@@ -1,8 +1,10 @@
+use std::convert::Infallible;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
+use futures_channel::oneshot;
 use futures_core::future::BoxFuture;
 use smallvec::SmallVec;
 use stratafs_range_bounds_map::RangeBoundsMap;
@@ -26,6 +28,8 @@ use crate::tree::{TreeConfig, TreeConfigLimits, TreeShared};
 pub struct TreeVolume<S: KeyValueStore, A, C> {
     pub(crate) shared: Arc<TreeShared<S, A, C>>,
     pub(crate) id: TreeVolumeId,
+    // _stop_garbage_collection stops the volume's garbage collector when it is dropped
+    pub(crate) _stop_garbage_collection: oneshot::Sender<Infallible>,
 }
 
 pub struct TreeTransaction<'txn, T, S: KeyValueStore, A, C> {
@@ -119,7 +123,7 @@ pub(crate) fn with_tree_failure<R, F>(
     }
 }
 
-fn refused_write_as_failure<F, R>(
+pub(crate) fn refused_write_as_failure<F, R>(
     error: StoreError<SetRejection<R>, TreeFailure<F, R>>,
 ) -> TreeFailure<F, R> {
     match error {

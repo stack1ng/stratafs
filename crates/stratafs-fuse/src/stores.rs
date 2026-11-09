@@ -334,7 +334,7 @@ fn serve<D: Database, C: Cached<D::Store>>(
             if !directory_holds::<D>(&arguments.store)? {
                 return Err(OpenError::NoStore);
             }
-            let (tree, content) = open_tree::<D>(&arguments.store).await?;
+            let (tree, content) = open_tree::<D>(&arguments.store, Arc::clone(&runtime)).await?;
             engine::<D, C>(
                 &tree,
                 content,
@@ -352,17 +352,18 @@ fn serve<D: Database, C: Cached<D::Store>>(
 // create_volume makes a new, empty volume in the store of database D in directory, and returns its id.
 async fn create_volume<D: Database>(directory: &Path) -> Result<TreeVolumeId, OpenError> {
     std::fs::create_dir_all(directory).map_err(OpenError::Directory)?;
-    let (tree, content) = open_tree::<D>(directory).await?;
-    let volume = tree
-        .create()
-        .await
-        .map_err(|error| OpenError::Create(Box::new(error)))?;
-    // Opening the engine makes the volume's root directory, so a mount finds it ready. No kernel caches its inodes,
-    // so its pool runs nothing.
+    // No kernel caches the volume's inodes, so its pool runs only the volume's garbage collector.
     let pool = SpawnerPool::builder()
         .pool_size(1)
         .create()
         .map_err(OpenError::Runtime)?;
+    let runtime: Arc<dyn Runtime> = Arc::new(ThreadPoolRuntime(pool));
+    let (tree, content) = open_tree::<D>(directory, Arc::clone(&runtime)).await?;
+    let volume = tree
+        .create()
+        .await
+        .map_err(|error| OpenError::Create(Box::new(error)))?;
+    // Opening the engine makes the volume's root directory, so a mount finds it ready.
     let engine = engine::<D, Eventual>(
         &tree,
         content,
@@ -370,7 +371,7 @@ async fn create_volume<D: Database>(directory: &Path) -> Result<TreeVolumeId, Op
         Some(DurableAgainst::PowerFailure),
         Eventual::default(),
         NoKernel,
-        Arc::new(ThreadPoolRuntime(pool)),
+        runtime,
     )
     .await?;
     engine
@@ -391,11 +392,14 @@ fn directory_holds<D: Database>(directory: &Path) -> Result<bool, OpenError> {
 }
 
 // open_tree opens the tree and content of the store of database D in directory, making the store first if the
-// directory holds none.
-async fn open_tree<D: Database>(directory: &Path) -> Result<(StoreTree<D>, D::Content), OpenError> {
+// directory holds none. Its volumes' garbage collectors run on runtime.
+async fn open_tree<D: Database>(
+    directory: &Path,
+    runtime: Arc<dyn Runtime>,
+) -> Result<(StoreTree<D>, D::Content), OpenError> {
     let (metadata, content) = D::open(directory)?;
     let allocate_node: fn() -> u128 = rand::random;
-    let tree = Tree::new(metadata, allocate_node)
+    let tree = Tree::new(metadata, allocate_node, runtime)
         .await
         .map_err(|error| OpenError::Tree(Box::new(error)))?;
     Ok((tree, content))

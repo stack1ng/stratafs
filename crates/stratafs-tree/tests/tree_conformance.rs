@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -5,6 +6,7 @@ use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
 use stratafs_kv_conformance::runtime::{exhaustive_dfs, seeded};
 use stratafs_redb::RedbStore;
+use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::spawn::Inline;
@@ -38,6 +40,7 @@ fn new_tree<C: TreeConfig>() -> Tree<RedbStore<Inline>, impl Fn() -> u128, C> {
     block_on(Tree::new(
         RedbStore::new(database, Inline).unwrap(),
         allocate_id,
+        Arc::new(TaskDroppingRuntime),
     ))
     .unwrap()
 }

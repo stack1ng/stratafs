@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use bytes::{Buf, BytesMut};
 use futures_lite::future::block_on;
 use redb::backends::InMemoryBackend;
 use stratafs_redb::RedbStore;
+use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
@@ -68,7 +71,12 @@ fn three_level_volume() -> Volume<RedbStore<Inline>> {
         .unwrap();
     let store = RedbStore::new(database, Inline).unwrap();
     store_three_levels(&store);
-    let tree = block_on(Tree::<_, fn() -> u128, SmallConfig>::new(store, || 1)).unwrap();
+    let tree = block_on(Tree::<_, fn() -> u128, SmallConfig>::new(
+        store,
+        || 1,
+        Arc::new(TaskDroppingRuntime),
+    ))
+    .unwrap();
     block_on(tree.open(VOLUME)).unwrap()
 }
 

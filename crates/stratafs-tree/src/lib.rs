@@ -3,6 +3,7 @@ mod concatenated_bytes;
 mod descent;
 pub mod error;
 mod flush;
+mod garbage_collection;
 pub mod header;
 mod invariants;
 mod key;
