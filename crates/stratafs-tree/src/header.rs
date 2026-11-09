@@ -11,6 +11,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::serialized::CorruptValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode)]
+#[cfg_attr(test, derive(storekey::Decode))]
 pub struct TreeVolumeId(pub(crate) u128);
 
 impl From<TreeVolumeId> for Bytes {
@@ -46,6 +47,20 @@ impl SerializedShape for NodeId {
         xxh32(b"NodeId", 0),
     );
 }
+
+#[cfg(test)]
+impl<F> storekey::Decode<F> for NodeId {
+    fn decode<R: std::io::BufRead>(
+        reader: &mut storekey::Reader<R>,
+    ) -> Result<Self, storekey::DecodeError> {
+        <u128 as storekey::Decode<F>>::decode(reader).map(|id| Self(U128::new(id)))
+    }
+}
+
+// JobId tells apart the garbage collection jobs written for one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode)]
+#[cfg_attr(test, derive(storekey::Decode))]
+pub(crate) struct JobId(pub(crate) u128);
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,

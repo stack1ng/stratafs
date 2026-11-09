@@ -8,6 +8,7 @@ use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::error::TreeFailure;
+use crate::header::JobId;
 use crate::key::TreeKey;
 use crate::node::InternalEntry;
 use crate::serialized::CorruptValue;
@@ -40,6 +41,7 @@ where
 
     // apply_node_ref_deltas nets the write's changes per node, so a pointer that only moved costs nothing,
     // then applies them, reading the counts that grow together.
+    // A count that drops is left to the garbage collector, as one blind job write per node.
     pub(crate) async fn apply_node_ref_deltas(
         &mut self,
     ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
@@ -53,8 +55,18 @@ where
             }
             same
         });
-        if deltas.iter().any(|(_, delta)| *delta < 0) {
-            todo!("handle node ref decrement")
+        debug_assert!(
+            deltas.iter().all(|(_, delta)| *delta >= -1),
+            "a write changes one volume's tree, where a node has one parent or is the root"
+        );
+        for (id, _) in deltas.iter().filter(|(_, delta)| *delta < 0) {
+            let job = JobId((self.shared.id_allocator)());
+            self.inner
+                .set(
+                    Bytes::from(TreeKey::Dereference(self.volume, *id, job)),
+                    Bytes::new(),
+                )
+                .map_err(with_tree_failure)?;
         }
         deltas.retain(|(_, delta)| *delta > 0);
         if !deltas.is_empty() {

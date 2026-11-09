@@ -1,15 +1,19 @@
 use bytes::Bytes;
 use storekey::Encode;
 
-use crate::header::{NodeId, TreeVolumeId};
+use crate::header::{JobId, NodeId, TreeVolumeId};
 
 #[derive(Encode)]
+#[cfg_attr(test, derive(storekey::Decode))]
 pub(crate) enum TreeKey {
     VolumeHeader(TreeVolumeId),
     Node(NodeId),
     Config,
     // NodeRefCount is a node's count of parent pointers, where a missing count is 1
     NodeRefCount(NodeId),
+    // Dereference is a job, with an empty value, saying the node lost one parent in the volume's tree.
+    // Deleting a volume must write one for its root and drain the volume's jobs.
+    Dereference(TreeVolumeId, NodeId, JobId),
 }
 
 impl From<TreeKey> for Bytes {

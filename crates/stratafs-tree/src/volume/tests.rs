@@ -1,8 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_lite::future::block_on;
+use proptest::prelude::RngExt;
+use proptest::test_runner::{RngAlgorithm, TestRng};
 use redb::backends::InMemoryBackend;
 use stratafs_redb::{RedbFailure, RedbStore};
 use stratafs_store::forkable::ForkableKeyValueStore;
@@ -11,7 +14,9 @@ use zerocopy::little_endian::{U64, U128};
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
+use crate::header::JobId;
 use crate::invariants;
+use crate::node::Node;
 use crate::tree::Tree;
 
 struct SmallNodeConfig;
@@ -76,6 +81,17 @@ fn clear_keys(volume: &TestVolume, indexes: Range<usize>) {
             for index in indexes {
                 transaction.clear(key(index))?;
             }
+            Ok::<_, Failure>(((), transaction))
+        })
+    }))
+    .unwrap();
+}
+
+fn clear_range(volume: &TestVolume, range: Range<Bytes>) {
+    block_on(volume.transact(|mut transaction| {
+        let range = range.clone();
+        Box::pin(async move {
+            transaction.clear_range(range)?;
             Ok::<_, Failure>(((), transaction))
         })
     }))
@@ -164,6 +180,93 @@ fn stored_counts<S: KeyValueStore, A>(volume: &TreeVolume<S, A, SmallNodeConfig>
                 .map(|(_, count)| U64::read_from_bytes(&count).unwrap().get())
                 .collect();
             Ok::<_, <S::ReadTransaction<'_> as ReadKeyValueTransaction>::Failure>(counts)
+        })
+    }))
+    .unwrap()
+}
+
+// jobs are every pending job's volume and node, in key order.
+fn jobs<S: KeyValueStore, A>(
+    volume: &TreeVolume<S, A, SmallNodeConfig>,
+) -> Vec<(TreeVolumeId, NodeId)> {
+    block_on(volume.shared.store.read_transact(|transaction| {
+        Box::pin(async move {
+            let jobs: Vec<_> = transaction
+                .get_range(
+                    Bytes::from(TreeKey::Dereference(
+                        TreeVolumeId(0),
+                        NodeId(U128::new(0)),
+                        JobId(0),
+                    ))
+                        ..=Bytes::from(TreeKey::Dereference(
+                            TreeVolumeId(u128::MAX),
+                            NodeId(U128::new(u128::MAX)),
+                            JobId(u128::MAX),
+                        )),
+                    usize::MAX,
+                )
+                .await?
+                .map(|(key, value)| {
+                    assert!(value.is_empty());
+                    match storekey::decode(&key[..]).unwrap() {
+                        TreeKey::Dereference(volume, node, _) => (volume, node),
+                        _ => unreachable!("the range holds only jobs"),
+                    }
+                })
+                .collect();
+            Ok::<_, <S::ReadTransaction<'_> as ReadKeyValueTransaction>::Failure>(jobs)
+        })
+    }))
+    .unwrap()
+}
+
+// tree_parents maps every node in the volume's tree to its parent, where the root has none.
+fn tree_parents<S: KeyValueStore, A>(
+    volume: &TreeVolume<S, A, SmallNodeConfig>,
+) -> HashMap<u128, Option<u128>> {
+    let volume_id = volume.id;
+    block_on(volume.shared.store.read_transact(|transaction| {
+        Box::pin(async move {
+            let header = transaction
+                .get(TreeKey::VolumeHeader(volume_id).into())
+                .await?
+                .unwrap();
+            let root = VolumeHeader::view(&header).unwrap().root;
+            let mut parents = HashMap::from([(root.0.get(), None)]);
+            let mut unvisited = vec![root];
+            while let Some(id) = unvisited.pop() {
+                let stored = transaction.get(TreeKey::Node(id).into()).await?.unwrap();
+                if let (_, Node::Internal(entries)) = Node::<Bytes, u8>::read(stored).unwrap() {
+                    for index in 0..entries.len() {
+                        let child = entries.get(index).unwrap().unwrap().child;
+                        parents.insert(child.0.get(), Some(id.0.get()));
+                        unvisited.push(child);
+                    }
+                }
+            }
+            Ok::<_, <S::ReadTransaction<'_> as ReadKeyValueTransaction>::Failure>(parents)
+        })
+    }))
+    .unwrap()
+}
+
+// stored_nodes are the ids of every node the store holds.
+fn stored_nodes<S: KeyValueStore, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> HashSet<u128> {
+    block_on(volume.shared.store.read_transact(|transaction| {
+        Box::pin(async move {
+            let nodes: HashSet<_> = transaction
+                .get_range(
+                    Bytes::from(TreeKey::Node(NodeId(U128::new(0))))
+                        ..=Bytes::from(TreeKey::Node(NodeId(U128::new(u128::MAX)))),
+                    usize::MAX,
+                )
+                .await?
+                .map(|(key, _)| match storekey::decode(&key[..]).unwrap() {
+                    TreeKey::Node(id) => id.0.get(),
+                    _ => unreachable!("the range holds only nodes"),
+                })
+                .collect();
+            Ok::<_, <S::ReadTransaction<'_> as ReadKeyValueTransaction>::Failure>(nodes)
         })
     }))
     .unwrap()
@@ -272,6 +375,170 @@ fn the_check_catches_a_count_on_a_node_no_tree_reaches() {
                 U64::new(2).as_bytes(),
             )?;
             Ok::<_, StoreError<SetRejection<Infallible>, RedbFailure>>(((), transaction))
+        })
+    }))
+    .unwrap();
+    assert!(!counts_match_parents(&volume));
+}
+
+#[test]
+fn a_range_clear_writes_one_job_for_each_subtree_it_cuts_off() {
+    let tree = new_tree();
+    let volume = new_volume(&tree);
+    set_keys(&volume, 0..KEY_COUNT);
+    assert!(depth(&volume) >= 3);
+    let before = tree_parents(&volume);
+    clear_range(&volume, Bytes::from("key/0040")..Bytes::from("key/0360"));
+    let after = tree_parents(&volume);
+    let stored = stored_nodes(&volume);
+    // a cut off node left the tree but is still stored, and only the top of each cut off subtree lost its parent
+    let cut_off = |id: &u128| !after.contains_key(id) && stored.contains(id);
+    let mut expected: Vec<_> = before
+        .iter()
+        .filter(|(id, parent)| cut_off(id) && !parent.is_some_and(|parent| cut_off(&parent)))
+        .map(|(id, _)| (volume.id, NodeId(U128::new(*id))))
+        .collect();
+    expected.sort_by_key(|(_, id)| id.0.get());
+    assert!(!expected.is_empty());
+    assert_eq!(jobs(&volume), expected);
+    assert!(counts_match_parents(&volume));
+}
+
+#[test]
+fn a_write_after_a_fork_writes_one_job_for_the_shared_root_in_the_writing_volume() {
+    let tree = new_tree();
+    let volume = new_volume(&tree);
+    set_keys(&volume, 0..KEY_COUNT);
+    assert!(depth(&volume) >= 2);
+    let shared_root = root(&volume);
+    let forked = block_on(tree.open(fork(&volume))).unwrap();
+    set_keys(&forked, 0..1);
+    assert_eq!(jobs(&volume), [(forked.id, shared_root)]);
+    assert!(counts_match_parents(&volume));
+    set_keys(&volume, 0..1);
+    assert_eq!(
+        jobs(&volume),
+        [(volume.id, shared_root), (forked.id, shared_root)]
+    );
+    assert!(counts_match_parents(&volume));
+}
+
+#[test]
+fn a_root_move_in_a_fork_writes_one_job_for_the_old_root() {
+    let tree = new_tree();
+    let shrinking = new_volume(&tree);
+    set_keys(&shrinking, 0..KEY_COUNT);
+    assert!(depth(&shrinking) >= 3);
+    let tall_root = root(&shrinking);
+    let shrunk = block_on(tree.open(fork(&shrinking))).unwrap();
+    clear_keys(&shrunk, 0..KEY_COUNT);
+    assert_eq!(depth(&shrunk), 0);
+    assert_eq!(jobs(&shrunk), [(shrunk.id, tall_root)]);
+    assert!(counts_match_parents(&shrunk));
+
+    let growing = new_volume(&tree);
+    let leaf_root = root(&growing);
+    let grown = block_on(tree.open(fork(&growing))).unwrap();
+    set_keys(&grown, 0..KEY_COUNT);
+    assert!(depth(&grown) >= 3);
+    assert_eq!(
+        jobs(&grown),
+        [(shrunk.id, tall_root), (grown.id, leaf_root)]
+    );
+    assert!(counts_match_parents(&grown));
+}
+
+#[test]
+fn counts_match_parents_with_pending_jobs_after_random_forks_writes_and_clears() {
+    let tree = new_tree();
+    let mut volumes = vec![new_volume(&tree)];
+    let mut rng = TestRng::deterministic_rng(RngAlgorithm::ChaCha);
+    for _ in 0..300 {
+        let index = rng.random_range(0..volumes.len());
+        let volume = &volumes[index];
+        let start = rng.random_range(0..KEY_COUNT);
+        let end = rng.random_range(start + 1..=KEY_COUNT.min(start + 80));
+        match rng.random_range(0..4) {
+            0 if volumes.len() < 8 => {
+                let forked = block_on(tree.open(fork(volume))).unwrap();
+                volumes.push(forked);
+            }
+            0 | 1 => set_keys(volume, start..end),
+            2 => clear_keys(volume, start..end),
+            _ => clear_range(
+                volume,
+                Bytes::from(format!("key/{start:04}"))..Bytes::from(format!("key/{end:04}")),
+            ),
+        }
+        assert!(counts_match_parents(&volumes[index]));
+    }
+    assert!(!jobs(&volumes[0]).is_empty());
+}
+
+#[test]
+fn the_check_catches_a_job_on_a_node_that_lost_no_parent() {
+    let tree = new_tree();
+    let volume = new_volume(&tree);
+    fork(&volume);
+    let root = root(&volume);
+    let volume_id = volume.id;
+    block_on(volume.shared.store.transact(|mut transaction| {
+        Box::pin(async move {
+            transaction.set(
+                TreeKey::Dereference(volume_id, root, JobId(u128::MAX)).into(),
+                Bytes::new(),
+            )?;
+            Ok::<_, StoreError<SetRejection<Infallible>, RedbFailure>>(((), transaction))
+        })
+    }))
+    .unwrap();
+    assert!(!counts_match_parents(&volume));
+}
+
+#[test]
+fn the_check_catches_a_missing_job_on_a_cut_off_subtree() {
+    let tree = new_tree();
+    let volume = new_volume(&tree);
+    set_keys(&volume, 0..KEY_COUNT);
+    clear_range(&volume, Bytes::from("key/0040")..Bytes::from("key/0360"));
+    assert!(counts_match_parents(&volume));
+    block_on(volume.shared.store.transact(|mut transaction| {
+        Box::pin(async move {
+            let (first, _) = transaction
+                .get_range(
+                    Bytes::from(TreeKey::Dereference(
+                        TreeVolumeId(0),
+                        NodeId(U128::new(0)),
+                        JobId(0),
+                    ))
+                        ..=Bytes::from(TreeKey::Dereference(
+                            TreeVolumeId(u128::MAX),
+                            NodeId(U128::new(u128::MAX)),
+                            JobId(u128::MAX),
+                        )),
+                    1,
+                )
+                .await?
+                .next()
+                .unwrap();
+            transaction.clear(first)?;
+            Ok::<_, RedbFailure>(((), transaction))
+        })
+    }))
+    .unwrap();
+    assert!(!counts_match_parents(&volume));
+}
+
+#[test]
+fn the_check_catches_a_lost_header() {
+    let tree = new_tree();
+    let volume = new_volume(&tree);
+    set_keys(&volume, 0..KEY_COUNT);
+    let volume_id = volume.id;
+    block_on(volume.shared.store.transact(|mut transaction| {
+        Box::pin(async move {
+            transaction.clear(TreeKey::VolumeHeader(volume_id).into())?;
+            Ok::<_, RedbFailure>(((), transaction))
         })
     }))
     .unwrap();
