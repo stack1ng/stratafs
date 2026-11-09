@@ -44,6 +44,7 @@ StrataFS itself has these open gaps, on macOS and Linux alike:
 - A file open on one mount is deleted as soon as another mount unlinks it, so later reads, writes and fstat on the open
   descriptor fail with ESTALE: the mount that unlinks it deletes it once its own kernel lets go of it, and nothing
   records the opens other mounts hold.
+- A commit whose process dies before it appends its change record wakes no watch in other processes.
 
 StrataFS is completely written in Rust for maximum performance and portability. Strata can be used on Linux, macOS, and even WebAssembly.
 

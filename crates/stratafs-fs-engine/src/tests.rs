@@ -118,6 +118,7 @@ impl Cached<InMemoryStore> for Scripted {
         _: &Mount<InMemoryStore>,
         _: &[(Inode, Attributes)],
         (): &(),
+        _: u64,
         _: PurgeWaits,
     ) -> Result<(), HoldFailed> {
         Ok(())

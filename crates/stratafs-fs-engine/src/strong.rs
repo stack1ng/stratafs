@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use event_listener::Event;
 use futures_core::future::BoxFuture;
-use futures_util::future::{AbortHandle, Abortable, join_all, select};
+use futures_util::FutureExt;
+use futures_util::future::{AbortHandle, Abortable, join_all, select_all};
 use stratafs_pubsub::{Key, PubSub, PubSubError};
 use stratafs_runtime::Runtime;
 use stratafs_store::error::StoreError;
@@ -45,9 +46,6 @@ const PURGE_RETRY_MOST: Duration = Duration::from_secs(1);
 // LATE_READS_WAIT is how long after a round asks the kernel a read begun since waits for the round to end instead of
 // making it invalidate again.
 const LATE_READS_WAIT: Duration = Duration::from_millis(3);
-
-// RECHECK is how often a read waiting on a write in flight it may have missed reads again.
-const RECHECK: Duration = Duration::from_millis(5);
 
 // StrongUntilDisconnectCached serves reads from a cache, which forces any write to verify that all other
 // StrongUntilDisconnectCached clients have been invalidated before it can return. A client that disconnects
@@ -92,6 +90,7 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
                 watching: Mutex::new(None),
                 changed: Event::new(),
                 clock: AtomicU64::new(1),
+                woken: AtomicU64::new(0),
             }),
         }
     }
@@ -122,6 +121,8 @@ pub enum StrongFailure<F, R, M> {
          the kernel may hold back while this write is in flight"
     )]
     Contended,
+    #[error("watching the store for the end of a write in flight failed")]
+    Watch(#[source] M),
 }
 
 // A write another write in flight holds back is busy; every other failure is an I/O error.
@@ -137,7 +138,8 @@ impl<F, R, M> From<&StrongFailure<F, R, M>> for PosixError {
             | StrongFailure::Pending(_)
             | StrongFailure::Overtaken
             | StrongFailure::Purging
-            | StrongFailure::Uninvalidated(_) => PosixError::EIO,
+            | StrongFailure::Uninvalidated(_)
+            | StrongFailure::Watch(_) => PosixError::EIO,
         }
     }
 }
@@ -186,6 +188,8 @@ struct State<P: PubSub> {
     changed: Event,
     // clock numbers holds as they start and reads as they begin, so a read can tell a hold made after it began.
     clock: AtomicU64,
+    // woken is the clock at the latest wake, so a read can tell the state changed after it began.
+    woken: AtomicU64,
 }
 
 struct Inner<P: PubSub> {
@@ -293,6 +297,8 @@ impl<P: PubSub> State<P> {
     }
 
     fn wake(&self) {
+        let now = self.clock.fetch_add(1, Ordering::SeqCst);
+        self.woken.fetch_max(now, Ordering::SeqCst);
         self.changed.notify(usize::MAX);
     }
 }
@@ -779,7 +785,8 @@ impl<P: PubSub<Message = u64>> StrongUntilDisconnectCached<P> {
             if contended(&mut self.state.lock(), &inodes, purge_waits, &*mount.kernel) {
                 return Err(StrongFailure::Contended);
             }
-            Cached::<St>::settled(self, mount, &in_flight, &pending, purge_waits).await?;
+            let ticket = Cached::<St>::reading(self);
+            Cached::<St>::settled(self, mount, &in_flight, &pending, ticket, purge_waits).await?;
             let (stored, stored_pending) = self.stored(mount, &inodes).await?;
             in_flight = in_flight
                 .into_iter()
@@ -1190,7 +1197,11 @@ async fn handled<P: PubSub>(
         };
         match round {
             Round::Acknowledged | Round::Gone => break,
-            Round::Again => again = true,
+            // The round's end lets a late read waiting on it go on.
+            Round::Again => {
+                again = true;
+                state.wake();
+            }
             // A write of this mount committed a change to the inode and has yet to hand it over, which it does
             // without waiting on this delivery, so the delivery invalidates again once it has.
             Round::Replying => {
@@ -1694,15 +1705,27 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         )
     }
 
+    // settled waits for a change to this mount's state since ticket, the end of a write in flight a read shows or
+    // is behind, or the deadline of a wait that ends by time alone: settling a write whose writer is gone, or a round
+    // a late read waits for.
     async fn settled(
         &self,
         mount: &Mount<St>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
+        ticket: u64,
         purge_waits: PurgeWaits,
     ) -> Result<(), Self::Failure> {
         let listener = self.state.changed.listen();
+        if no_room(purge_waits, &*mount.kernel) && handling_delivery(&self.state.lock()) {
+            return Err(StrongFailure::Contended);
+        }
+        if self.state.woken.load(Ordering::SeqCst) > ticket {
+            return Ok(());
+        }
         let mut stale = HashMap::new();
+        let mut deadline: Option<Instant> = None;
+        let mut watched = Vec::new();
         {
             let mut inner = self.state.lock();
             // A write in flight not met again for twice the wait is long over, settled by some read or by its writer.
@@ -1710,18 +1733,30 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
             let now = mount.runtime.now();
             inner.seen.retain(|_, first| now - *first < waits * 2);
             for (inode, read) in reads {
-                let Some(version) = pending
+                let version = pending
                     .get(inode)
-                    .filter(|version| live(read, Some(version)))
-                else {
-                    continue;
-                };
-                let first = *inner
-                    .seen
-                    .entry((*inode, version.mount, version.number))
-                    .or_insert(now);
-                if now - first > waits {
-                    stale.insert(*inode, *version);
+                    .filter(|version| live(read, Some(version)));
+                if let Some(version) = version {
+                    let first = *inner
+                        .seen
+                        .entry((*inode, version.mount, version.number))
+                        .or_insert(now);
+                    if now - first >= waits {
+                        stale.insert(*inode, *version);
+                    }
+                    deadline = Some(deadline.map_or(first + waits, |at| at.min(first + waits)));
+                }
+                let hold = inner.held(*inode);
+                // A late read waits for the round at most LATE_READS_WAIT, which may have passed since it was handled.
+                if matches!(purge_waits, PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode)
+                    && let Some(asked) = hold.as_ref().and_then(|hold| hold.asked_at)
+                {
+                    let ended = asked + LATE_READS_WAIT;
+                    deadline = Some(deadline.map_or(ended, |at| at.min(ended)));
+                }
+                let behind = hold.is_some_and(|hold| read.change_version.number < hold.confirmed);
+                if version.is_some() || behind {
+                    watched.push((*inode, read));
                 }
             }
         }
@@ -1740,11 +1775,23 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St> for StrongUntilDisconnectCa
         if !lost.is_empty() {
             return self.hold(mount, &lost, 0).await.map(|_| ());
         }
-        if no_room(purge_waits, &*mount.kernel) && handling_delivery(&self.state.lock()) {
-            return Err(StrongFailure::Contended);
+        // A write ends by committing or being settled, which moves the inode's attributes and clears its pending
+        // change version.
+        let metadata = mount.store.metadata();
+        let mut ends: Vec<BoxFuture<'_, Result<(), MetadataFailure<St>>>> =
+            vec![Box::pin(listener.map(Ok))];
+        if let Some(deadline) = deadline {
+            ends.push(Box::pin(mount.runtime.sleep_until(deadline).map(Ok)));
         }
-        let _ = select(listener, mount.runtime.sleep(RECHECK)).await;
-        Ok(())
+        for (inode, read) in watched {
+            let key = FsKey::new_attributes(inode).into();
+            ends.push(Box::pin(metadata.changed(key, Some(Bytes::from(read)))));
+            let seen = pending.get(&inode).map(Bytes::from);
+            let key = FsKey::new_pending_change_version(inode).into();
+            ends.push(Box::pin(metadata.changed(key, seen)));
+        }
+        let (ended, _, _) = select_all(ends).await;
+        ended.map_err(StrongFailure::Watch)
     }
 
     async fn reread(

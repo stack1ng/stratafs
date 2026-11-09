@@ -143,6 +143,51 @@ fn new_file_another_mount_writes(engine: &StrongEngine) -> Inode {
     inode
 }
 
+// end_other_mounts_write commits the write new_file_another_mount_writes left in flight on inode.
+fn end_other_mounts_write(engine: &StrongEngine, inode: Inode) {
+    let committed: Result<(), Settled<InMemoryStore>> =
+        block_on(engine.mount.store.metadata().transact(|mut metadata| {
+            Box::pin(async move {
+                let mut attributes = read_attributes(&*metadata, inode)
+                    .await
+                    .map_err(StoreWork::Read)?
+                    .expect("the file exists");
+                attributes.change_version = attributes.change_version.after(OTHER_MOUNT);
+                metadata
+                    .set(
+                        FsKey::new_attributes(inode).into(),
+                        Bytes::from(&attributes),
+                    )
+                    .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
+                metadata
+                    .clear(FsKey::new_pending_change_version(inode).into())
+                    .map_err(|failure| StoreWork::Write(StoreError::Failed(failure)))?;
+                Ok(((), metadata))
+            })
+        }));
+    committed.unwrap();
+}
+
+// getattr reads inode's attributes as an operation no purge waits for, which waits on any write in flight it shows.
+async fn getattr(engine: &StrongEngine, inode: Inode) -> Result<Attributes, Failed> {
+    let served = engine.serve(
+        PurgeWaits::No,
+        false,
+        |txn| {
+            Box::pin(async move {
+                let found = txn.getattr(inode).await;
+                found.map(|found| (found, txn))
+            })
+        },
+        |found| found.iter().map(|found| (inode, found.clone())).collect(),
+        |found, _, result_handling| {
+            (result_handling() == ResultHandling::Cache).then(|| found.clone())
+        },
+    );
+    let found = served.await.map_err(consistency_failure)?;
+    Ok(found.expect("the file exists"))
+}
+
 // start_delivery has the mount handle a delivery of inode, which it holds, that never ends.
 fn start_delivery(engine: &StrongEngine, inode: Inode) {
     let state = &engine.consistency().state;
@@ -203,14 +248,17 @@ fn with_no_room_a_write_any_purge_waits_for_waits_on_another_mounts_write_while_
     let strong = engine.consistency();
     let (stored, pending) = block_on(strong.stored(&engine.mount, &[inode])).unwrap();
     let in_flight = [(inode, stored[0].clone().expect("the file exists"))];
+    let ticket = Cached::<InMemoryStore>::reading(strong);
     let mut settled = pin!(Cached::<InMemoryStore>::settled(
         strong,
         &engine.mount,
         &in_flight,
         &pending,
+        ticket,
         PurgeWaits::OfAnyInode,
     ));
     assert!(block_on(poll_once(settled.as_mut())).is_none());
+    strong.state.wake();
     block_on(settled).expect("the write waits");
 }
 
@@ -333,4 +381,67 @@ fn with_no_room_a_write_any_purge_waits_for_waiting_on_a_claim_fails_once_a_deli
     start_delivery(&engine, Inode::ROOT);
     let unclaimed = block_on(poll_once(unclaimed.as_mut()));
     assert!(matches!(unclaimed, Some(Err(StrongFailure::Contended))));
+}
+
+#[test]
+fn a_read_waiting_on_another_mounts_write_wakes_at_its_commit() {
+    let engine = strong_engine();
+    let inode = new_file_another_mount_writes(&engine);
+    let began = engine.mount.runtime.now();
+    let mut read = pin!(getattr(&engine, inode));
+    assert!(block_on(poll_once(read.as_mut())).is_none());
+    // It waits having met the write in flight.
+    assert!(!engine.consistency().state.lock().seen.is_empty());
+    end_other_mounts_write(&engine, inode);
+    let read = block_on(read).expect("the read waits and goes on");
+    assert_eq!(read.change_version.mount, OTHER_MOUNT);
+    // Well before the other mount's writer would be taken for gone.
+    assert!(engine.mount.runtime.now() - began < TIMEOUT + SETTLE_MARGIN);
+}
+
+#[test]
+fn a_read_waiting_on_a_write_whose_writer_is_gone_settles_it_at_its_deadline() {
+    let engine = strong_engine();
+    let inode = new_file_another_mount_writes(&engine);
+    let began = engine.mount.runtime.now();
+    let read = block_on(getattr(&engine, inode)).expect("the read settles the write and goes on");
+    assert!(engine.mount.runtime.now() - began >= TIMEOUT + SETTLE_MARGIN);
+    assert_eq!(read.change_version.mount, OTHER_MOUNT);
+    let (_, pending) = block_on(engine.consistency().stored(&engine.mount, &[inode])).unwrap();
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn a_late_read_settling_after_its_wait_is_over_goes_on() {
+    let engine = strong_engine();
+    let inode = new_file(&engine);
+    block_on(getattr(&engine, inode)).expect("the read holds the inode");
+    let strong = engine.consistency();
+    // A delivery whose round asked the kernel longer ago than a late read waits for it, and has not ended.
+    let asked_at = engine.mount.runtime.now() - LATE_READS_WAIT;
+    {
+        let mut inner = strong.state.lock();
+        let hold = inner.held(inode).expect("the mount holds the inode");
+        hold.pending += 1;
+        hold.asked += 1;
+        hold.asked_at = Some(asked_at);
+    }
+    let (stored, pending) = block_on(strong.stored(&engine.mount, &[inode])).unwrap();
+    let reads = [(inode, stored[0].clone().expect("the file exists"))];
+    let ticket = Cached::<InMemoryStore>::reading(strong);
+    let settled = Cached::<InMemoryStore>::settled(
+        strong,
+        &engine.mount,
+        &reads,
+        &pending,
+        ticket,
+        PurgeWaits::OfOwnInode,
+    );
+    let settled = block_on(
+        engine
+            .mount
+            .runtime
+            .timeout(TIMEOUT + SETTLE_MARGIN, settled),
+    );
+    assert!(matches!(settled, Some(Ok(()))));
 }

@@ -68,7 +68,7 @@ type Content = stratafs_mdbx::MdbxContent<ThreadPool>;
 #[cfg(store = "redb")]
 type DatabaseError = redb::Error;
 #[cfg(store = "sqlite")]
-type DatabaseError = MetadataFailure;
+type DatabaseError = stratafs_sqlite::SqliteOpenError;
 #[cfg(store = "mdbx")]
 type DatabaseError = stratafs_mdbx::MdbxOpenError;
 

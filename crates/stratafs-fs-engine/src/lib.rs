@@ -183,12 +183,14 @@ pub trait Cached<St: Store>: Consistency {
         ticket: Self::Ticket,
     ) -> ResultHandling;
 
-    // settled resolves once reads handled with Retry, by an operation of purge_waits, are worth taking again.
+    // settled resolves once reads handled with Retry, taken since ticket by an operation of purge_waits, are worth
+    // taking again.
     fn settled(
         &self,
         mount: &Mount<St>,
         reads: &[(Inode, Attributes)],
         state: &Self::InodeState,
+        ticket: Self::Ticket,
         purge_waits: PurgeWaits,
     ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 
@@ -479,9 +481,11 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                     Some(replied) => break Ok(self.handed(&read, cached.into_inner(), replied)),
                     None => {
                         at_once = false;
-                        if let Err(failure) = self.settled(&read, &state, purge_waits).await {
+                        if let Err(failure) = self.settled(&read, &state, ticket, purge_waits).await
+                        {
                             break Err(failure);
                         }
+                        ticket = self.consistency.reading();
                     }
                 }
             };
@@ -684,7 +688,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                 match hand(&result, &read, &result_handling) {
                     Some(replied) => return Ok(self.handed(&read, cached.into_inner(), replied)),
                     None => self
-                        .settled(&read, &state, purge_waits)
+                        .settled(&read, &state, ticket, purge_waits)
                         .await
                         .map_err(consistency_failed)?,
                 }
@@ -722,7 +726,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                 match hand(&result, &read, &result_handling) {
                     Some(replied) => return Ok(replied),
                     None => self
-                        .settled(&read, &state, PurgeWaits::Unknown)
+                        .settled(&read, &state, ticket, PurgeWaits::Unknown)
                         .await
                         .map_err(consistency_failed)?,
                 }
@@ -805,16 +809,17 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         replied
     }
 
-    // settled resolves once reads the consistency handled with Retry, of state, by an operation of purge_waits, are
-    // worth taking again.
+    // settled resolves once reads the consistency handled with Retry, of state, taken since ticket by an operation of
+    // purge_waits, are worth taking again.
     fn settled<'a>(
         &'a self,
         reads: &'a [(Inode, Attributes)],
         state: &'a C::InodeState,
+        ticket: C::Ticket,
         purge_waits: PurgeWaits,
     ) -> impl Future<Output = Result<(), C::Failure>> + Send + 'a {
         self.consistency
-            .settled(&self.mount, reads, state, purge_waits)
+            .settled(&self.mount, reads, state, ticket, purge_waits)
     }
 
     // cached tells the consistency the kernel caches inode as seen, for a reply serve did not hand over.

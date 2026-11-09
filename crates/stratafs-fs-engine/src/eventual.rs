@@ -190,6 +190,7 @@ impl<St: Store> Cached<St> for Eventual {
         _: &Mount<St>,
         _: &[(Inode, Attributes)],
         (): &(),
+        _: u64,
         _: PurgeWaits,
     ) -> Result<(), Infallible> {
         Ok(())

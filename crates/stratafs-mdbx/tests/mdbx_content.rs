@@ -4,6 +4,7 @@ mod configuration;
 use std::convert::Infallible;
 
 use bytes::{Buf, Bytes};
+use common::Stores;
 use futures_lite::future::block_on;
 use stratafs_mdbx::MdbxContent;
 use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
@@ -28,28 +29,28 @@ fn read(content: &MdbxContent<Inline>, hash: &ContentHash, start: usize, end: us
 
 #[test]
 fn stores_content_under_its_hash() {
-    stratafs_content_conformance::stores_content_under_its_hash(|| {
-        MdbxContent::of(&common::open_store())
-    });
+    let stores = Stores::new();
+    stratafs_content_conformance::stores_content_under_its_hash(|| MdbxContent::of(&stores.open()));
 }
 
 #[test]
 fn reads_ranges() {
-    stratafs_content_conformance::reads_ranges(|| MdbxContent::of(&common::open_store()));
+    let stores = Stores::new();
+    stratafs_content_conformance::reads_ranges(|| MdbxContent::of(&stores.open()));
 }
 
 #[test]
 fn rejects_ranges_beyond_the_content() {
+    let stores = Stores::new();
     stratafs_content_conformance::rejects_ranges_beyond_the_content(|| {
-        MdbxContent::of(&common::open_store())
+        MdbxContent::of(&stores.open())
     });
 }
 
 #[test]
 fn rejects_unknown_content() {
-    stratafs_content_conformance::rejects_unknown_content(
-        || MdbxContent::of(&common::open_store()),
-    );
+    let stores = Stores::new();
+    stratafs_content_conformance::rejects_unknown_content(|| MdbxContent::of(&stores.open()));
 }
 
 #[test]

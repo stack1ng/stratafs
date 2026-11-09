@@ -422,7 +422,7 @@ fn an_append_lands_at_the_end_another_mount_moved() {
 const CONVERGES_WITHIN: Duration = Duration::from_secs(1);
 
 // two_eventual_mounts has two daemons mount one volume of database eventually consistent, and checks that each sees
-// the other's changes to what it caches. It fails for now: a store's change watch sees only its own process's commits.
+// the other's changes to what it caches.
 fn two_eventual_mounts(database: &str) {
     let store = Store::new(database, "eventual", None);
     let (first, second) = (store.mount(), store.mount());

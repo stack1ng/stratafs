@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::{CStr, CString, c_int};
 use std::future::poll_fn;
+use std::io;
 use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -82,6 +83,14 @@ const CONTENT_END: &str =
 const CHUNK_ROW: &str = "SELECT rowid FROM content WHERE hash = ?1 AND chunk = ?2";
 const PUT_CHUNK: &str = "INSERT INTO content (hash, chunk, data) VALUES (?1, ?2, ?3)";
 
+#[derive(Debug, thiserror::Error)]
+pub enum SqliteOpenError {
+    #[error("the store's change log could not be opened")]
+    ChangeLog(#[source] io::Error),
+    #[error(transparent)]
+    Failed(#[from] rusqlite::Error),
+}
+
 // SqliteStore keeps a file system's metadata and its content in one SQLite database, so the write ahead log orders
 // every commit of either.
 pub struct SqliteStore<M, S> {
@@ -111,6 +120,7 @@ struct Database<S> {
     syncer: Arc<Mutex<Syncer>>,
     // syncs_started is how many syncs ensure_durable started.
     syncs_started: AtomicU64,
+    // notify wakes the watches of this store and of other stores of the file.
     notify: KeyedNotify,
     spawner: S,
 }
@@ -185,7 +195,7 @@ impl<S> SqliteMetadata<S> {
         vfs: &CStr,
         checkpoint_pages: u32,
         spawner: S,
-    ) -> rusqlite::Result<Self> {
+    ) -> Result<Self, SqliteOpenError> {
         let location = Location {
             path: path.as_ref().to_owned(),
             vfs: vfs.to_owned(),
@@ -211,6 +221,8 @@ impl<S> SqliteMetadata<S> {
             against_software_failure: None,
             against_power_failure: None,
         };
+        let changes_directory = path.as_ref().with_added_extension("changes");
+        let notify = KeyedNotify::shared(&changes_directory).map_err(SqliteOpenError::ChangeLog)?;
         Ok(Self(Arc::new(Database {
             location,
             checkpoint_pages,
@@ -225,14 +237,14 @@ impl<S> SqliteMetadata<S> {
             idle_readers: std::sync::Mutex::new(Vec::new()),
             syncer: Arc::new(Mutex::new(syncer)),
             syncs_started: AtomicU64::new(0),
-            notify: KeyedNotify::new(),
+            notify,
             spawner,
         })))
     }
 
     // local keeps the store in a database file at path on this machine's disk, syncing it with the call each
     // failure needs.
-    pub fn local(path: impl AsRef<Path>, spawner: S) -> rusqlite::Result<Self> {
+    pub fn local(path: impl AsRef<Path>, spawner: S) -> Result<Self, SqliteOpenError> {
         Self::new(path, vfs::local_disk()?, CHECKPOINT_PAGES, spawner)
     }
 }

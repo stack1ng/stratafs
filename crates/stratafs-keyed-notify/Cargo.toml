@@ -8,6 +8,14 @@ license.workspace = true
 [dependencies]
 bytes.workspace = true
 event-listener.workspace = true
+rand.workspace = true
+stratafs-lossy-log.workspace = true
+tracing.workspace = true
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+tempfile = "3"

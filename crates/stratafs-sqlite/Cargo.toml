@@ -12,6 +12,7 @@ futures-core.workspace = true
 rusqlite = { version = "0.41.0", default-features = false, features = ["blob", "bundled", "cache", "fallible_uint", "hooks"] }
 stratafs-keyed-notify.workspace = true
 stratafs-store.workspace = true
+thiserror.workspace = true
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 nix.workspace = true

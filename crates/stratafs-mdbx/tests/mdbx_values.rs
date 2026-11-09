@@ -9,7 +9,8 @@ use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransac
 
 #[test]
 fn a_value_reads_back_whole_from_one_chunk_or_several() {
-    let store = common::open_store();
+    let stores = common::Stores::new();
+    let store = stores.open();
     block_on(store.transact(|mut transaction| {
         Box::pin(async move {
             transaction
@@ -51,7 +52,8 @@ fn a_value_reads_back_whole_from_one_chunk_or_several() {
 
 #[test]
 fn a_set_consumes_its_value_from_one_chunk_or_several() {
-    let store = common::open_store();
+    let stores = common::Stores::new();
+    let store = stores.open();
     let remaining = block_on(store.transact(|mut transaction| {
         Box::pin(async move {
             let mut one_chunk = Bytes::from_static(b"value");

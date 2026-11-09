@@ -1,6 +1,7 @@
 use futures_lite::future::yield_now;
 use stratafs_mdbx::MdbxMetadata;
 use stratafs_store::spawn::SpawnBlocking;
+use tempfile::TempDir;
 
 use crate::configuration;
 
@@ -20,9 +21,17 @@ impl SpawnBlocking for SimulatedThreadPool {
     }
 }
 
-// open_store opens a store in a fresh directory, and removes the directory at once:
-// the store keeps its files open, and they go when it closes.
-pub fn open_store() -> MdbxMetadata<SimulatedThreadPool> {
-    let directory = tempfile::tempdir().unwrap();
-    configuration::open(directory.path().join("store.mdbx"), SimulatedThreadPool).unwrap()
+// Stores is a temporary directory that gives each store opened in it a fresh directory of its own. They last as long
+// as Stores, since a store whose change log is removed reads Gaps, which wake its watches from outside a simulation.
+pub struct Stores(TempDir);
+
+impl Stores {
+    pub fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+
+    pub fn open(&self) -> MdbxMetadata<SimulatedThreadPool> {
+        let directory = tempfile::tempdir_in(self.0.path()).unwrap().keep();
+        configuration::open(directory.join("store.mdbx"), SimulatedThreadPool).unwrap()
+    }
 }

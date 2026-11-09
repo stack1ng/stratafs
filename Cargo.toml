@@ -32,6 +32,7 @@ futures-timer = "3"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 fuser = "0.18"
 hex = "0.4"
+inotify = { version = "0.11", default-features = false }
 libc = "0.2"
 mimalloc = "0.1.52"
 nix = { version = "0.31", default-features = false, features = ["fs"] }
@@ -57,6 +58,7 @@ stratafs-fskit = { path = "crates/stratafs-fskit" }
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
 stratafs-lock-synchronized = { path = "crates/stratafs-lock-synchronized" }
+stratafs-lossy-log = { path = "crates/stratafs-lossy-log" }
 stratafs-mdbx = { path = "crates/stratafs-mdbx" }
 stratafs-object-store = { path = "crates/stratafs-object-store" }
 stratafs-pubsub = { path = "crates/stratafs-pubsub" }

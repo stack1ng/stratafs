@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ffi::{CString, NulError, c_int};
+use std::io;
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -41,6 +42,8 @@ pub enum MdbxOpenError {
     Path(#[from] NulError),
     #[error("the store's file has pages too small for the largest entry the store accepts")]
     PagesTooSmall,
+    #[error("the store's change log could not be opened")]
+    ChangeLog(#[source] io::Error),
     #[error(transparent)]
     Failed(#[from] MdbxFailure),
 }
@@ -90,6 +93,7 @@ struct Database<S> {
     // pending is the content put since a commit last wrote it. Every commit writes it ahead of its own writes, so no
     // commit names content that it or an earlier commit did not write.
     pending: std::sync::Mutex<HashMap<ContentHash, Bytes>>,
+    // notify wakes the watches of this store and of other stores of the file.
     notify: KeyedNotify,
     spawner: S,
 }
@@ -123,6 +127,7 @@ impl<S> MdbxMetadata<S> {
         configuration: &MdbxConfiguration<'_>,
         spawner: S,
     ) -> Result<Self, MdbxOpenError> {
+        let changes_directory = path.as_ref().with_added_extension("changes");
         let path = CString::new(path.as_ref().as_os_str().as_bytes())?;
         Ok(Self(Arc::new(Database {
             environment: Arc::new(Environment::open(&path, configuration)?),
@@ -131,7 +136,7 @@ impl<S> MdbxMetadata<S> {
                 durable: None,
             }),
             pending: std::sync::Mutex::new(HashMap::new()),
-            notify: KeyedNotify::new(),
+            notify: KeyedNotify::shared(&changes_directory).map_err(MdbxOpenError::ChangeLog)?,
             spawner,
         })))
     }
@@ -335,7 +340,7 @@ impl<S: SpawnBlocking + 'static> KeyValueStore for MdbxMetadata<S> {
             .map_err(TransactError::Aborted)
     }
 
-    // changed sees only this process's commits.
+    // changed sees other stores' commits through the change log.
     async fn changed(&self, key: Bytes, seen: Option<Bytes>) -> Result<(), Self::Failure> {
         let (key, seen) = (&key, &seen);
         self.0
