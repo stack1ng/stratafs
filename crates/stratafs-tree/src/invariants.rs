@@ -163,5 +163,90 @@ fn separator_at<R: AddressableRange>(
     step.entries.get(index)?.ok().map(|entry| &entry.key)
 }
 
+// node_ref_counts_match_parents walks every volume's tree and checks that each node's stored count,
+// where a missing count is 1, equals its parent pointers plus the headers whose root it is,
+// and that no count is stored for a node no tree reaches.
+#[cfg(test)]
+pub(crate) async fn node_ref_counts_match_parents<T, R>(transaction: &T) -> bool
+where
+    T: stratafs_store::kv::ReadKeyValueTransaction,
+    R: AddressableRange,
+{
+    use std::collections::{HashMap, HashSet};
+
+    use bytes::Bytes;
+    use zerocopy::FromBytes;
+    use zerocopy::little_endian::{U64, U128};
+
+    use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
+    use crate::key::TreeKey;
+    use crate::node::Node;
+
+    let headers = transaction
+        .get_range(
+            Bytes::from(TreeKey::VolumeHeader(TreeVolumeId(0)))
+                ..=Bytes::from(TreeKey::VolumeHeader(TreeVolumeId(u128::MAX))),
+            usize::MAX,
+        )
+        .await
+        .expect("the store reads the volume headers");
+    let mut parents = HashMap::new();
+    let mut visited = HashSet::new();
+    let mut unvisited = Vec::new();
+    let mut point_at = |child: NodeId, unvisited: &mut Vec<NodeId>| {
+        *parents.entry(child.0.get()).or_insert(0) += 1;
+        if visited.insert(child.0.get()) {
+            unvisited.push(child);
+        }
+    };
+    for (_, header) in headers {
+        let header = VolumeHeader::view(&header).expect("a stored header is valid");
+        point_at(header.root, &mut unvisited);
+    }
+    while let Some(id) = unvisited.pop() {
+        let stored = transaction
+            .get(TreeKey::Node(id).into())
+            .await
+            .expect("the store reads the node")
+            .expect("a node a parent points at is stored");
+        let (_, node) = Node::<Bytes, R>::read(stored).expect("a stored node is valid");
+        if let Node::Internal(entries) = node {
+            for index in 0..entries.len() {
+                let entry = entries.get(index).expect("the index is in the node");
+                point_at(
+                    entry.expect("a stored entry is valid").child,
+                    &mut unvisited,
+                );
+            }
+        }
+    }
+    let mut reached_counts = 0;
+    for (id, parents) in parents {
+        let stored = transaction
+            .get(TreeKey::NodeRefCount(NodeId(U128::new(id))).into())
+            .await
+            .expect("the store reads the count");
+        reached_counts += usize::from(stored.is_some());
+        let count = stored.map_or(1, |stored| {
+            U64::read_from_bytes(&stored)
+                .expect("a stored count is a U64")
+                .get()
+        });
+        if count != parents {
+            return false;
+        }
+    }
+    let stored_counts = transaction
+        .get_range(
+            Bytes::from(TreeKey::NodeRefCount(NodeId(U128::new(0))))
+                ..=Bytes::from(TreeKey::NodeRefCount(NodeId(U128::new(u128::MAX)))),
+            usize::MAX,
+        )
+        .await
+        .expect("the store reads the counts")
+        .count();
+    stored_counts == reached_counts
+}
+
 #[cfg(test)]
 mod tests;

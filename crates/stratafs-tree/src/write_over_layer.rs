@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
@@ -22,6 +22,8 @@ mod span_resolution;
 pub(crate) struct LayerNode<R> {
     pub(crate) node: ObservedNode,
     pub(crate) steps: DescentSteps<R>,
+    // stored_entries is the node's entries as stored before this write
+    pub(crate) stored_entries: SlottedList<Bytes, [u8], R>,
 }
 
 // LayerSpan represents a set of nodes that should be treated as contiguous,
@@ -87,7 +89,7 @@ where
         while !layer.spans.is_empty() {
             layer = self.fit_layer(volume, layer, packing).await?;
         }
-        Ok(())
+        self.apply_node_ref_deltas().await
     }
 
     // fit_layer handles actually fitting the given entries to the given nodes.

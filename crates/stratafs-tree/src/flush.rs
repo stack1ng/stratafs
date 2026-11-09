@@ -188,6 +188,7 @@ where
                 .map(|leaf| LayerNode {
                     node: leaf.destination.node,
                     steps: leaf.steps.clone(),
+                    stored_entries: leaf.destination.entries.clone().into_untyped(),
                 })
                 .collect(),
             entries: entries.into_untyped(),

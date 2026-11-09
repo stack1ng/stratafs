@@ -7,7 +7,6 @@ use crate::error::TreeFailure;
 use crate::key::TreeKey;
 use crate::node::{Node, ObservedNode};
 use crate::serialized::CorruptValue;
-use crate::slotted::SlottedList;
 use crate::tree::TreeConfig;
 use crate::volume::TreeTransaction;
 
@@ -41,17 +40,9 @@ where
         span: &'span LayerSpan<C::Range>,
     ) -> Option<
         SpanNeighbors<
+            impl Future<Output = Result<LayerNode<C::Range>, TreeFailure<T::Failure, S::Rejection>>>,
             impl Future<
-                Output = Result<
-                    (LayerNode<C::Range>, SlottedList<Bytes, [u8], C::Range>),
-                    TreeFailure<T::Failure, S::Rejection>,
-                >,
-            >,
-            impl Future<
-                Output = Result<
-                    Option<(LayerNode<C::Range>, SlottedList<Bytes, [u8], C::Range>)>,
-                    TreeFailure<T::Failure, S::Rejection>,
-                >,
+                Output = Result<Option<LayerNode<C::Range>>, TreeFailure<T::Failure, S::Rejection>>,
             >,
         >,
     > {
@@ -86,10 +77,7 @@ where
     async fn read_neighbor(
         &self,
         steps: DescentSteps<C::Range>,
-    ) -> Result<
-        (LayerNode<C::Range>, SlottedList<Bytes, [u8], C::Range>),
-        TreeFailure<T::Failure, S::Rejection>,
-    > {
+    ) -> Result<LayerNode<C::Range>, TreeFailure<T::Failure, S::Rejection>> {
         let id = {
             let step = steps
                 .last()
@@ -107,17 +95,15 @@ where
             .map_err(TreeFailure::Store)?
             .ok_or(TreeFailure::Corrupt(CorruptValue::MissingNode))?;
         let (epoch, node) = Node::<Bytes, C::Range>::read(stored).map_err(TreeFailure::Corrupt)?;
-        let entries = match node {
+        let stored_entries = match node {
             Node::Leaf(entries) => entries.into_untyped(),
             Node::Internal(entries) => entries.into_untyped(),
         };
-        Ok((
-            LayerNode {
-                node: ObservedNode { id, epoch },
-                steps,
-            },
-            entries,
-        ))
+        Ok(LayerNode {
+            node: ObservedNode { id, epoch },
+            steps,
+            stored_entries,
+        })
     }
 
     async fn find_cousin_path(

@@ -37,6 +37,8 @@ pub struct TreeTransaction<'txn, T, S: KeyValueStore, A, C> {
         // None here means the bytes were cleared
         Option<Bytes>,
     >,
+    // node_ref_deltas are the current write's reference count changes, netted per node when it ends
+    pub(crate) node_ref_deltas: Vec<(NodeId, i64)>,
 }
 
 // FlushingWork is the error of a transaction's work followed by its flush.
@@ -55,6 +57,7 @@ impl<S: KeyValueStore, A, C> TreeVolume<S, A, C> {
             shared: &self.shared,
             volume: self.id,
             buffered_delta: RangeBoundsMap::new(),
+            node_ref_deltas: Vec::new(),
         }
     }
 }
@@ -374,7 +377,15 @@ where
             )
             .map_err(with_tree_failure)
             .map_err(refused_write_as_failure)?;
+        // both headers now point at the root
+        self.node_ref_deltas.push((from_header.root, 1));
+        self.apply_node_ref_deltas()
+            .await
+            .map_err(refused_write_as_failure)?;
 
         Ok(new_volume)
     }
 }
+
+#[cfg(test)]
+mod tests;

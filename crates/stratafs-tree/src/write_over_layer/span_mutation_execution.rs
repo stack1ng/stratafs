@@ -77,7 +77,7 @@ where
             return self.execute_root_plan_group(volume, kind, group);
         }
         // Phase 1: accumulate the parent span.
-        // Take the parents of each plan's first and last existing node, and put them and their
+        // Take the parents of each plan's existing nodes, and put them and their
         // entries into one parent span, left to right. Each parent's first entry gets its real
         // key back, as everywhere else.
         let mut parent_span = LayerSpan {
@@ -100,9 +100,10 @@ where
                     // merge the new parent ndoe into the accumulating parent_span
                     let parent_steps: DescentSteps<C::Range> =
                         node.steps[..node.steps.len() - 1].iter().cloned().collect();
+                    let stored_entries = step.entries.clone().into_untyped();
                     let parent_entries = resolve_node_relative_first_separator(
                         NodeKind::Internal,
-                        &step.entries.clone().into_untyped(),
+                        &stored_entries,
                         &parent_steps,
                     )?;
                     last_parent_offset = parent_span.entries.len();
@@ -110,22 +111,24 @@ where
                     parent_span.nodes.push(LayerNode {
                         node: step.node,
                         steps: parent_steps,
+                        stored_entries,
                     });
                 }
                 Ok(last_parent_offset + step.position)
             };
             // Phase 2: find each plan's range in the parent span's entries.
             // From its first existing node's entry to its last existing node's entry.
+            // A parent of a node in the middle joins too, so it is rewritten rather than left pointing at that node.
+            let mut nodes = plan.existing_nodes();
             let start = slot_in_parents(
-                plan.first_existing_node()
+                nodes
+                    .next()
                     .expect("a plan below the root changes an existing node"),
             )
             .map_err(corrupt)?;
-            let end = slot_in_parents(
-                plan.last_existing_node()
-                    .expect("a plan below the root changes an existing node"),
-            )
-            .map_err(corrupt)?;
+            let end = nodes
+                .try_fold(start, |_, node| slot_in_parents(node))
+                .map_err(corrupt)?;
             ranges.push(start..end + 1);
         }
 
@@ -206,12 +209,14 @@ where
                 root,
                 epoch: volume.epoch,
             })?;
+            self.node_ref_deltas.extend([(root, 1), (volume.root, -1)]);
         }
         Ok(None)
     }
 
     // execute_span_mutation_plan applies the plan to the current layer,
-    // and returns the entries that it created/updated
+    // and returns the entries that it created/updated.
+    // It records +1 per new internal pointer and -1 per pointer an owned old node held; a created or cleared node cancels its parent's change.
     fn execute_span_mutation_plan(
         &mut self,
         volume: VolumeHeader,
@@ -238,6 +243,10 @@ where
                             ),
                         )
                         .map_err(with_tree_failure)?;
+                    self.node_ref_deltas.push((new_node_id, -1));
+                    if kind == NodeKind::Internal {
+                        self.push_child_ref_deltas(&entries, 1).map_err(corrupt)?;
+                    }
                     parent_entries.insert_entry(parent_entries.len(), new_node_id, &separator);
                 }
                 Update {
@@ -262,6 +271,15 @@ where
                             ),
                         )
                         .map_err(with_tree_failure)?;
+                    if target != node.node.id {
+                        self.node_ref_deltas.push((target, -1));
+                    } else if kind == NodeKind::Internal {
+                        self.push_child_ref_deltas(&node.stored_entries, -1)
+                            .map_err(corrupt)?;
+                    }
+                    if kind == NodeKind::Internal {
+                        self.push_child_ref_deltas(&entries, 1).map_err(corrupt)?;
+                    }
                     parent_entries.insert_entry(parent_entries.len(), target, &separator);
                 }
                 Delete { node } => {
@@ -270,6 +288,11 @@ where
                             .clear(TreeKey::Node(node.node.id).into())
                             .map_err(TreeFailure::Store)
                             .map_err(StoreError::Failed)?;
+                        self.node_ref_deltas.push((node.node.id, 1));
+                        if kind == NodeKind::Internal {
+                            self.push_child_ref_deltas(&node.stored_entries, -1)
+                                .map_err(corrupt)?;
+                        }
                     }
                 }
                 Promote { separator, child } => {

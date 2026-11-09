@@ -138,21 +138,24 @@ where
                 }
             };
             let [left, right] = candidates;
-            let (merge_side, (node, entries)) = match (left, right) {
+            let (merge_side, node) = match (left, right) {
                 (None, None) => {
                     // being here means the span covers its layer's entire domain, so it fits in one node,
                     // and the layers above it collapse during the ascent until that node is the root,
                     // where being underfull is accepted.
                     break;
                 }
-                (Some(left), Some(right)) if right.1.stored_length() < left.1.stored_length() => {
+                (Some(left), Some(right))
+                    if right.stored_entries.stored_length()
+                        < left.stored_entries.stored_length() =>
+                {
                     (Side::Right, right)
                 }
                 (Some(left), _) => (Side::Left, left),
                 (None, Some(right)) => (Side::Right, right),
             };
             let mut neighbor_entries =
-                resolve_node_relative_first_separator(kind, &entries, &node.steps)
+                resolve_node_relative_first_separator(kind, &node.stored_entries, &node.steps)
                     .map_err(TreeFailure::Corrupt)?;
             match merge_side {
                 Side::Left => {

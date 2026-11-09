@@ -25,6 +25,10 @@ impl<R> SpanMutationPlan<R> {
         self.mutations.iter().find_map(existing_node)
     }
 
+    pub(super) fn existing_nodes(&self) -> impl Iterator<Item = &LayerNode<R>> {
+        self.mutations.iter().filter_map(existing_node)
+    }
+
     pub(super) fn last_existing_node(&self) -> Option<&LayerNode<R>> {
         self.mutations.iter().rev().find_map(existing_node)
     }

@@ -12,6 +12,12 @@ fn node(id: u128) -> LayerNode<u16> {
             epoch: VolumeEpoch(U64::new(0)),
         },
         steps: SmallVec::new(),
+        stored_entries: SlottedList::new(
+            SlottedList::<BytesMut, [u8], u16>::empty()
+                .into_inner()
+                .freeze(),
+        )
+        .unwrap(),
     }
 }
 

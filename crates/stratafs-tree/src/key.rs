@@ -8,6 +8,8 @@ pub(crate) enum TreeKey {
     VolumeHeader(TreeVolumeId),
     Node(NodeId),
     Config,
+    // NodeRefCount is a node's count of parent pointers, where a missing count is 1
+    NodeRefCount(NodeId),
 }
 
 impl From<TreeKey> for Bytes {

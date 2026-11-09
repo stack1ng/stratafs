@@ -58,6 +58,12 @@ fn node_at(position: usize) -> LayerNode<u16> {
     LayerNode {
         node: observed(position as u128),
         steps: smallvec![step(&[b"", b"m", b"t"], position)],
+        stored_entries: SlottedList::new(
+            SlottedList::<BytesMut, [u8], u16>::empty()
+                .into_inner()
+                .freeze(),
+        )
+        .unwrap(),
     }
 }
 

@@ -7,6 +7,7 @@ pub mod header;
 mod invariants;
 mod key;
 mod node;
+mod node_ref_count;
 pub mod serialized;
 pub mod slotted;
 pub mod tree;
