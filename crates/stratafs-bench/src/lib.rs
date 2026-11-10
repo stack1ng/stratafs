@@ -123,19 +123,19 @@ const MDBX_CONFIGURATION: stratafs_mdbx::MdbxConfiguration<'static> =
         },
     };
 
-pub type BenchTree = Tree<Metadata, fn() -> u128, BenchTreeConfig>;
+// Database is the store directory's metadata and the content of every file, made durable together.
+#[cfg(store = "redb")]
+pub type Database = stratafs_lock_synchronized::LockSynchronizedStore<Metadata, Content>;
+#[cfg(store = "sqlite")]
+pub type Database = stratafs_sqlite::SqliteStore<Metadata, ThreadPool>;
+#[cfg(store = "mdbx")]
+pub type Database = stratafs_mdbx::MdbxStore<Metadata, ThreadPool>;
 
-pub type BenchVolume = TreeVolume<Metadata, fn() -> u128, BenchTreeConfig>;
+pub type BenchTree = Tree<Database, fn() -> u128, BenchTreeConfig>;
+
+pub type BenchVolume = TreeVolume<Database, fn() -> u128, BenchTreeConfig>;
 type VolumeRejection = <BenchVolume as KeyValueStore>::Rejection;
 type VolumeFailure = <BenchVolume as KeyValueStore>::Failure;
-
-// BenchStore keeps a volume and the content of every file, made durable together.
-#[cfg(store = "redb")]
-pub type BenchStore = stratafs_lock_synchronized::LockSynchronizedStore<BenchVolume, Content>;
-#[cfg(store = "sqlite")]
-pub type BenchStore = stratafs_sqlite::SqliteStore<BenchVolume, ThreadPool>;
-#[cfg(store = "mdbx")]
-pub type BenchStore = stratafs_mdbx::MdbxStore<BenchVolume, ThreadPool>;
 
 // The consistency comes from the build's environment too, as STRATAFS_BENCH_CONSISTENCY: eventual, or strong, whose
 // mounts reach the coordinator whose URL is in the store directory's coordinator file.
@@ -146,14 +146,13 @@ pub type BenchConsistency =
     StrongUntilDisconnectCached<stratafs_websocket_pubsub::client::Client<u64>>;
 
 pub type BenchEngine =
-    FsEngine<BenchStore, fn() -> u64, fn() -> Timestamp, BenchFsConfig, BenchConsistency>;
+    FsEngine<BenchVolume, fn() -> u64, fn() -> Timestamp, BenchFsConfig, BenchConsistency>;
 
-type ConsistencyFailure = <BenchConsistency as Cached<BenchStore>>::Failure;
+type ConsistencyFailure = <BenchConsistency as Cached<BenchVolume>>::Failure;
 
-// Store is the store directory opened: the tree holding every volume, and the content of every file.
+// Store is the store directory opened: the tree holding every volume.
 pub struct Store {
     pub tree: BenchTree,
-    pub content: Content,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -233,16 +232,15 @@ pub async fn open_store(
     runtime: Arc<dyn Runtime>,
 ) -> Result<Store, OpenStoreError> {
     std::fs::create_dir_all(directory).map_err(OpenStoreError::Directory)?;
-    let (metadata, content) = open_database(directory)?;
     let allocate_node: fn() -> u128 = rand::random;
-    let tree = Tree::new(metadata, allocate_node, content.clone(), runtime)
+    let tree = Tree::new(open_database(directory)?, allocate_node, runtime)
         .await
         .map_err(OpenStoreError::Tree)?;
-    Ok(Store { tree, content })
+    Ok(Store { tree })
 }
 
 #[cfg(store = "redb")]
-fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError> {
+fn open_database(directory: &Path) -> Result<Database, OpenStoreError> {
     let content = stratafs_object_store::ObjectStoreContentStore::local(directory.join("content"))
         .map_err(OpenStoreError::Content)?;
     let metadata = stratafs_redb::RedbStore::local(directory.join("metadata.redb"), ThreadPool)
@@ -250,20 +248,20 @@ fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError
             redb::Error::DatabaseAlreadyOpen => OpenStoreError::AlreadyOpen,
             error => OpenStoreError::Database(error),
         })?;
-    Ok((metadata, content))
+    Ok(Database::new(metadata, content))
 }
 
 #[cfg(store = "sqlite")]
-fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError> {
+fn open_database(directory: &Path) -> Result<Database, OpenStoreError> {
     let metadata =
         stratafs_sqlite::SqliteMetadata::local(directory.join("store.sqlite"), ThreadPool)
             .map_err(OpenStoreError::Database)?;
     let content = stratafs_sqlite::SqliteContent::of(&metadata);
-    Ok((metadata, content))
+    Ok(Database::new(metadata, content))
 }
 
 #[cfg(store = "mdbx")]
-fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError> {
+fn open_database(directory: &Path) -> Result<Database, OpenStoreError> {
     let metadata = stratafs_mdbx::MdbxMetadata::open(
         directory.join("store.mdbx"),
         &MDBX_CONFIGURATION,
@@ -274,7 +272,7 @@ fn open_database(directory: &Path) -> Result<(Metadata, Content), OpenStoreError
         error => OpenStoreError::Database(error),
     })?;
     let content = stratafs_mdbx::MdbxContent::of(&metadata);
-    Ok((metadata, content))
+    Ok(Database::new(metadata, content))
 }
 
 // open_volume opens volume from the store in directory, as an engine that invalidates kernel's cache, running its
@@ -315,14 +313,14 @@ async fn engine(
     kernel: impl KernelCache,
     runtime: Arc<dyn Runtime>,
 ) -> Result<BenchEngine, OpenVolumeError> {
-    let metadata = store.tree.open(volume).await.map_err(|error| match error {
+    let opened = store.tree.open(volume).await.map_err(|error| match error {
         StoreError::Rejected(UnknownVolume) => OpenVolumeError::UnknownVolume,
         StoreError::Failed(failure) => OpenVolumeError::Volume(failure),
     })?;
     let allocate_inode: fn() -> u64 = rand::random;
     let allocate_content_id: fn() -> ContentId = || ContentId(rand::random());
     FsEngine::new(
-        BenchStore::new(metadata, store.content),
+        opened,
         allocate_inode,
         allocate_content_id,
         now as fn() -> Timestamp,

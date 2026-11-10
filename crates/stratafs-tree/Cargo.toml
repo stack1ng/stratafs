@@ -26,9 +26,12 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 futures-lite.workspace = true
+object_store.workspace = true
 proptest.workspace = true
 redb = "4.4.0"
 stratafs-kv-conformance.workspace = true
+stratafs-lock-synchronized.workspace = true
+stratafs-object-store.workspace = true
 stratafs-redb.workspace = true
 
 [lints]

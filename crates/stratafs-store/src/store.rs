@@ -3,6 +3,7 @@ use crate::durability::DurableAgainst;
 use crate::kv::KeyValueStore;
 
 // Store is one unit holding a file system's metadata and its file content, made durable together.
+// Durable metadata never names content that is not durable.
 pub trait Store: Send + Sync + 'static {
     type Metadata: KeyValueStore;
     type Content: ContentStore;

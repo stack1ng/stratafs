@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_lite::future::block_on;
 use stratafs_kv_conformance::runtime::seeded;
-use stratafs_mdbx::MdbxMetadata;
+use stratafs_mdbx::{MdbxContent, MdbxMetadata, MdbxStore};
 use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::spawn::Inline;
-use stratafs_tree::tree::{NoContent, Tree, TreeConfig};
+use stratafs_tree::tree::{Tree, TreeConfig};
 
 struct SingleLeafConfig;
 
@@ -31,15 +31,15 @@ impl TreeConfig for SmallNodeConfig {
 // change log is removed reads Gaps, which wake its watches from outside the simulation.
 fn new_tree<C: TreeConfig>(
     stores: &Path,
-) -> Tree<MdbxMetadata<Inline>, impl Fn() -> u128 + use<C>, C> {
+) -> Tree<MdbxStore<MdbxMetadata<Inline>, Inline>, impl Fn() -> u128 + use<C>, C> {
     let directory = tempfile::tempdir_in(stores).unwrap().keep();
-    let store = configuration::open(directory.join("store.mdbx"), Inline).unwrap();
+    let metadata = configuration::open(directory.join("store.mdbx"), Inline).unwrap();
+    let content = MdbxContent::of(&metadata);
     let next_id = AtomicU64::new(1);
     let allocate_id = move || u128::from(next_id.fetch_add(1, Ordering::Relaxed));
     block_on(Tree::new(
-        store,
+        MdbxStore::new(metadata, content),
         allocate_id,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap()

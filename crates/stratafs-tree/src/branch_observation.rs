@@ -6,6 +6,7 @@ use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
 use futures_util::future::{Shared, select_all};
 use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction, TransactError};
+use stratafs_store::store::Store;
 use weak_table::WeakValueHashMap;
 
 use crate::descent::DescentPath;
@@ -13,7 +14,7 @@ use crate::error::TreeFailure;
 use crate::header::NodeId;
 use crate::key::TreeKey;
 use crate::node::{Node, NodeHeader, NodeKind};
-use crate::tree::{TreeConfig, TreeShared};
+use crate::tree::{MetadataFailure, MetadataRejection, TreeConfig, TreeShared};
 use crate::volume::{TreeTransaction, TreeVolume};
 
 pub(crate) type SharedWatches<F> =
@@ -28,13 +29,13 @@ pub(crate) struct SharedWatch<F> {
 
 impl<S, A, C> TreeShared<S, A, C>
 where
-    S: KeyValueStore,
+    S: Store,
     A: Send + Sync + 'static,
     C: TreeConfig,
 {
     // watch returns the watch on key for value, starting one unless a watch on those bytes is still waiting.
     // A new watch takes over the key, while the waiters of the one it replaces keep theirs.
-    fn watch(self: &Arc<Self>, key: Bytes, value: Bytes) -> Arc<SharedWatch<S::Failure>> {
+    fn watch(self: &Arc<Self>, key: Bytes, value: Bytes) -> Arc<SharedWatch<MetadataFailure<S>>> {
         let mut watches = self.watches.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(watch) = watches
             .get(&key)
@@ -48,6 +49,7 @@ where
             changed: async move {
                 shared
                     .store
+                    .metadata()
                     .changed(watched_key, Some(watched_value))
                     .await
                     .map_err(Arc::new)
@@ -63,7 +65,7 @@ where
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
-    S: KeyValueStore,
+    S: Store,
     A: Send + Sync,
     C: TreeConfig,
 {
@@ -104,7 +106,7 @@ where
 
 impl<S, A, C> TreeVolume<S, A, C>
 where
-    S: KeyValueStore,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -114,7 +116,7 @@ where
         &self,
         key: Bytes,
         seen: Option<Bytes>,
-    ) -> Result<(), TreeFailure<S::Failure, S::Rejection>> {
+    ) -> Result<(), TreeFailure<MetadataFailure<S>, MetadataRejection<S>>> {
         loop {
             let branch = self
                 .read_transact(|transaction| {

@@ -2,7 +2,8 @@ use std::ops::Range;
 
 use bytes::BytesMut;
 use smallvec::{SmallVec, smallvec};
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction};
+use stratafs_store::kv::KeyValueTransaction;
+use stratafs_store::store::Store;
 use zerocopy::{FromBytes, KnownLayout};
 
 use super::packing::PackingStrategy;
@@ -13,7 +14,7 @@ use crate::header::NodeId;
 use crate::node::{InternalEntry, LEFTMOST_SEPARATOR, LeafEntry, NodeKind};
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
-use crate::tree::{TreeConfig, TreeConfigLimits};
+use crate::tree::{MetadataRejection, TreeConfig, TreeConfigLimits};
 use crate::volume::TreeTransaction;
 
 pub(super) struct SpanMutationPlan<R> {
@@ -48,8 +49,8 @@ fn existing_node<R>(mutation: &LayerNodeMutation<R>) -> Option<&LayerNode<R>> {
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -58,7 +59,7 @@ where
         kind: NodeKind,
         span: IndependentResolvedSpan<C::Range>,
         packing: PackingStrategy,
-    ) -> Result<SpanMutationPlan<C::Range>, TreeFailure<T::Failure, S::Rejection>> {
+    ) -> Result<SpanMutationPlan<C::Range>, TreeFailure<T::Failure, MetadataRejection<S>>> {
         let span = span.into_span();
         let is_root = span.is_root();
         let span_lower_bound: Box<[u8]> = Box::from(match span.nodes.first() {

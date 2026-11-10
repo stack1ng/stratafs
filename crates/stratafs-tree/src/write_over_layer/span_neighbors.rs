@@ -1,5 +1,6 @@
 use bytes::Bytes;
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction};
+use stratafs_store::kv::KeyValueTransaction;
+use stratafs_store::store::Store;
 
 use super::{LayerNode, LayerSpan};
 use crate::descent::{DescentStep, DescentSteps};
@@ -7,7 +8,7 @@ use crate::error::TreeFailure;
 use crate::key::TreeKey;
 use crate::node::{Node, ObservedNode};
 use crate::serialized::CorruptValue;
-use crate::tree::TreeConfig;
+use crate::tree::{MetadataRejection, TreeConfig};
 use crate::volume::TreeTransaction;
 
 #[derive(Clone, Copy)]
@@ -30,8 +31,8 @@ pub(super) struct SpanNeighbors<I: Future, E: Future> {
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -40,9 +41,14 @@ where
         span: &'span LayerSpan<C::Range>,
     ) -> Option<
         SpanNeighbors<
-            impl Future<Output = Result<LayerNode<C::Range>, TreeFailure<T::Failure, S::Rejection>>>,
             impl Future<
-                Output = Result<Option<LayerNode<C::Range>>, TreeFailure<T::Failure, S::Rejection>>,
+                Output = Result<LayerNode<C::Range>, TreeFailure<T::Failure, MetadataRejection<S>>>,
+            >,
+            impl Future<
+                Output = Result<
+                    Option<LayerNode<C::Range>>,
+                    TreeFailure<T::Failure, MetadataRejection<S>>,
+                >,
             >,
         >,
     > {
@@ -77,7 +83,7 @@ where
     async fn read_neighbor(
         &self,
         steps: DescentSteps<C::Range>,
-    ) -> Result<LayerNode<C::Range>, TreeFailure<T::Failure, S::Rejection>> {
+    ) -> Result<LayerNode<C::Range>, TreeFailure<T::Failure, MetadataRejection<S>>> {
         let id = {
             let step = steps
                 .last()
@@ -110,7 +116,7 @@ where
         &self,
         node: &LayerNode<C::Range>,
         side: Side,
-    ) -> Result<Option<DescentSteps<C::Range>>, TreeFailure<T::Failure, S::Rejection>> {
+    ) -> Result<Option<DescentSteps<C::Range>>, TreeFailure<T::Failure, MetadataRejection<S>>> {
         let Some(turn) = node.steps.iter().rposition(|step| match side {
             Side::Left => step.position > 0,
             Side::Right => step.position + 1 < step.entries.len(),

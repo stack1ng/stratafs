@@ -1,5 +1,8 @@
 use futures_lite::future::block_on;
+use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
+use stratafs_lock_synchronized::LockSynchronizedStore;
+use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::spawn::Inline;
@@ -19,11 +22,12 @@ impl<R: AddressableRange, const NODE_CAPACITY: usize, const MERGE_BELOW_PERCENT:
 
 type Config<R, const NODE_CAPACITY: usize> = TestConfig<R, NODE_CAPACITY, 25>;
 
+type TestStore = LockSynchronizedStore<RedbStore<Inline>, ObjectStoreContentStore>;
+
 fn accepts_config<C: TreeConfig>() {
-    drop(Tree::<RedbStore<Inline>, fn() -> u128, C>::new(
+    drop(Tree::<TestStore, fn() -> u128, C>::new(
         memory_store(),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ));
 }
@@ -36,14 +40,17 @@ fn each_width_accepts_its_optimal_capacities() {
     accepts_config::<Config<u32, 65536>>();
 }
 
-fn memory_store() -> RedbStore<Inline> {
+fn memory_store() -> TestStore {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
-    RedbStore::new(database, Inline).unwrap()
+    LockSynchronizedStore::new(
+        RedbStore::new(database, Inline).unwrap(),
+        ObjectStoreContentStore::new(InMemory::new()),
+    )
 }
 
-fn into_store<S: KeyValueStore, A, C>(tree: Tree<S, A, C>) -> S {
+fn into_store<S: Store, A, C>(tree: Tree<S, A, C>) -> S {
     Arc::into_inner(tree.0)
         .expect("the test holds the only reference to the tree")
         .store
@@ -54,14 +61,12 @@ fn a_store_accepts_the_config_it_was_first_given() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         into_store(tree),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
@@ -72,14 +77,12 @@ fn a_store_rejects_a_different_node_capacity() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     let reopened = block_on(Tree::<_, _, TestConfig<u16, 4067, 25>>::new(
         into_store(tree),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ));
     assert!(matches!(
@@ -94,14 +97,12 @@ fn a_store_rejects_a_different_address_length() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 65535, 25>>::new(
         memory_store(),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     let reopened = block_on(Tree::<_, _, TestConfig<u32, 65536, 25>>::new(
         into_store(tree),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ));
     assert!(matches!(
@@ -116,14 +117,12 @@ fn a_store_rejects_a_different_merge_threshold() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     let reopened = block_on(Tree::<_, _, TestConfig<u16, 16355, 30>>::new(
         into_store(tree),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ));
     assert!(matches!(
@@ -136,7 +135,7 @@ fn a_store_rejects_a_different_merge_threshold() {
 #[test]
 fn a_corrupt_pinned_config_is_reported() {
     let store = memory_store();
-    block_on(store.transact(|mut transaction| {
+    block_on(store.metadata().transact(|mut transaction| {
         Box::pin(async move {
             let set = transaction.set(TreeKey::Config.into(), Bytes::from_static(b"not a config"));
             set.map(|()| ((), transaction))
@@ -146,7 +145,6 @@ fn a_corrupt_pinned_config_is_reported() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         store,
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ));
     assert!(matches!(
@@ -162,13 +160,12 @@ fn create_writes_a_header_and_an_empty_root() {
     let tree = block_on(Tree::<_, _, TestConfig<u16, 16355, 25>>::new(
         memory_store(),
         || 7,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
     let volume = block_on(tree.create()).unwrap();
     assert_eq!(volume, TreeVolumeId(7));
-    let (header, root) = block_on(tree.0.store.read_transact(|transaction| {
+    let (header, root) = block_on(tree.0.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             let header = transaction
                 .get(TreeKey::VolumeHeader(TreeVolumeId(7)).into())

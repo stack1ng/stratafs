@@ -1,7 +1,8 @@
 use bytes::{Bytes, BytesMut};
 use smallvec::SmallVec;
 use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
+use stratafs_store::kv::{KeyValueTransaction, SetRejection};
+use stratafs_store::store::Store;
 
 use crate::descent::DescentSteps;
 use crate::error::TreeFailure;
@@ -9,7 +10,7 @@ use crate::header::{NodeId, VolumeHeader};
 use crate::invariants;
 use crate::node::{NodeKind, ObservedNode};
 use crate::slotted::SlottedList;
-use crate::tree::TreeConfig;
+use crate::tree::{MetadataRejection, TreeConfig};
 use crate::volume::TreeTransaction;
 use packing::PackingStrategy;
 
@@ -72,8 +73,8 @@ enum LayerNodeMutation<R> {
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -82,8 +83,13 @@ where
         volume: VolumeHeader,
         layer: Layer<C::Range>,
         packing: PackingStrategy,
-    ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
-    {
+    ) -> Result<
+        (),
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
+    > {
         debug_assert!(invariants::layer_is_well_formed(&layer));
         let mut layer = layer;
         while !layer.spans.is_empty() {
@@ -108,7 +114,10 @@ where
         packing: PackingStrategy,
     ) -> Result<
         Layer<C::Range>,
-        StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
     > {
         let independent_spans = self
             .resolve_independent_spans(layer.kind, layer.spans)

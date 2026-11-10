@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use bytes::{Buf, BytesMut};
 use futures_lite::future::block_on;
+use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
+use stratafs_lock_synchronized::LockSynchronizedStore;
+use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::error::StoreError;
@@ -14,7 +17,7 @@ use zerocopy::little_endian::{U64, U128};
 use super::*;
 use crate::header::TreeVolumeId;
 use crate::node::{NodeHeader, NodeKind};
-use crate::tree::{NoContent, Tree};
+use crate::tree::{MetadataFailure, MetadataRejection, Tree};
 use crate::volume::TreeVolume;
 
 struct SmallConfig;
@@ -26,6 +29,7 @@ impl TreeConfig for SmallConfig {
 }
 
 type Volume<S> = TreeVolume<S, fn() -> u128, SmallConfig>;
+type TestStore = LockSynchronizedStore<RedbStore<Inline>, ObjectStoreContentStore>;
 
 const VOLUME: TreeVolumeId = TreeVolumeId(1);
 const ROOT: u128 = 100;
@@ -65,16 +69,15 @@ fn stored(kind: NodeKind, entries: &SlottedList<BytesMut, [u8], u16>) -> Bytes {
 //                 root ["" -> left, "f" -> right]
 //   left ["" -> 111, "c" -> 112]          right ["" -> 121, "i" -> 122]
 //   111 [a b]      112 [d e]              121 [g h]      122 [j k]
-fn three_level_volume() -> Volume<RedbStore<Inline>> {
+fn three_level_volume() -> Volume<TestStore> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
     let store = RedbStore::new(database, Inline).unwrap();
     store_three_levels(&store);
     let tree = block_on(Tree::<_, fn() -> u128, SmallConfig>::new(
-        store,
+        LockSynchronizedStore::new(store, ObjectStoreContentStore::new(InMemory::new())),
         || 1,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
@@ -119,7 +122,7 @@ fn path_of(path: &DescentPath<u16>) -> Path {
     )
 }
 
-fn descend_many<S: KeyValueStore>(volume: &Volume<S>, targets: &[&[u8]]) -> Vec<Path> {
+fn descend_many<S: Store>(volume: &Volume<S>, targets: &[&[u8]]) -> Vec<Path> {
     let targets: Vec<Bytes> = targets
         .iter()
         .map(|target| Bytes::copy_from_slice(target))
@@ -128,19 +131,21 @@ fn descend_many<S: KeyValueStore>(volume: &Volume<S>, targets: &[&[u8]]) -> Vec<
         let targets = targets.clone();
         Box::pin(async move {
             let paths = transaction.descend_many(&targets).await?;
-            Ok::<_, TreeFailure<S::Failure, S::Rejection>>(paths.iter().map(path_of).collect())
+            Ok::<_, TreeFailure<MetadataFailure<S>, MetadataRejection<S>>>(
+                paths.iter().map(path_of).collect(),
+            )
         })
     }))
     .unwrap()
 }
 
-fn descend<S: KeyValueStore>(volume: &Volume<S>, target: &[u8]) -> Path {
+fn descend<S: Store>(volume: &Volume<S>, target: &[u8]) -> Path {
     let target = Bytes::copy_from_slice(target);
     block_on(volume.read_transact(|transaction| {
         let target = target.clone();
         Box::pin(async move {
             let path = transaction.descend(&target).await?;
-            Ok::<_, TreeFailure<S::Failure, S::Rejection>>(path_of(&path))
+            Ok::<_, TreeFailure<MetadataFailure<S>, MetadataRejection<S>>>(path_of(&path))
         })
     }))
     .unwrap()

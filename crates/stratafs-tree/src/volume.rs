@@ -16,6 +16,7 @@ use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
     TransactionHandle, assert_valid_range,
 };
+use stratafs_store::store::Store;
 use zerocopy::KnownLayout;
 
 use crate::concatenated_bytes::ConcatenatedBytes;
@@ -24,16 +25,16 @@ use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
 use crate::key::{Referenced, TreeKey};
 use crate::node::{InternalEntry, LeafEntry};
 use crate::serialized::CorruptValue;
-use crate::tree::{TreeConfig, TreeConfigLimits, TreeShared};
+use crate::tree::{MetadataFailure, MetadataRejection, TreeConfig, TreeConfigLimits, TreeShared};
 
-pub struct TreeVolume<S: KeyValueStore, A, C> {
+pub struct TreeVolume<S: Store, A, C> {
     pub(crate) shared: Arc<TreeShared<S, A, C>>,
     pub(crate) id: TreeVolumeId,
     // _stop_garbage_collection stops the volume's garbage collector when it is dropped
     pub(crate) _stop_garbage_collection: oneshot::Sender<Infallible>,
 }
 
-pub struct TreeTransaction<'txn, T, S: KeyValueStore, A, C> {
+pub struct TreeTransaction<'txn, T, S: Store, A, C> {
     pub(crate) inner: TransactionHandle<'txn, 'txn, T>,
     pub(crate) shared: &'txn TreeShared<S, A, C>,
     pub(crate) volume: TreeVolumeId,
@@ -52,7 +53,7 @@ enum FlushingWork<E, F, R> {
     Flush(TreeFailure<F, R>),
 }
 
-impl<S: KeyValueStore, A, C> TreeVolume<S, A, C> {
+impl<S: Store, A, C> TreeVolume<S, A, C> {
     fn transaction<'txn, T>(
         &'txn self,
         inner: TransactionHandle<'txn, 'txn, T>,
@@ -80,11 +81,11 @@ fn store_failure_as_tree_failure<R, F, E>(
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
-    S: KeyValueStore,
+    S: Store,
 {
     pub(crate) async fn get_volume_header(
         &self,
-    ) -> Result<VolumeHeader, TreeFailure<T::Failure, S::Rejection>> {
+    ) -> Result<VolumeHeader, TreeFailure<T::Failure, MetadataRejection<S>>> {
         let stored = self
             .inner
             .get(TreeKey::VolumeHeader(self.volume).into())
@@ -98,14 +99,19 @@ where
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
 {
     pub(crate) fn set_volume_header(
         &mut self,
         new_value: VolumeHeader,
-    ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
-    {
+    ) -> Result<
+        (),
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
+    > {
         self.inner
             .set(
                 TreeKey::VolumeHeader(self.volume).into(),
@@ -135,14 +141,16 @@ pub(crate) fn refused_write_as_failure<F, R>(
 
 impl<S, A, C> KeyValueStore for TreeVolume<S, A, C>
 where
-    S: KeyValueStore,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
-    type Rejection = S::Rejection;
-    type Failure = TreeFailure<S::Failure, S::Rejection>;
-    type ReadTransaction<'txn> = TreeTransaction<'txn, S::ReadTransaction<'txn>, S, A, C>;
-    type Transaction<'txn> = TreeTransaction<'txn, S::Transaction<'txn>, S, A, C>;
+    type Rejection = MetadataRejection<S>;
+    type Failure = TreeFailure<MetadataFailure<S>, MetadataRejection<S>>;
+    type ReadTransaction<'txn> =
+        TreeTransaction<'txn, <S::Metadata as KeyValueStore>::ReadTransaction<'txn>, S, A, C>;
+    type Transaction<'txn> =
+        TreeTransaction<'txn, <S::Metadata as KeyValueStore>::Transaction<'txn>, S, A, C>;
 
     const LARGEST_ACCEPTED_ENTRY: usize = C::LARGEST_ENTRY_SIZE.saturating_sub(size_of::<NodeId>());
 
@@ -157,6 +165,7 @@ where
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
         self.shared
             .store
+            .metadata()
             .transact(|inner| {
                 let working = work(TransactionHandle::new(self.transaction(inner)));
                 Box::pin(async move {
@@ -191,6 +200,7 @@ where
     ) -> Result<T, TransactError<Self::Rejection, Self::Failure, E>> {
         self.shared
             .store
+            .metadata()
             .read_transact(|inner| work(TransactionHandle::new(self.transaction(inner))))
             .await
             .map_err(store_failure_as_tree_failure)
@@ -200,20 +210,51 @@ where
         self.branch_changed(key, seen).await
     }
 
-    // ensure_durable makes the whole store durable, since every volume shares it.
+    // ensure_durable makes the whole store durable, metadata and content, since every volume shares it.
     async fn ensure_durable(&self, against: DurableAgainst) -> Result<(), Self::Failure> {
-        Ok(self.shared.store.ensure_durable(against).await?)
+        self.shared
+            .store
+            .ensure_durable(against)
+            .await
+            .map_err(|failure| TreeFailure::Durability(Box::new(failure)))
+    }
+}
+
+// A volume is a store itself: its own metadata, with the content of the tree's store.
+impl<S, A, C> Store for TreeVolume<S, A, C>
+where
+    S: Store,
+    A: Fn() -> u128 + Send + Sync + 'static,
+    C: TreeConfig,
+{
+    type Metadata = Self;
+    type Content = S::Content;
+    type Failure = TreeFailure<MetadataFailure<S>, MetadataRejection<S>>;
+
+    fn metadata(&self) -> &Self {
+        self
+    }
+
+    fn content(&self) -> &S::Content {
+        self.shared.store.content()
+    }
+
+    fn ensure_durable(
+        &self,
+        against: DurableAgainst,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        KeyValueStore::ensure_durable(self, against)
     }
 }
 
 impl<'txn, T, S, A, C> ReadKeyValueTransaction for TreeTransaction<'txn, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
-    S: KeyValueStore,
+    S: Store,
     A: Send + Sync,
     C: TreeConfig,
 {
-    type Failure = TreeFailure<T::Failure, S::Rejection>;
+    type Failure = TreeFailure<T::Failure, MetadataRejection<S>>;
 
     async fn get(&self, key: Bytes) -> Result<Option<Bytes>, Self::Failure> {
         if let Some(buffered) = self.buffered_delta.get(&key) {
@@ -324,8 +365,8 @@ where
 
 impl<T, S, A, C> KeyValueTransaction for TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -360,7 +401,7 @@ where
     }
 }
 
-impl<T, S: KeyValueStore, A, C: TreeConfig> TreeTransaction<'_, T, S, A, C> {
+impl<T, S: Store, A, C: TreeConfig> TreeTransaction<'_, T, S, A, C> {
     // dereference_replaced_new_content records one reference less for each new blob whose buffered entry in range is
     // replaced before the tree stores it, as the tree counts a new blob's entry only by storing it. An entry replaced
     // by the same reference stays.
@@ -383,8 +424,8 @@ impl<T, S: KeyValueStore, A, C: TreeConfig> TreeTransaction<'_, T, S, A, C> {
 
 impl<T, S, A, C> ForkingTransaction for TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {

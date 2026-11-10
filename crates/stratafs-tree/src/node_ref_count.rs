@@ -5,7 +5,8 @@ use bytes::Bytes;
 use futures_util::future::try_join_all;
 use stratafs_store::content::ContentReference;
 use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
+use stratafs_store::kv::{KeyValueTransaction, SetRejection};
+use stratafs_store::store::Store;
 use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -15,13 +16,13 @@ use crate::key::{Referenced, TreeKey};
 use crate::node::InternalEntry;
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
-use crate::tree::TreeConfig;
+use crate::tree::{MetadataRejection, TreeConfig};
 use crate::volume::{TreeTransaction, with_tree_failure};
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -91,8 +92,13 @@ where
     // A count that drops is left to the garbage collector, as one blind job write per lost pointer.
     pub(crate) async fn apply_ref_deltas(
         &mut self,
-    ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
-    {
+    ) -> Result<
+        (),
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
+    > {
         let mut deltas = mem::take(&mut self.ref_deltas);
         deltas.sort_unstable_by_key(|(referenced, _)| *referenced);
         deltas.dedup_by(|(referenced, delta), (kept, kept_delta)| {

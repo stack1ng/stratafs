@@ -43,9 +43,10 @@ impl TreeConfig for TestTreeConfig {
     }
 }
 
-pub(crate) type InMemoryStore = LockSynchronizedStore<
-    TreeVolume<RedbStore<Inline>, fn() -> u128, TestTreeConfig>,
-    ObjectStoreContentStore,
+pub(crate) type InMemoryStore = TreeVolume<
+    LockSynchronizedStore<RedbStore<Inline>, ObjectStoreContentStore>,
+    fn() -> u128,
+    TestTreeConfig,
 >;
 
 pub(crate) type SharedStore = Shared<InMemoryStore>;
@@ -91,11 +92,12 @@ pub(crate) async fn new_store(runtime: Arc<dyn Runtime>) -> Arc<InMemoryStore> {
     NEXT_NODE.set(1);
     NEXT_CONTENT_ID.set(1);
     let allocate_node: fn() -> u128 = next_node;
-    let content = ObjectStoreContentStore::new(InMemory::new());
     let tree = Tree::new(
-        RedbStore::new(database, Inline).expect("redb starts a store in memory"),
+        LockSynchronizedStore::new(
+            RedbStore::new(database, Inline).expect("redb starts a store in memory"),
+            ObjectStoreContentStore::new(InMemory::new()),
+        ),
         allocate_node,
-        content.clone(),
         runtime,
     )
     .await
@@ -104,7 +106,7 @@ pub(crate) async fn new_store(runtime: Arc<dyn Runtime>) -> Arc<InMemoryStore> {
         .open(tree.create().await.expect("a tree creates a volume"))
         .await
         .expect("a tree opens the volume it created");
-    Arc::new(LockSynchronizedStore::new(volume, content))
+    Arc::new(volume)
 }
 
 thread_local! {

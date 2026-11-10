@@ -7,14 +7,15 @@ use equivalent::{Comparable, Equivalent};
 use smallvec::{SmallVec, smallvec};
 use stratafs_range_bounds_map::RangeBoundsMap;
 use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
+use stratafs_store::kv::{KeyValueTransaction, SetRejection};
+use stratafs_store::store::Store;
 use zerocopy::KnownLayout;
 
 use crate::descent::DescentPath;
 use crate::error::TreeFailure;
 use crate::node::{LeafEntry, NodeKind};
 use crate::slotted::{AddressableRange, SlottedList};
-use crate::tree::TreeConfig;
+use crate::tree::{MetadataRejection, TreeConfig};
 use crate::volume::TreeTransaction;
 use crate::write_over_layer::packing::PackingStrategy;
 use crate::write_over_layer::{Layer, LayerNode, LayerSpan};
@@ -51,16 +52,21 @@ struct FlushSpan<'flush, R: AddressableRange> {
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
     // flush writes the buffered writes into the tree, it costs only one descent pass (by parallelizing reads) and one ascent pass at runtime.
     pub(crate) async fn flush(
         &mut self,
-    ) -> Result<(), StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>>
-    {
+    ) -> Result<
+        (),
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
+    > {
         // Phase 1: take the buffer, leaving the transaction with an empty one.
         let buffered = mem::take(&mut self.buffered_delta);
         if buffered.is_empty() {

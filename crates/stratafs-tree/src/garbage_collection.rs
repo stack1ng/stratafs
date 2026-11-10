@@ -11,10 +11,12 @@ use bytes::Bytes;
 use futures_channel::oneshot;
 use futures_util::future::{join_all, select, try_join_all};
 use stratafs_runtime::Runtime;
+use stratafs_store::content::ContentStore;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, TransactError,
 };
+use stratafs_store::store::Store;
 use zerocopy::IntoBytes;
 use zerocopy::little_endian::{U64, U128};
 
@@ -24,24 +26,26 @@ use crate::key::{Referenced, TreeKey};
 use crate::node::Node;
 use crate::node_ref_count::stored_count;
 use crate::serialized::CorruptValue;
-use crate::tree::{TreeConfig, TreeShared};
+use crate::tree::{MetadataFailure, MetadataRejection, TreeConfig, TreeShared};
 use crate::volume::{TreeVolume, refused_write_as_failure, with_tree_failure};
 
 impl<S, A, C> TreeVolume<S, A, C>
 where
-    S: KeyValueStore,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
     // collect_garbage runs one garbage collection pass over the volume.
-    pub async fn collect_garbage(&self) -> Result<(), TreeFailure<S::Failure, S::Rejection>> {
+    pub async fn collect_garbage(
+        &self,
+    ) -> Result<(), TreeFailure<MetadataFailure<S>, MetadataRejection<S>>> {
         self.shared.collect_garbage(self.id).await
     }
 }
 
 impl<S, A, C> TreeShared<S, A, C>
 where
-    S: KeyValueStore,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -84,7 +88,7 @@ where
     pub(crate) async fn collect_garbage(
         &self,
         volume: TreeVolumeId,
-    ) -> Result<(), TreeFailure<S::Failure, S::Rejection>> {
+    ) -> Result<(), TreeFailure<MetadataFailure<S>, MetadataRejection<S>>> {
         let deleted = async {
             while self.delete_unreferenced_content(volume).await? {}
             Ok(())
@@ -101,7 +105,7 @@ where
         &self,
         volume: TreeVolumeId,
         start: NodeId,
-    ) -> Result<bool, TreeFailure<S::Failure, S::Rejection>> {
+    ) -> Result<bool, TreeFailure<MetadataFailure<S>, MetadataRejection<S>>> {
         let first = Bytes::from(TreeKey::Dereference(
             volume,
             Referenced::Node(NodeId(U128::new(0))),
@@ -118,6 +122,7 @@ where
             JobId(u128::MAX),
         ));
         self.store
+            .metadata()
             .transact(|mut transaction| {
                 let (first, from, last) = (first.clone(), from.clone(), last.clone());
                 Box::pin(async move {
@@ -243,18 +248,19 @@ where
     async fn delete_unreferenced_content(
         &self,
         volume: TreeVolumeId,
-    ) -> Result<bool, TreeFailure<S::Failure, S::Rejection>> {
+    ) -> Result<bool, TreeFailure<MetadataFailure<S>, MetadataRejection<S>>> {
         let range = Bytes::from(TreeKey::ContentDeletion(volume, TreeContentId(0)))
             ..=Bytes::from(TreeKey::ContentDeletion(volume, TreeContentId(u128::MAX)));
         let deletions: Vec<Bytes> = self
             .store
+            .metadata()
             .read_transact(|transaction| {
                 let range = range.clone();
                 Box::pin(async move {
                     let deletions = transaction
                         .get_range(range, C::GARBAGE_COLLECTION_BATCH)
                         .await?;
-                    Ok::<_, TreeFailure<S::Failure, S::Rejection>>(
+                    Ok::<_, TreeFailure<MetadataFailure<S>, MetadataRejection<S>>>(
                         deletions.map(|(key, _)| key).collect(),
                     )
                 })
@@ -268,19 +274,21 @@ where
         self.store
             .ensure_durable(DurableAgainst::PowerFailure)
             .await
-            .map_err(TreeFailure::Store)?;
+            .map_err(|failure| TreeFailure::Durability(Box::new(failure)))?;
         let deleted = join_all(deletions.iter().map(|key| async move {
             let Ok(TreeKey::ContentDeletion(_, id)) = storekey::decode(&key[..]) else {
                 return Err(TreeFailure::Corrupt(CorruptValue::InvalidKey));
             };
-            self.content
-                .delete(id.into())
+            self.store
+                .content()
+                .delete(&id.into())
                 .await
-                .map_err(TreeFailure::ContentDeletion)
+                .map_err(|failure| TreeFailure::ContentDeletion(Box::new(failure)))
         }))
         .await;
         let (deletions, results) = (&deletions, &deleted);
         self.store
+            .metadata()
             .transact(|mut transaction| {
                 Box::pin(async move {
                     for (key, result) in deletions.iter().zip(results) {
@@ -288,7 +296,10 @@ where
                             transaction.clear(key.clone())?;
                         }
                     }
-                    Ok::<_, TreeFailure<S::Failure, S::Rejection>>(((), transaction))
+                    Ok::<_, TreeFailure<MetadataFailure<S>, MetadataRejection<S>>>((
+                        (),
+                        transaction,
+                    ))
                 })
             })
             .await

@@ -1,7 +1,8 @@
 use bytes::BytesMut;
 use futures_util::future::{join, try_join_all};
 use smallvec::SmallVec;
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction};
+use stratafs_store::kv::KeyValueTransaction;
+use stratafs_store::store::Store;
 
 use super::LayerSpan;
 use super::span_neighbors::{Neighbor, Side};
@@ -11,7 +12,7 @@ use crate::invariants;
 use crate::node::{InternalEntry, LEFTMOST_SEPARATOR, NodeKind};
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
-use crate::tree::{TreeConfig, TreeConfigLimits};
+use crate::tree::{MetadataRejection, TreeConfig, TreeConfigLimits};
 use crate::volume::TreeTransaction;
 
 // IndependentResolvedSpan represents a span that does not overlap with any other spans in its Layer,
@@ -42,8 +43,8 @@ impl<R> PulledSpan<R> {
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -53,7 +54,7 @@ where
         spans: SmallVec<[LayerSpan<C::Range>; 1]>,
     ) -> Result<
         SmallVec<[IndependentResolvedSpan<C::Range>; 1]>,
-        TreeFailure<T::Failure, S::Rejection>,
+        TreeFailure<T::Failure, MetadataRejection<S>>,
     > {
         debug_assert!(invariants::spans_are_ordered(&spans));
         let mut unresolved = spans;
@@ -100,7 +101,7 @@ where
         &self,
         kind: NodeKind,
         mut span: LayerSpan<C::Range>,
-    ) -> Result<PulledSpan<C::Range>, TreeFailure<T::Failure, S::Rejection>> {
+    ) -> Result<PulledSpan<C::Range>, TreeFailure<T::Failure, MetadataRejection<S>>> {
         if span.is_root() || span.entries.len() == 0 {
             return Ok(PulledSpan::without_pulls(span));
         }

@@ -20,4 +20,6 @@ pub enum TreeFailure<F, R> {
     RefusedTransaction(#[source] R),
     #[error("the content store failed to delete a blob")]
     ContentDeletion(#[source] Box<dyn Error + Send + Sync>),
+    #[error("the store failed to make its metadata and content durable")]
+    Durability(#[source] Box<dyn Error + Send + Sync>),
 }

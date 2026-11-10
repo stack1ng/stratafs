@@ -27,11 +27,10 @@ use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_sqlite::{SqliteContent, SqliteMetadata, SqliteStore};
-use stratafs_store::content::{ContentId, ContentReference, ContentStore};
+use stratafs_store::content::{ContentId, ContentReference};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
-use stratafs_store::kv::KeyValueStore;
 use stratafs_store::spawn::ThreadPool;
 use stratafs_store::store::Store;
 use stratafs_tree::header::TreeVolumeId;
@@ -227,35 +226,28 @@ pub fn create(arguments: &CreateArguments) -> Result<TreeVolumeId, OpenError> {
     }
 }
 
-// Database is a store's database on disk: its metadata and content, and the store a volume of its tree makes with them.
+// Database is a store's database on disk: its metadata and content as one store.
 // FILE names its metadata's file in the store directory.
 trait Database {
-    type Metadata: KeyValueStore;
-    type Content: ContentStore + Clone + 'static;
     type Store: Store;
 
     const FILE: &str;
 
-    fn open(directory: &Path) -> Result<(Self::Metadata, Self::Content), OpenError>;
-
-    fn store(volume: Volume<Self::Metadata>, content: Self::Content) -> Self::Store;
+    fn open(directory: &Path) -> Result<Self::Store, OpenError>;
 }
 
-type Volume<M> = TreeVolume<M, fn() -> u128, FuseTreeConfig>;
+type Volume<D> = TreeVolume<<D as Database>::Store, fn() -> u128, FuseTreeConfig>;
 
-type Engine<D, C> =
-    FsEngine<<D as Database>::Store, fn() -> u64, fn() -> Timestamp, FuseFsConfig, C>;
+type Engine<D, C> = FsEngine<Volume<D>, fn() -> u64, fn() -> Timestamp, FuseFsConfig, C>;
 
 struct Mdbx;
 
 impl Database for Mdbx {
-    type Metadata = MdbxMetadata<ThreadPool>;
-    type Content = MdbxContent<ThreadPool>;
-    type Store = MdbxStore<Volume<Self::Metadata>, ThreadPool>;
+    type Store = MdbxStore<MdbxMetadata<ThreadPool>, ThreadPool>;
 
     const FILE: &str = "store.mdbx";
 
-    fn open(directory: &Path) -> Result<(Self::Metadata, Self::Content), OpenError> {
+    fn open(directory: &Path) -> Result<Self::Store, OpenError> {
         let metadata =
             MdbxMetadata::open(directory.join(Self::FILE), &MDBX_CONFIGURATION, ThreadPool)
                 .map_err(|error| match error {
@@ -263,24 +255,18 @@ impl Database for Mdbx {
                     error => OpenError::Database(Box::new(error)),
                 })?;
         let content = MdbxContent::of(&metadata);
-        Ok((metadata, content))
-    }
-
-    fn store(volume: Volume<Self::Metadata>, content: Self::Content) -> Self::Store {
-        MdbxStore::new(volume, content)
+        Ok(MdbxStore::new(metadata, content))
     }
 }
 
 struct Redb;
 
 impl Database for Redb {
-    type Metadata = RedbStore<ThreadPool>;
-    type Content = ObjectStoreContentStore;
-    type Store = LockSynchronizedStore<Volume<Self::Metadata>, Self::Content>;
+    type Store = LockSynchronizedStore<RedbStore<ThreadPool>, ObjectStoreContentStore>;
 
     const FILE: &str = "metadata.redb";
 
-    fn open(directory: &Path) -> Result<(Self::Metadata, Self::Content), OpenError> {
+    fn open(directory: &Path) -> Result<Self::Store, OpenError> {
         let content = ObjectStoreContentStore::local(directory.join("content"))
             .map_err(|error| OpenError::Database(Box::new(error)))?;
         let metadata = RedbStore::local(directory.join(Self::FILE), ThreadPool).map_err(
@@ -289,37 +275,27 @@ impl Database for Redb {
                 error => OpenError::Database(Box::new(error)),
             },
         )?;
-        Ok((metadata, content))
-    }
-
-    fn store(volume: Volume<Self::Metadata>, content: Self::Content) -> Self::Store {
-        LockSynchronizedStore::new(volume, content)
+        Ok(LockSynchronizedStore::new(metadata, content))
     }
 }
 
 struct Sqlite;
 
 impl Database for Sqlite {
-    type Metadata = SqliteMetadata<ThreadPool>;
-    type Content = SqliteContent<ThreadPool>;
-    type Store = SqliteStore<Volume<Self::Metadata>, ThreadPool>;
+    type Store = SqliteStore<SqliteMetadata<ThreadPool>, ThreadPool>;
 
     const FILE: &str = "store.sqlite";
 
-    fn open(directory: &Path) -> Result<(Self::Metadata, Self::Content), OpenError> {
+    fn open(directory: &Path) -> Result<Self::Store, OpenError> {
         let metadata = SqliteMetadata::local(directory.join(Self::FILE), ThreadPool)
             .map_err(|error| OpenError::Database(Box::new(error)))?;
         let content = SqliteContent::of(&metadata);
-        Ok((metadata, content))
-    }
-
-    fn store(volume: Volume<Self::Metadata>, content: Self::Content) -> Self::Store {
-        SqliteStore::new(volume, content)
+        Ok(SqliteStore::new(metadata, content))
     }
 }
 
 // serve mounts the volume arguments name from a store of database D, with the consistency made by consistency.
-fn serve<D: Database, C: Cached<D::Store>>(
+fn serve<D: Database, C: Cached<Volume<D>>>(
     arguments: &MountArguments,
     runtime: Arc<dyn Runtime>,
     consistency: impl FnOnce() -> Result<C, OpenError>,
@@ -339,10 +315,9 @@ fn serve<D: Database, C: Cached<D::Store>>(
             if !directory_holds::<D>(&arguments.store)? {
                 return Err(OpenError::NoStore);
             }
-            let (tree, content) = open_tree::<D>(&arguments.store, Arc::clone(&runtime)).await?;
+            let tree = open_tree::<D>(&arguments.store, Arc::clone(&runtime)).await?;
             engine::<D, C>(
                 &tree,
-                content,
                 arguments.volume,
                 limit,
                 consistency()?,
@@ -363,7 +338,7 @@ async fn create_volume<D: Database>(directory: &Path) -> Result<TreeVolumeId, Op
         .create()
         .map_err(OpenError::Runtime)?;
     let runtime: Arc<dyn Runtime> = Arc::new(ThreadPoolRuntime(pool));
-    let (tree, content) = open_tree::<D>(directory, Arc::clone(&runtime)).await?;
+    let tree = open_tree::<D>(directory, Arc::clone(&runtime)).await?;
     let volume = tree
         .create()
         .await
@@ -371,7 +346,6 @@ async fn create_volume<D: Database>(directory: &Path) -> Result<TreeVolumeId, Op
     // Opening the engine makes the volume's root directory, so a mount finds it ready.
     let engine = engine::<D, Eventual>(
         &tree,
-        content,
         volume,
         Some(DurableAgainst::PowerFailure),
         Eventual::default(),
@@ -386,7 +360,7 @@ async fn create_volume<D: Database>(directory: &Path) -> Result<TreeVolumeId, Op
     Ok(volume)
 }
 
-type StoreTree<D> = Tree<<D as Database>::Metadata, fn() -> u128, FuseTreeConfig>;
+type StoreTree<D> = Tree<<D as Database>::Store, fn() -> u128, FuseTreeConfig>;
 
 // directory_holds says whether directory holds a store of database D.
 fn directory_holds<D: Database>(directory: &Path) -> Result<bool, OpenError> {
@@ -396,38 +370,35 @@ fn directory_holds<D: Database>(directory: &Path) -> Result<bool, OpenError> {
         .map_err(OpenError::Find)
 }
 
-// open_tree opens the tree and content of the store of database D in directory, making the store first if the
-// directory holds none. Its volumes' garbage collectors run on runtime.
+// open_tree opens the tree of the store of database D in directory, making the store first if the directory holds
+// none. Its volumes' garbage collectors run on runtime.
 async fn open_tree<D: Database>(
     directory: &Path,
     runtime: Arc<dyn Runtime>,
-) -> Result<(StoreTree<D>, D::Content), OpenError> {
-    let (metadata, content) = D::open(directory)?;
+) -> Result<StoreTree<D>, OpenError> {
     let allocate_node: fn() -> u128 = rand::random;
-    let tree = Tree::new(metadata, allocate_node, content.clone(), runtime)
+    Tree::new(D::open(directory)?, allocate_node, runtime)
         .await
-        .map_err(|error| OpenError::Tree(Box::new(error)))?;
-    Ok((tree, content))
+        .map_err(|error| OpenError::Tree(Box::new(error)))
 }
 
 // engine opens volume of tree as an engine that invalidates kernel's cache, running its work on runtime.
-async fn engine<D: Database, C: Cached<D::Store>>(
+async fn engine<D: Database, C: Cached<Volume<D>>>(
     tree: &StoreTree<D>,
-    content: D::Content,
     volume: TreeVolumeId,
     durability_limit: Option<DurableAgainst>,
     consistency: C,
     kernel: impl KernelCache,
     runtime: Arc<dyn Runtime>,
 ) -> Result<Engine<D, C>, OpenError> {
-    let metadata = tree.open(volume).await.map_err(|error| match error {
+    let volume = tree.open(volume).await.map_err(|error| match error {
         StoreError::Rejected(UnknownVolume) => OpenError::UnknownVolume,
         StoreError::Failed(failure) => OpenError::Volume(Box::new(failure)),
     })?;
     let allocate_inode: fn() -> u64 = rand::random;
     let allocate_content_id: fn() -> ContentId = || ContentId(rand::random());
     FsEngine::new(
-        D::store(metadata, content),
+        volume,
         allocate_inode,
         allocate_content_id,
         now as fn() -> Timestamp,

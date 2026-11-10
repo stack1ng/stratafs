@@ -1,20 +1,19 @@
 use std::convert::Infallible;
-use std::error::Error;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_channel::oneshot;
-use futures_core::future::BoxFuture;
 use stratafs_runtime::Runtime;
 use stratafs_serialized::serialized_value;
-use stratafs_store::content::{ContentId, ContentReference, ContentStore};
+use stratafs_store::content::ContentReference;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::kv::{
     KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction, SetRejection, TransactError,
 };
+use stratafs_store::store::Store;
 use zerocopy::little_endian::{U64, U128};
 
 use crate::branch_observation::SharedWatches;
@@ -41,26 +40,11 @@ pub trait TreeConfig: Send + Sync + 'static {
     }
 }
 
-// ContentDeleter is the part of a content store the tree uses.
-pub trait ContentDeleter: Send + Sync + 'static {
-    // delete removes the blob kept under id, and succeeds when there is none.
-    fn delete(&self, id: ContentId) -> BoxFuture<'_, Result<(), Box<dyn Error + Send + Sync>>>;
-}
+// MetadataRejection is the rejection of a store's metadata store.
+pub type MetadataRejection<S> = <<S as Store>::Metadata as KeyValueStore>::Rejection;
 
-impl<C: ContentStore + 'static> ContentDeleter for C {
-    fn delete(&self, id: ContentId) -> BoxFuture<'_, Result<(), Box<dyn Error + Send + Sync>>> {
-        Box::pin(async move { ContentStore::delete(self, &id).await.map_err(Into::into) })
-    }
-}
-
-// NoContent is the content of a tree whose entries reference none.
-pub struct NoContent;
-
-impl ContentDeleter for NoContent {
-    fn delete(&self, _id: ContentId) -> BoxFuture<'_, Result<(), Box<dyn Error + Send + Sync>>> {
-        Box::pin(async { Ok(()) })
-    }
-}
+// MetadataFailure is the failure of a store's metadata store.
+pub type MetadataFailure<S> = <<S as Store>::Metadata as KeyValueStore>::Failure;
 
 pub(crate) trait TreeConfigLimits: TreeConfig {
     const LARGEST_ENTRY_SIZE: usize;
@@ -104,15 +88,13 @@ pub enum PinnedConfigError<R, F> {
     Store(StoreError<SetRejection<R>, F>),
 }
 
-pub struct Tree<S: KeyValueStore, A, C>(Arc<TreeShared<S, A, C>>);
+pub struct Tree<S: Store, A, C>(Arc<TreeShared<S, A, C>>);
 
-pub(crate) struct TreeShared<S: KeyValueStore, A, C> {
+pub(crate) struct TreeShared<S: Store, A, C> {
     pub(crate) store: S,
     pub(crate) id_allocator: A,
-    // content deletes each blob the garbage collector finds unreferenced
-    pub(crate) content: Arc<dyn ContentDeleter>,
     // watches holds each watch that waiters share, for as long as one of them still waits on it
-    pub(crate) watches: Mutex<SharedWatches<S::Failure>>,
+    pub(crate) watches: Mutex<SharedWatches<MetadataFailure<S>>>,
     // runtime runs each opened volume's garbage collector
     pub(crate) runtime: Arc<dyn Runtime>,
     config: PhantomData<C>,
@@ -120,7 +102,7 @@ pub(crate) struct TreeShared<S: KeyValueStore, A, C> {
 
 impl<S, A, C> Tree<S, A, C>
 where
-    S: KeyValueStore,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -129,11 +111,14 @@ where
     pub async fn new(
         store: S,
         id_allocator: A,
-        content: impl ContentDeleter,
         runtime: Arc<dyn Runtime>,
     ) -> Result<
         Self,
-        TransactError<S::Rejection, S::Failure, PinnedConfigError<S::Rejection, S::Failure>>,
+        TransactError<
+            MetadataRejection<S>,
+            MetadataFailure<S>,
+            PinnedConfigError<MetadataRejection<S>, MetadataFailure<S>>,
+        >,
     > {
         const {
             assert!(
@@ -167,6 +152,7 @@ where
             merge_below_percent: C::MERGE_BELOW_PERCENT,
         };
         store
+            .metadata()
             .transact(move |mut transaction| {
                 Box::pin(async move {
                     let key = Bytes::from(TreeKey::Config);
@@ -194,7 +180,6 @@ where
         Ok(Self(Arc::new(TreeShared {
             store,
             id_allocator,
-            content: Arc::new(content),
             watches: Mutex::default(),
             runtime,
             config: PhantomData,
@@ -204,13 +189,16 @@ where
 
 impl<S, A, C> ForkableKeyValueStore for Tree<S, A, C>
 where
-    S: KeyValueStore,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
-    type Failure = TreeFailure<S::Failure, S::Rejection>;
-    type CreateError =
-        TransactError<S::Rejection, S::Failure, StoreError<SetRejection<S::Rejection>, S::Failure>>;
+    type Failure = TreeFailure<MetadataFailure<S>, MetadataRejection<S>>;
+    type CreateError = TransactError<
+        MetadataRejection<S>,
+        MetadataFailure<S>,
+        StoreError<SetRejection<MetadataRejection<S>>, MetadataFailure<S>>,
+    >;
     type VolumeId = TreeVolumeId;
     type Volume = TreeVolume<S, A, C>;
 
@@ -220,6 +208,7 @@ where
         let root = NodeId(U128::new((self.0.id_allocator)()));
         self.0
             .store
+            .metadata()
             .transact(move |mut transaction| {
                 Box::pin(async move {
                     transaction.set(
@@ -261,6 +250,7 @@ where
         let header = self
             .0
             .store
+            .metadata()
             .read_transact(move |transaction| {
                 Box::pin(async move { transaction.get(TreeKey::VolumeHeader(id).into()).await })
             })

@@ -30,20 +30,12 @@ fn reopened<D: Database>(database: StoreKind) {
     let pool = SpawnerPool::builder().pool_size(1).create().unwrap();
     let runtime: Arc<dyn Runtime> = Arc::new(ThreadPoolRuntime(pool));
     block_on(async {
-        let (tree, content) = open_tree::<D>(directory.path(), Arc::clone(&runtime))
+        let tree = open_tree::<D>(directory.path(), Arc::clone(&runtime))
             .await
             .unwrap();
-        engine::<D, Eventual>(
-            &tree,
-            content,
-            volume,
-            None,
-            Eventual::default(),
-            NoKernel,
-            runtime,
-        )
-        .await
-        .unwrap();
+        engine::<D, Eventual>(&tree, volume, None, Eventual::default(), NoKernel, runtime)
+            .await
+            .unwrap();
     });
 }
 
@@ -68,12 +60,11 @@ fn a_volume_a_store_never_made_is_unknown() {
     let pool = SpawnerPool::builder().pool_size(1).create().unwrap();
     let runtime: Arc<dyn Runtime> = Arc::new(ThreadPoolRuntime(pool));
     let opened = block_on(async {
-        let (tree, content) = open_tree::<Mdbx>(directory.path(), Arc::clone(&runtime))
+        let tree = open_tree::<Mdbx>(directory.path(), Arc::clone(&runtime))
             .await
             .unwrap();
         engine::<Mdbx, Eventual>(
             &tree,
-            content,
             TreeVolumeId::try_from(Bytes::from(vec![7; 16])).unwrap(),
             None,
             Eventual::default(),

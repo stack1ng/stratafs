@@ -5,7 +5,8 @@ use bytes::Bytes;
 use equivalent::Comparable;
 use futures_util::future::try_join_all;
 use smallvec::SmallVec;
-use stratafs_store::kv::{KeyValueStore, ReadKeyValueTransaction};
+use stratafs_store::kv::ReadKeyValueTransaction;
+use stratafs_store::store::Store;
 
 use crate::error::TreeFailure;
 use crate::header::{NodeId, VolumeEpoch, VolumeHeader};
@@ -13,7 +14,7 @@ use crate::key::TreeKey;
 use crate::node::{InternalEntry, LeafEntry, Node, ObservedNode};
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
-use crate::tree::TreeConfig;
+use crate::tree::{MetadataRejection, TreeConfig};
 use crate::volume::TreeTransaction;
 
 const MAX_DEPTH: usize = 64;
@@ -102,13 +103,13 @@ impl<R: AddressableRange> DescentStep<R, LeafEntry<R>, Result<usize, usize>> {
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
     T: ReadKeyValueTransaction,
-    S: KeyValueStore,
+    S: Store,
     C: TreeConfig,
 {
     pub(crate) async fn descend<Q>(
         &self,
         target: &Q,
-    ) -> Result<DescentPath<C::Range>, TreeFailure<T::Failure, S::Rejection>>
+    ) -> Result<DescentPath<C::Range>, TreeFailure<T::Failure, MetadataRejection<S>>>
     where
         Q: Ord,
         [u8]: Comparable<Q>,
@@ -124,7 +125,7 @@ where
     pub(crate) async fn descend_many<Q>(
         &self,
         targets: &[Q],
-    ) -> Result<SmallVec<[DescentPath<C::Range>; 1]>, TreeFailure<T::Failure, S::Rejection>>
+    ) -> Result<SmallVec<[DescentPath<C::Range>; 1]>, TreeFailure<T::Failure, MetadataRejection<S>>>
     where
         Q: Ord,
         [u8]: Comparable<Q>,
@@ -219,7 +220,8 @@ where
     async fn read_node(
         &self,
         id: NodeId,
-    ) -> Result<(VolumeEpoch, Node<Bytes, C::Range>), TreeFailure<T::Failure, S::Rejection>> {
+    ) -> Result<(VolumeEpoch, Node<Bytes, C::Range>), TreeFailure<T::Failure, MetadataRejection<S>>>
+    {
         let stored = self
             .inner
             .get(TreeKey::Node(id).into())
@@ -235,7 +237,7 @@ where
         target: &Q,
     ) -> Result<
         DescentStep<C::Range, LeafEntry<C::Range>, Result<usize, usize>>,
-        TreeFailure<T::Failure, S::Rejection>,
+        TreeFailure<T::Failure, MetadataRejection<S>>,
     >
     where
         [u8]: Comparable<Q>,
@@ -280,7 +282,7 @@ where
         cursor: &'cursor mut DescentPath<C::Range>,
     ) -> Result<
         Option<(&'cursor LeafEntry<C::Range>, &'cursor Bytes)>,
-        TreeFailure<T::Failure, S::Rejection>,
+        TreeFailure<T::Failure, MetadataRejection<S>>,
     > {
         let next_held_leaf_index = match cursor.destination.position {
             Ok(index) => index,

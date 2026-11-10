@@ -1,9 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::error::Error;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures_lite::future::block_on;
@@ -11,9 +10,10 @@ use proptest::prelude::RngExt;
 use proptest::test_runner::{RngAlgorithm, TestRng};
 use redb::backends::InMemoryBackend;
 use stratafs_kv_conformance::runtime::{Replay, ReplayingRuntime, seeded};
+use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_redb::{RedbFailure, RedbStore};
 use stratafs_runtime::{Runtime, TaskDroppingRuntime};
-use stratafs_store::content::{ContentId, ContentReference};
+use stratafs_store::content::{ContentId, ContentReference, ContentStore, GetRejection};
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::spawn::Inline;
 use zerocopy::little_endian::{U64, U128};
@@ -24,7 +24,7 @@ use crate::header::{JobId, TreeContentId};
 use crate::invariants;
 use crate::key::Referenced;
 use crate::node::Node;
-use crate::tree::{ContentDeleter, Tree};
+use crate::tree::Tree;
 
 struct SmallNodeConfig;
 
@@ -47,8 +47,9 @@ impl TreeConfig for SmallNodeConfig {
     }
 }
 
-type TestTree = Tree<RedbStore<Inline>, fn() -> u128, SmallNodeConfig>;
-type TestVolume = TreeVolume<RedbStore<Inline>, fn() -> u128, SmallNodeConfig>;
+type TestStore = LockSynchronizedStore<RedbStore<Inline>, DeletedContent>;
+type TestTree = Tree<TestStore, fn() -> u128, SmallNodeConfig>;
+type TestVolume = TreeVolume<TestStore, fn() -> u128, SmallNodeConfig>;
 type Failure = TreeFailure<RedbFailure, Infallible>;
 
 const KEY_COUNT: usize = 400;
@@ -58,40 +59,69 @@ fn allocate_id() -> u128 {
     u128::from(NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-// DeletedContent is every blob a test tree's garbage collector deleted, in order, and whether its deletes fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentEvent {
+    MadeDurable,
+    Deleted(u128),
+}
+
+// DeletedContent is what a test tree's garbage collector did to its content, in order, and whether its deletes fail.
 #[derive(Clone, Default)]
 struct DeletedContent {
-    ids: Arc<Mutex<Vec<u128>>>,
+    events: Arc<Mutex<Vec<ContentEvent>>>,
     // failing is the ids whose delete fails
     failing: Arc<Mutex<HashSet<u128>>>,
 }
 
-impl ContentDeleter for DeletedContent {
-    fn delete(&self, id: ContentId) -> BoxFuture<'_, Result<(), Box<dyn Error + Send + Sync>>> {
-        Box::pin(async move {
-            if self
-                .failing
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .contains(&id.0)
-            {
-                return Err("the delete failed on purpose".into());
-            }
-            self.ids
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(id.0);
-            Ok(())
-        })
+// Only the garbage collector uses the content of a test tree, to delete from it.
+impl ContentStore for DeletedContent {
+    type Failure = std::io::Error;
+    type Content = Bytes;
+
+    async fn put(&self, _id: &ContentId, _content: impl Buf + Send) -> Result<(), Self::Failure> {
+        unreachable!("a test tree stores no content")
+    }
+
+    async fn get(
+        &self,
+        _id: &ContentId,
+        _offset: u64,
+        _size: u64,
+    ) -> Result<Bytes, StoreError<GetRejection, Self::Failure>> {
+        unreachable!("a test tree reads no content")
+    }
+
+    async fn delete(&self, id: &ContentId) -> Result<(), Self::Failure> {
+        if self
+            .failing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&id.0)
+        {
+            return Err(std::io::Error::other("the delete failed on purpose"));
+        }
+        self.events().push(ContentEvent::Deleted(id.0));
+        Ok(())
+    }
+
+    async fn ensure_durable(&self, _against: DurableAgainst) -> Result<(), Self::Failure> {
+        self.events().push(ContentEvent::MadeDurable);
+        Ok(())
     }
 }
 
 impl DeletedContent {
+    fn events(&self) -> MutexGuard<'_, Vec<ContentEvent>> {
+        self.events.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // ids is every blob deleted, in order.
     fn ids(&self) -> Vec<u128> {
-        self.ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        let deleted = |event: &ContentEvent| match event {
+            ContentEvent::Deleted(id) => Some(*id),
+            ContentEvent::MadeDurable => None,
+        };
+        self.events().iter().filter_map(deleted).collect()
     }
 
     fn fail(&self, ids: impl IntoIterator<Item = u128>) {
@@ -114,9 +144,8 @@ fn new_tree_on(runtime: Arc<dyn Runtime>, deleted: &DeletedContent) -> TestTree 
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
     block_on(Tree::new(
-        RedbStore::new(database, Inline).unwrap(),
+        LockSynchronizedStore::new(RedbStore::new(database, Inline).unwrap(), deleted.clone()),
         allocate_id as fn() -> u128,
-        deleted.clone(),
         runtime,
     ))
     .unwrap()
@@ -204,32 +233,32 @@ where
 }
 
 // depth is the number of internal layers above the leaves.
-fn depth<S: KeyValueStore, A: Fn() -> u128 + Send + Sync + 'static>(
+fn depth<S: Store, A: Fn() -> u128 + Send + Sync + 'static>(
     volume: &TreeVolume<S, A, SmallNodeConfig>,
 ) -> usize {
     block_on(volume.read_transact(|transaction| {
         Box::pin(async move {
             let path = transaction.descend(&Bytes::new()).await?;
-            Ok::<_, TreeFailure<S::Failure, S::Rejection>>(path.steps.len())
+            Ok::<_, TreeFailure<MetadataFailure<S>, MetadataRejection<S>>>(path.steps.len())
         })
     }))
     .unwrap()
 }
 
-fn root<S: KeyValueStore, A: Fn() -> u128 + Send + Sync + 'static>(
+fn root<S: Store, A: Fn() -> u128 + Send + Sync + 'static>(
     volume: &TreeVolume<S, A, SmallNodeConfig>,
 ) -> NodeId {
     block_on(volume.read_transact(|transaction| {
         Box::pin(async move {
             let header = transaction.get_volume_header().await?;
-            Ok::<_, TreeFailure<S::Failure, S::Rejection>>(header.root)
+            Ok::<_, TreeFailure<MetadataFailure<S>, MetadataRejection<S>>>(header.root)
         })
     }))
     .unwrap()
 }
 
-fn counts_match_parents<S: KeyValueStore, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> bool {
-    block_on(volume.shared.store.read_transact(|transaction| {
+fn counts_match_parents<S: Store, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> bool {
+    block_on(volume.shared.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             Ok::<_, Infallible>(
                 invariants::node_ref_counts_match_parents::<_, u8>(&*transaction).await,
@@ -260,10 +289,8 @@ fn set_content(volume: &TestVolume, indexes: Range<usize>, id: u128, exists: boo
     .unwrap();
 }
 
-fn content_counts_match_leaves<S: KeyValueStore, A>(
-    volume: &TreeVolume<S, A, SmallNodeConfig>,
-) -> bool {
-    block_on(volume.shared.store.read_transact(|transaction| {
+fn content_counts_match_leaves<S: Store, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> bool {
+    block_on(volume.shared.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             Ok::<_, Infallible>(
                 invariants::content_ref_counts_match_leaves::<_, SmallNodeConfig>(&*transaction)
@@ -276,7 +303,7 @@ fn content_counts_match_leaves<S: KeyValueStore, A>(
 
 // content_counts maps each blob with a stored reference count to it.
 fn content_counts(volume: &TestVolume) -> HashMap<u128, u64> {
-    block_on(volume.shared.store.read_transact(|transaction| {
+    block_on(volume.shared.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             let counts = transaction
                 .get_range(
@@ -302,7 +329,7 @@ fn content_counts(volume: &TestVolume) -> HashMap<u128, u64> {
 
 // referenced_content are the blobs the entries of every stored leaf reference.
 fn referenced_content(volume: &TestVolume) -> HashSet<u128> {
-    block_on(volume.shared.store.read_transact(|transaction| {
+    block_on(volume.shared.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             let mut referenced = HashSet::new();
             let nodes = transaction
@@ -336,8 +363,8 @@ fn referenced_content(volume: &TestVolume) -> HashSet<u128> {
 }
 
 // stored_counts are every node reference count the store holds.
-fn stored_counts<S: KeyValueStore, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> Vec<u64> {
-    block_on(volume.shared.store.read_transact(|transaction| {
+fn stored_counts<S: Store, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> Vec<u64> {
+    block_on(volume.shared.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             let counts: Vec<_> = transaction
                 .get_range(
@@ -350,17 +377,15 @@ fn stored_counts<S: KeyValueStore, A>(volume: &TreeVolume<S, A, SmallNodeConfig>
                 .await?
                 .map(|(_, count)| U64::read_from_bytes(&count).unwrap().get())
                 .collect();
-            Ok::<_, <S::ReadTransaction<'_> as ReadKeyValueTransaction>::Failure>(counts)
+            Ok::<_, MetadataFailure<S>>(counts)
         })
     }))
     .unwrap()
 }
 
 // jobs are every pending job's volume and node, in key order.
-fn jobs<S: KeyValueStore, A>(
-    volume: &TreeVolume<S, A, SmallNodeConfig>,
-) -> Vec<(TreeVolumeId, NodeId)> {
-    block_on(volume.shared.store.read_transact(|transaction| {
+fn jobs<S: Store, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> Vec<(TreeVolumeId, NodeId)> {
+    block_on(volume.shared.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             let jobs: Vec<_> = transaction
                 .get_range(
@@ -388,18 +413,18 @@ fn jobs<S: KeyValueStore, A>(
                     }
                 })
                 .collect();
-            Ok::<_, <S::ReadTransaction<'_> as ReadKeyValueTransaction>::Failure>(jobs)
+            Ok::<_, MetadataFailure<S>>(jobs)
         })
     }))
     .unwrap()
 }
 
 // tree_parents maps every node in the volume's tree to its parent, where the root has none.
-fn tree_parents<S: KeyValueStore, A>(
+fn tree_parents<S: Store, A>(
     volume: &TreeVolume<S, A, SmallNodeConfig>,
 ) -> HashMap<u128, Option<u128>> {
     let volume_id = volume.id;
-    block_on(volume.shared.store.read_transact(|transaction| {
+    block_on(volume.shared.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             let header = transaction
                 .get(TreeKey::VolumeHeader(volume_id).into())
@@ -418,15 +443,15 @@ fn tree_parents<S: KeyValueStore, A>(
                     }
                 }
             }
-            Ok::<_, <S::ReadTransaction<'_> as ReadKeyValueTransaction>::Failure>(parents)
+            Ok::<_, MetadataFailure<S>>(parents)
         })
     }))
     .unwrap()
 }
 
 // stored_nodes are the ids of every node the store holds.
-fn stored_nodes<S: KeyValueStore, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> HashSet<u128> {
-    block_on(volume.shared.store.read_transact(|transaction| {
+fn stored_nodes<S: Store, A>(volume: &TreeVolume<S, A, SmallNodeConfig>) -> HashSet<u128> {
+    block_on(volume.shared.store.metadata().read_transact(|transaction| {
         Box::pin(async move {
             let nodes: HashSet<_> = transaction
                 .get_range(
@@ -440,7 +465,7 @@ fn stored_nodes<S: KeyValueStore, A>(volume: &TreeVolume<S, A, SmallNodeConfig>)
                     _ => unreachable!("the range holds only nodes"),
                 })
                 .collect();
-            Ok::<_, <S::ReadTransaction<'_> as ReadKeyValueTransaction>::Failure>(nodes)
+            Ok::<_, MetadataFailure<S>>(nodes)
         })
     }))
     .unwrap()
@@ -528,7 +553,7 @@ fn the_check_catches_a_count_that_misses_a_header() {
     let volume = new_volume(&tree);
     fork(&volume);
     let root = root(&volume);
-    block_on(volume.shared.store.transact(|mut transaction| {
+    block_on(volume.shared.store.metadata().transact(|mut transaction| {
         Box::pin(async move {
             transaction.clear(TreeKey::RefCount(Referenced::Node(root)).into())?;
             Ok::<_, RedbFailure>(((), transaction))
@@ -542,7 +567,7 @@ fn the_check_catches_a_count_that_misses_a_header() {
 fn the_check_catches_a_count_on_a_node_no_tree_reaches() {
     let tree = new_tree();
     let volume = new_volume(&tree);
-    block_on(volume.shared.store.transact(|mut transaction| {
+    block_on(volume.shared.store.metadata().transact(|mut transaction| {
         Box::pin(async move {
             transaction.set(
                 TreeKey::RefCount(Referenced::Node(NodeId(U128::new(u128::MAX)))).into(),
@@ -656,7 +681,7 @@ fn the_check_catches_a_job_on_a_node_that_lost_no_parent() {
     fork(&volume);
     let root = root(&volume);
     let volume_id = volume.id;
-    block_on(volume.shared.store.transact(|mut transaction| {
+    block_on(volume.shared.store.metadata().transact(|mut transaction| {
         Box::pin(async move {
             transaction.set(
                 TreeKey::Dereference(volume_id, Referenced::Node(root), JobId(u128::MAX)).into(),
@@ -676,7 +701,7 @@ fn the_check_catches_a_missing_job_on_a_cut_off_subtree() {
     set_keys(&volume, 0..KEY_COUNT);
     clear_range(&volume, Bytes::from("key/0040")..Bytes::from("key/0360"));
     assert!(counts_match_parents(&volume));
-    block_on(volume.shared.store.transact(|mut transaction| {
+    block_on(volume.shared.store.metadata().transact(|mut transaction| {
         Box::pin(async move {
             let (first, _) = transaction
                 .get_range(
@@ -709,7 +734,7 @@ fn the_check_catches_a_lost_header() {
     let volume = new_volume(&tree);
     set_keys(&volume, 0..KEY_COUNT);
     let volume_id = volume.id;
-    block_on(volume.shared.store.transact(|mut transaction| {
+    block_on(volume.shared.store.metadata().transact(|mut transaction| {
         Box::pin(async move {
             transaction.clear(TreeKey::VolumeHeader(volume_id).into())?;
             Ok::<_, RedbFailure>(((), transaction))
@@ -796,6 +821,23 @@ fn a_blob_forks_share_is_deleted_once_no_fork_references_it() {
 }
 
 #[test]
+fn the_garbage_collector_makes_the_whole_store_durable_before_it_deletes_a_blob() {
+    let deleted = DeletedContent::default();
+    let tree = new_tree_deleting(&deleted);
+    let volume = new_volume(&tree);
+    set_content(&volume, 0..1, 1, false);
+    set_keys(&volume, 0..1);
+    collect_garbage(&volume);
+    assert!(deleted.events().is_empty());
+    collect_garbage(&volume);
+    // the store makes its content durable ahead of its metadata, so the content coming first shows the store did it
+    assert_eq!(
+        *deleted.events(),
+        [ContentEvent::MadeDurable, ContentEvent::Deleted(1)]
+    );
+}
+
+#[test]
 fn a_failed_delete_is_retried_by_the_next_pass() {
     let deleted = DeletedContent::default();
     let tree = new_tree_deleting(&deleted);
@@ -822,7 +864,7 @@ fn the_check_catches_a_content_count_off_by_one() {
     let volume = new_volume(&tree);
     set_content(&volume, 0..2, 1, false);
     assert!(content_counts_match_leaves(&volume));
-    block_on(volume.shared.store.transact(|mut transaction| {
+    block_on(volume.shared.store.metadata().transact(|mut transaction| {
         Box::pin(async move {
             transaction.set(
                 TreeKey::RefCount(Referenced::Content(TreeContentId(1))).into(),
@@ -1072,9 +1114,11 @@ fn dropping_a_volume_stops_its_garbage_collector() {
 fn open_crashed_copy(path: &std::path::Path, copy: &std::path::Path) -> TestTree {
     std::fs::copy(path, copy).unwrap();
     block_on(Tree::new(
-        RedbStore::local(copy, Inline).unwrap(),
+        LockSynchronizedStore::new(
+            RedbStore::local(copy, Inline).unwrap(),
+            DeletedContent::default(),
+        ),
         allocate_id as fn() -> u128,
-        DeletedContent::default(),
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap()
@@ -1088,9 +1132,8 @@ fn a_crash_after_garbage_collection_brings_back_no_reference_to_a_deleted_blob()
     let file = directory.join("metadata.redb");
     let deleted = DeletedContent::default();
     let tree: TestTree = block_on(Tree::new(
-        RedbStore::local(&file, Inline).unwrap(),
+        LockSynchronizedStore::new(RedbStore::local(&file, Inline).unwrap(), deleted.clone()),
         allocate_id as fn() -> u128,
-        deleted.clone(),
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();
@@ -1100,6 +1143,7 @@ fn a_crash_after_garbage_collection_brings_back_no_reference_to_a_deleted_blob()
         volume
             .shared
             .store
+            .metadata()
             .ensure_durable(stratafs_store::durability::DurableAgainst::PowerFailure),
     )
     .unwrap();

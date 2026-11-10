@@ -3,8 +3,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures_lite::future::block_on;
+use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
 use stratafs_kv_conformance::runtime::{exhaustive_dfs, seeded};
+use stratafs_lock_synchronized::LockSynchronizedStore;
+use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::error::StoreError;
@@ -12,8 +15,10 @@ use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::spawn::Inline;
 use stratafs_tree::header::TreeVolumeId;
 use stratafs_tree::serialized::CorruptValue;
-use stratafs_tree::tree::{NoContent, Tree, TreeConfig};
+use stratafs_tree::tree::{Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
+
+type TestStore = LockSynchronizedStore<RedbStore<Inline>, ObjectStoreContentStore>;
 
 struct SingleLeafConfig;
 
@@ -31,22 +36,24 @@ impl TreeConfig for SmallNodeConfig {
     const MERGE_BELOW_PERCENT: u8 = 25;
 }
 
-fn new_tree<C: TreeConfig>() -> Tree<RedbStore<Inline>, impl Fn() -> u128, C> {
+fn new_tree<C: TreeConfig>() -> Tree<TestStore, impl Fn() -> u128, C> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
     let next_id = AtomicU64::new(1);
     let allocate_id = move || u128::from(next_id.fetch_add(1, Ordering::Relaxed));
     block_on(Tree::new(
-        RedbStore::new(database, Inline).unwrap(),
+        LockSynchronizedStore::new(
+            RedbStore::new(database, Inline).unwrap(),
+            ObjectStoreContentStore::new(InMemory::new()),
+        ),
         allocate_id,
-        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap()
 }
 
-fn open_volume<C: TreeConfig>() -> TreeVolume<RedbStore<Inline>, impl Fn() -> u128, C> {
+fn open_volume<C: TreeConfig>() -> TreeVolume<TestStore, impl Fn() -> u128, C> {
     let tree = new_tree::<C>();
     block_on(async {
         let id = tree.create().await.unwrap();

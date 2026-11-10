@@ -51,9 +51,10 @@ impl TreeConfig for TestTreeConfig {
     }
 }
 
-pub(crate) type InMemoryStore = LockSynchronizedStore<
-    TreeVolume<RedbStore<Inline>, fn() -> u128, TestTreeConfig>,
-    ListedContent,
+pub(crate) type InMemoryStore = TreeVolume<
+    LockSynchronizedStore<RedbStore<Inline>, ListedContent>,
+    fn() -> u128,
+    TestTreeConfig,
 >;
 
 // ListedContent keeps content in memory, and lists the id of every blob it keeps.
@@ -172,7 +173,8 @@ pub(crate) fn new_test_engine_with<C: Cached<InMemoryStore>>(
     volumes.engine_with(volume, consistency, kernel)
 }
 
-pub(crate) type TestTree = Tree<RedbStore<Inline>, fn() -> u128, TestTreeConfig>;
+pub(crate) type TestTree =
+    Tree<LockSynchronizedStore<RedbStore<Inline>, ListedContent>, fn() -> u128, TestTreeConfig>;
 
 // TestVolumes is a tree of volumes in memory and the content their engines share. Only a test runs its garbage
 // collection.
@@ -193,9 +195,8 @@ impl TestVolumes {
         let content = ListedContent::new();
         // node ids count per thread, so the tree runs no garbage collector on another thread
         let tree = block_on(Tree::new(
-            RedbStore::new(database, Inline).unwrap(),
+            LockSynchronizedStore::new(RedbStore::new(database, Inline).unwrap(), content.clone()),
             allocate_node,
-            content.clone(),
             Arc::new(TaskDroppingRuntime),
         ))
         .unwrap();
@@ -242,7 +243,7 @@ impl TestVolumes {
         block_on(async {
             let volume = self.tree.open(volume).await.unwrap();
             FsEngine::new(
-                LockSynchronizedStore::new(volume, self.content.clone()),
+                volume,
                 allocate_inode,
                 next_content_id,
                 now,

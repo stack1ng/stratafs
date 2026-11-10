@@ -3,7 +3,8 @@ use std::ops::Range;
 use bytes::BytesMut;
 use smallvec::{SmallVec, smallvec};
 use stratafs_store::error::StoreError;
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
+use stratafs_store::kv::{KeyValueTransaction, SetRejection};
+use stratafs_store::store::Store;
 use zerocopy::FromBytes;
 use zerocopy::little_endian::U128;
 
@@ -17,14 +18,14 @@ use crate::key::{Referenced, TreeKey};
 use crate::node::{InternalEntry, LEFTMOST_SEPARATOR, LeafEntry, Node, NodeHeader, NodeKind};
 use crate::serialized::CorruptValue;
 use crate::slotted::{AddressableRange, SlottedList};
-use crate::tree::TreeConfig;
+use crate::tree::{MetadataRejection, TreeConfig};
 use crate::volume::{TreeTransaction, with_tree_failure};
 use crate::write_over_layer::LayerNodeMutation::{Create, Delete, Promote, Update};
 
 impl<T, S, A, C> TreeTransaction<'_, T, S, A, C>
 where
-    T: KeyValueTransaction<Rejection = S::Rejection>,
-    S: KeyValueStore,
+    T: KeyValueTransaction<Rejection = MetadataRejection<S>>,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -35,7 +36,10 @@ where
         plans: SmallVec<[SpanMutationPlan<C::Range>; 1]>,
     ) -> Result<
         SmallVec<[LayerSpan<C::Range>; 1]>,
-        StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
     > {
         // group plans if they have any common parents
         let parent_of = |node: Option<&LayerNode<C::Range>>| {
@@ -72,7 +76,10 @@ where
         group: SmallVec<[SpanMutationPlan<C::Range>; 1]>,
     ) -> Result<
         Option<LayerSpan<C::Range>>,
-        StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
     > {
         if group[0].is_root() {
             return self.execute_root_plan_group(volume, kind, group);
@@ -177,7 +184,10 @@ where
         group: SmallVec<[SpanMutationPlan<C::Range>; 1]>,
     ) -> Result<
         Option<LayerSpan<C::Range>>,
-        StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
     > {
         let mut roots = SlottedList::<BytesMut, [u8], u32>::empty();
         for plan in group {
@@ -228,7 +238,10 @@ where
         plan: SpanMutationPlan<C::Range>,
     ) -> Result<
         SlottedList<BytesMut, [u8], u32>,
-        StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
+        StoreError<
+            SetRejection<MetadataRejection<S>>,
+            TreeFailure<T::Failure, MetadataRejection<S>>,
+        >,
     > {
         // A leaf span's old entries are compared with its new ones to count its blobs' references. A copied leaf's
         // original keeps its references.

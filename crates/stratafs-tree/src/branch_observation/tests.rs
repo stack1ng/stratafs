@@ -3,7 +3,10 @@ use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_lite::future::{block_on, poll_once};
+use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
+use stratafs_lock_synchronized::LockSynchronizedStore;
+use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::{RedbFailure, RedbStore};
 use stratafs_runtime::TaskDroppingRuntime;
 use stratafs_store::error::StoreError;
@@ -12,7 +15,9 @@ use stratafs_store::kv::{KeyValueTransaction, SetRejection};
 use stratafs_store::spawn::Inline;
 
 use super::*;
-use crate::tree::{NoContent, Tree};
+use crate::tree::Tree;
+
+type TestStore = LockSynchronizedStore<RedbStore<Inline>, ObjectStoreContentStore>;
 
 struct SmallNodeConfig;
 
@@ -22,7 +27,7 @@ impl TreeConfig for SmallNodeConfig {
     const MERGE_BELOW_PERCENT: u8 = 25;
 }
 
-fn open_volume() -> TreeVolume<RedbStore<Inline>, impl Fn() -> u128, SmallNodeConfig> {
+fn open_volume() -> TreeVolume<TestStore, impl Fn() -> u128, SmallNodeConfig> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .unwrap();
@@ -30,9 +35,11 @@ fn open_volume() -> TreeVolume<RedbStore<Inline>, impl Fn() -> u128, SmallNodeCo
     let allocate_id = move || u128::from(next_id.fetch_add(1, Ordering::Relaxed));
     block_on(async {
         let tree = Tree::new(
-            RedbStore::new(database, Inline).unwrap(),
+            LockSynchronizedStore::new(
+                RedbStore::new(database, Inline).unwrap(),
+                ObjectStoreContentStore::new(InMemory::new()),
+            ),
             allocate_id,
-            NoContent,
             Arc::new(TaskDroppingRuntime),
         )
         .await
@@ -44,7 +51,7 @@ fn open_volume() -> TreeVolume<RedbStore<Inline>, impl Fn() -> u128, SmallNodeCo
 
 fn set_every_key<S, A, C>(volume: &TreeVolume<S, A, C>, value: &'static [u8])
 where
-    S: KeyValueStore,
+    S: Store,
     A: Fn() -> u128 + Send + Sync + 'static,
     C: TreeConfig,
 {
@@ -56,9 +63,13 @@ where
                     Bytes::from_static(value),
                 )?;
             }
-            Ok::<_, StoreError<SetRejection<S::Rejection>, TreeFailure<S::Failure, S::Rejection>>>(
-                ((), transaction),
-            )
+            Ok::<
+                _,
+                StoreError<
+                    SetRejection<MetadataRejection<S>>,
+                    TreeFailure<MetadataFailure<S>, MetadataRejection<S>>,
+                >,
+            >(((), transaction))
         })
     }))
     .unwrap();
@@ -102,7 +113,7 @@ fn waiters_on_the_same_key_share_its_watches() {
 fn a_watch_that_fired_is_not_handed_out_again_when_its_bytes_come_back() {
     let volume = open_volume();
     let set_watched = |value: &'static [u8]| {
-        block_on(volume.shared.store.transact(|mut transaction| {
+        block_on(volume.shared.store.metadata().transact(|mut transaction| {
             Box::pin(async move {
                 transaction.set(
                     Bytes::from_static(b"\xffwatched"),
