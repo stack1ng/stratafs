@@ -194,7 +194,8 @@ pub fn referenced_content(key: &[u8], value: &[u8]) -> Option<ContentReference> 
         SpillableKind::Overflow => ContentReference::New,
         SpillableKind::ExistingOverflow => ContentReference::Existing,
     };
-    let (stored, _hash) = OverflowReference::ref_from_prefix(rest).ok()?;
+    let (stored, hash) = OverflowReference::ref_from_prefix(rest).ok()?;
+    ContentHash::from_stored(hash)?;
     Some(reference(ContentId(stored.id.get())))
 }
 

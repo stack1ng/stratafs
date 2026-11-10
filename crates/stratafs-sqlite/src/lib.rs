@@ -80,7 +80,8 @@ const CLEAR_FROM: &str = "DELETE FROM kv WHERE key >= ?1 RETURNING key";
 const CONTENT_END: &str =
     "SELECT chunk, length(data) FROM content WHERE id = ?1 ORDER BY chunk DESC LIMIT 1";
 const CHUNK_ROW: &str = "SELECT rowid FROM content WHERE id = ?1 AND chunk = ?2";
-const PUT_CHUNK: &str = "INSERT INTO content (id, chunk, data) VALUES (?1, ?2, ?3)";
+// A commit that failed may have written the content it then writes again, so a chunk replaces the one kept.
+const PUT_CHUNK: &str = "INSERT OR REPLACE INTO content (id, chunk, data) VALUES (?1, ?2, ?3)";
 const DELETE_CONTENT: &str = "DELETE FROM content WHERE id = ?1";
 
 #[derive(Debug, thiserror::Error)]

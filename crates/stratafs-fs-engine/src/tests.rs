@@ -309,6 +309,16 @@ fn a_write_refused_once_puts_its_blob_once() {
 }
 
 #[test]
+fn a_write_refused_twice_puts_its_blob_once() {
+    let engine = scripted_engine(ResultHandling::Cache);
+    let inode = new_file(&engine);
+    engine.consistency().refusals.store(2, Ordering::SeqCst);
+    write_spilling(&engine, inode, || vec![7; 2000]);
+    assert_eq!(engine.consistency().refusals.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(1)]));
+}
+
+#[test]
 fn an_attempt_that_spills_other_content_than_the_one_before_keeps_only_its_own_blob() {
     let engine = scripted_engine(ResultHandling::Cache);
     let inode = new_file(&engine);

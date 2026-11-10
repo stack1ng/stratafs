@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_core::future::BoxFuture;
+use futures_util::future::join_all;
 use smallvec::SmallVec;
 use storekey::{BorrowDecode, Encode};
 use stratafs_runtime::Runtime;
@@ -43,7 +44,8 @@ mod test_support;
 pub trait FsConfig: Send + Sync + 'static {
     const LARGEST_INLINE_ENTRY: usize;
 
-    // content_hash is the hash kept with the reference to a blob of content.
+    // content_hash is the hash kept with the reference to a blob of content. A transaction's attempts take content
+    // with the same hash and length for the same content.
     fn content_hash(content: &[u8]) -> ContentHash;
 }
 
@@ -561,6 +563,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
         // a failed commit may have applied, so the blobs its attempt referenced stay
         let mut may_have_committed = false;
         let outcome = loop {
+            let attempts_before = attempts;
             let ticket = self.consistency.reading();
             let attempt = self
                 .mount
@@ -632,7 +635,8 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                 }
                 Err(TransactError::Rejected(rejection)) => TransactError::Rejected(rejection),
                 Err(TransactError::Failed(failure)) => {
-                    may_have_committed = true;
+                    // a store that failed before it ran the work committed nothing
+                    may_have_committed = attempts > attempts_before;
                     TransactError::Failed(EngineFailure::Store(failure))
                 }
             };
@@ -642,14 +646,15 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
             break Err(failed);
         };
         let written = written.into_inner().unwrap_or_else(PoisonError::into_inner);
-        for blob in written {
-            if may_have_committed && blob.taken_by == attempts {
-                continue;
-            }
+        let unreferenced = written
+            .iter()
+            .filter(|blob| !(may_have_committed && blob.taken_by == attempts));
+        join_all(unreferenced.map(|blob| async move {
             if let Err(error) = self.content().delete(&blob.id).await {
                 tracing::warn!(id = blob.id.0, %error, "deleting a blob no commit references failed, so it stays");
             }
-        }
+        }))
+        .await;
         outcome
     }
 

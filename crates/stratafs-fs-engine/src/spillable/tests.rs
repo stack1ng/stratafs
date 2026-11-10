@@ -259,6 +259,15 @@ fn other_keys_and_values_it_cannot_read_reference_no_content() {
     assert_eq!(referenced_content(b"", &spilled), None);
     // An extent's value starts with its start and offset, so a bare spillable value is too short to be one.
     assert_eq!(referenced_content(&extent, &spilled), None);
+    // a hash is at most ContentHash::LONGEST bytes, as reading the value back holds it to
+    let mut hash_too_long = extent_value(&SpillableValue::Overflow {
+        reference: ContentReference::New(ContentId(7)),
+        length: 2000,
+        hash: ContentHash::from([7; ContentHash::LONGEST]),
+    })
+    .to_vec();
+    hash_too_long.push(0);
+    assert_eq!(referenced_content(&extent, &hash_too_long), None);
     assert_eq!(referenced_content(&extent, &[0; 16]), None);
     assert_eq!(
         referenced_content(&extent, &[[0; 16], [2; 16]].concat()),
