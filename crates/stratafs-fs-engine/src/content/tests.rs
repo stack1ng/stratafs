@@ -8,6 +8,7 @@ use super::*;
 use crate::attributes::error::SetattrError;
 use crate::attributes::{ChangeVersion, Hints, Mode, Ownership, Restrictions, SettableAttributes};
 use crate::directories::NewItem;
+use crate::spillable::ContentHash;
 use crate::test_support::{
     InMemoryEngine, MetadataFailure, OneKibInline, TEST_MOUNT, aborted, new_test_engine, restrict,
     set_clock,
@@ -48,6 +49,7 @@ fn stored_extents_decode_to_the_extent_that_was_stored() {
             content: SpillableValue::Overflow {
                 reference: ContentReference::New(ContentId(7)),
                 length: 1 << 20,
+                hash: ContentHash::xxh3(b"content"),
             },
         },
     ] {
@@ -137,6 +139,7 @@ fn three_extents(engine: &InMemoryEngine, inode: Inode) -> ContentId {
             content: SpillableValue::Overflow {
                 reference: ContentReference::New(blob),
                 length: 100,
+                hash: ContentHash::xxh3(b"content"),
             },
         },
     );
@@ -385,6 +388,7 @@ fn slicing_an_overflow_extent_moves_its_offset_into_the_same_blob() {
     let content = SpillableValue::Overflow {
         reference: ContentReference::New(ContentId(7)),
         length: 100,
+        hash: ContentHash::xxh3(b"content"),
     };
     let extent = ExtentValue {
         start: 100,
@@ -399,6 +403,7 @@ fn slicing_an_overflow_extent_moves_its_offset_into_the_same_blob() {
             content: SpillableValue::Overflow {
                 reference: ContentReference::Existing(ContentId(7)),
                 length: 100,
+                hash: ContentHash::xxh3(b"content"),
             },
         }
     );
@@ -747,6 +752,7 @@ fn a_write_stays_inline_while_its_extent_fits_the_largest_inline_entry() {
                 content: SpillableValue::Overflow {
                     reference: ContentReference::New(the_only_stored_id(&engine)),
                     length: spills.len() as u64,
+                    hash: ContentHash::xxh3(&spills),
                 },
             }
         )]
@@ -764,6 +770,7 @@ fn overwriting_part_of_a_spilled_extent_keeps_pointing_into_its_blob() {
     let blob = SpillableValue::Overflow {
         reference: ContentReference::Existing(the_only_stored_id(&engine)),
         length: 2000,
+        hash: ContentHash::xxh3(&content),
     };
     assert_eq!(
         stored_extents(&engine, inode),
@@ -963,6 +970,7 @@ fn shrinking_a_spilled_extent_keeps_pointing_into_its_blob() {
                 content: SpillableValue::Overflow {
                     reference: ContentReference::Existing(the_only_stored_id(&engine)),
                     length: 2000,
+                    hash: ContentHash::xxh3(&content),
                 },
             }
         )]

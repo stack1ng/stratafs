@@ -2071,6 +2071,7 @@ dependencies = [
  "futures-util",
  "object_store",
  "redb",
+ "smallvec",
  "storekey",
  "stratafs-lock-synchronized",
  "stratafs-object-store",

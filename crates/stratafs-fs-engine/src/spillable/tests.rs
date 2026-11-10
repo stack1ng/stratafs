@@ -70,11 +70,13 @@ fn content_one_byte_over_the_largest_inline_entry_spills_to_the_content_store() 
     let SpillableValue::Overflow {
         reference: ContentReference::New(id),
         length,
+        hash,
     } = make_spillable(&engine, 0, content.clone())
     else {
         panic!("content over the largest inline entry stayed inline");
     };
     assert_eq!(length, content.len() as u64);
+    assert_eq!(hash, ContentHash::xxh3(&content));
     assert_eq!(engine.content().ids(), BTreeSet::from([id]));
     assert_eq!(stored_content(&engine, &id, content.len()), Some(content));
 }
@@ -101,14 +103,18 @@ fn inline_values_are_stored_as_the_inline_kind_then_the_content() {
 }
 
 #[test]
-fn overflow_values_are_stored_as_the_overflow_kind_then_the_id_then_the_length_in_little_endian() {
+fn overflow_values_are_stored_as_the_overflow_kind_then_the_id_and_the_length_in_little_endian_then_the_hash()
+ {
+    let hash = [7; 32];
     let value = SpillableValue::Overflow {
         reference: ContentReference::New(ContentId(0x0102_0304)),
         length: 0x0102,
+        hash: ContentHash::from(hash),
     };
     let mut expected = vec![1];
     expected.extend_from_slice(&0x0102_0304u128.to_le_bytes());
     expected.extend_from_slice(&0x0102u64.to_le_bytes());
+    expected.extend_from_slice(&hash);
     assert_eq!(stored(&value)[..], expected[..]);
 }
 
@@ -120,6 +126,12 @@ fn stored_values_decode_to_the_value_that_was_stored() {
         SpillableValue::Overflow {
             reference: ContentReference::New(ContentId(7)),
             length: 7,
+            hash: ContentHash::xxh3(b"content"),
+        },
+        SpillableValue::Overflow {
+            reference: ContentReference::Existing(ContentId(7)),
+            length: 7,
+            hash: ContentHash::from([7; 32]),
         },
     ] {
         assert_eq!(SpillableValue::from_stored(stored(&value)).unwrap(), value);
@@ -153,9 +165,11 @@ fn decoding_rejects_corrupt_values() {
         SpillableValue::from_stored(Bytes::from_static(&[1, 0, 0])),
         Err(CorruptValue::WrongLength)
     ));
+    // a hash is at most ContentHash::LONGEST bytes
     let mut one_byte_too_long = stored(&SpillableValue::Overflow {
         reference: ContentReference::New(ContentId(0)),
         length: 0,
+        hash: ContentHash::from([7; ContentHash::LONGEST]),
     })
     .to_vec();
     one_byte_too_long.push(0);
@@ -197,6 +211,7 @@ fn the_referenced_content_is_that_of_a_spilled_extent_annotation_or_symbolic_lin
     let spilled = SpillableValue::Overflow {
         reference: ContentReference::New(ContentId(7)),
         length: 2000,
+        hash: ContentHash::xxh3(b"content"),
     };
     let inline = SpillableValue::Inline(Bytes::from_static(b"inline"));
     let extent = Bytes::from(FsKey::new_extent(Inode(9), 2000));
@@ -220,6 +235,7 @@ fn the_referenced_content_is_that_of_a_spilled_extent_annotation_or_symbolic_lin
     let piece = SpillableValue::Overflow {
         reference: ContentReference::Existing(ContentId(7)),
         length: 2000,
+        hash: ContentHash::xxh3(b"content"),
     };
     assert_eq!(
         referenced_content(&extent, &extent_value(&piece)),
@@ -235,6 +251,7 @@ fn other_keys_and_values_it_cannot_read_reference_no_content() {
     let spilled = stored(&SpillableValue::Overflow {
         reference: ContentReference::New(ContentId(7)),
         length: 2000,
+        hash: ContentHash::xxh3(b"content"),
     });
     let attributes = Bytes::from(FsKey::new_attributes(Inode(9)));
     let extent = Bytes::from(FsKey::new_extent(Inode(9), 2000));

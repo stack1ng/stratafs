@@ -26,7 +26,7 @@ use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
 use crate::kernel_cache::{KernelCache, NoKernel};
-use crate::spillable::referenced_content;
+use crate::spillable::{ContentHash, referenced_content};
 use crate::{Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
 
 // TEST_MOUNT is the mount test engines are.
@@ -36,6 +36,10 @@ pub(crate) struct OneKibInline;
 
 impl FsConfig for OneKibInline {
     const LARGEST_INLINE_ENTRY: usize = 1024;
+
+    fn content_hash(content: &[u8]) -> ContentHash {
+        ContentHash::xxh3(content)
+    }
 }
 
 // TestTreeConfig has the smallest nodes that still hold a OneKibInline entry.

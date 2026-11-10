@@ -14,6 +14,7 @@ use stratafs_fs_engine::content::error::ReadError;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::error::{EngineFailure, Posix, PosixError};
 use stratafs_fs_engine::kernel_cache::KernelCache;
+use stratafs_fs_engine::spillable::ContentHash;
 use stratafs_fs_engine::strong::{Pending, StrongFailure};
 use stratafs_fs_engine::{
     Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, StrongUntilDisconnectCached,
@@ -39,6 +40,10 @@ pub(crate) struct OneKibInline;
 
 impl FsConfig for OneKibInline {
     const LARGEST_INLINE_ENTRY: usize = 1024;
+
+    fn content_hash(content: &[u8]) -> ContentHash {
+        ContentHash::xxh3(content)
+    }
 }
 
 type AllocateInode = Box<dyn Fn() -> u64 + Send + Sync>;

@@ -4,14 +4,15 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::ready;
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_core::future::BoxFuture;
+use smallvec::SmallVec;
 use storekey::{BorrowDecode, Encode};
 use stratafs_runtime::Runtime;
 use stratafs_serialized::little_endian_newtypes;
-use stratafs_store::content::ContentId;
+use stratafs_store::content::{ContentId, ContentStore};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
@@ -23,6 +24,7 @@ use crate::attributes::Attributes;
 use crate::error::{EngineFailure, Posix};
 pub use crate::eventual::Eventual;
 use crate::kernel_cache::KernelCache;
+use crate::spillable::ContentHash;
 pub use crate::strong::StrongUntilDisconnectCached;
 
 pub mod annotations;
@@ -40,7 +42,23 @@ mod test_support;
 
 pub trait FsConfig: Send + Sync + 'static {
     const LARGEST_INLINE_ENTRY: usize;
+
+    // content_hash is the hash kept with the reference to a blob of content.
+    fn content_hash(content: &[u8]) -> ContentHash;
 }
+
+// WrittenBlob is a blob one of a transaction's attempts wrote. A later attempt that spills the same content takes it
+// instead of writing it again.
+pub(crate) struct WrittenBlob {
+    pub(crate) hash: ContentHash,
+    pub(crate) length: u64,
+    pub(crate) id: ContentId,
+    // taken_by is the attempt that last referenced the blob
+    pub(crate) taken_by: u32,
+}
+
+// WrittenBlobs are the blobs one transaction's attempts wrote, of which most transactions have at most one.
+pub(crate) type WrittenBlobs = SmallVec<[WrittenBlob; 1]>;
 
 const SMALLEST_INLINE_ENTRY: usize = 1024;
 
@@ -276,6 +294,10 @@ pub struct FsTransaction<'txn, 'engine, T, C, A, N, S> {
     // first.
     allocated: Vec<Inode>,
     reuse: Vec<Inode>,
+    // written is the blobs the transaction's attempts wrote, and attempt is this attempt's number among them. A read
+    // writes no blob, so it has none.
+    written: Option<&'txn Mutex<WrittenBlobs>>,
+    attempt: u32,
     mount: MountId,
     content: &'engine C,
     allocate_inode: &'engine A,
@@ -534,15 +556,23 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
     > {
         let mut prepared = None;
         let mut reuse = Vec::new();
-        loop {
+        let written = Mutex::new(WrittenBlobs::new());
+        let mut attempts = 0;
+        // a failed commit may have applied, so the blobs its attempt referenced stay
+        let mut may_have_committed = false;
+        let outcome = loop {
             let ticket = self.consistency.reading();
             let attempt = self
                 .mount
                 .store
                 .metadata()
                 .transact(|metadata| {
+                    // the store runs work again only when the attempt before did not commit
+                    attempts += 1;
                     let mut transaction = self.transaction(metadata);
                     transaction.reuse = reuse.clone();
+                    transaction.written = Some(&written);
+                    transaction.attempt = attempts;
                     let working = work(transaction);
                     let (prepared, reads) = (prepared.clone(), &reads);
                     Box::pin(async move {
@@ -579,7 +609,8 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                 .await;
             let failed = match attempt {
                 Ok((result, read, state, changes)) => {
-                    return Ok((result, read, state, changes, prepared, ticket));
+                    may_have_committed = true;
+                    break Ok((result, read, state, changes, prepared, ticket));
                 }
                 Err(TransactError::Aborted(Attempt::Refused(changes, allocated))) => {
                     reuse = allocated;
@@ -592,7 +623,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                             prepared = Some(readied);
                             continue;
                         }
-                        Err(failure) => return Err(consistency_failed(failure)),
+                        Err(failure) => break Err(consistency_failed(failure)),
                     }
                 }
                 Err(TransactError::Aborted(Attempt::Work(error))) => TransactError::Aborted(error),
@@ -601,14 +632,25 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Cached<St>> FsEngine<St, A, N,
                 }
                 Err(TransactError::Rejected(rejection)) => TransactError::Rejected(rejection),
                 Err(TransactError::Failed(failure)) => {
+                    may_have_committed = true;
                     TransactError::Failed(EngineFailure::Store(failure))
                 }
             };
             if let Some(prepared) = prepared {
                 self.consistency.finish(&self.mount, prepared, None).await;
             }
-            return Err(failed);
+            break Err(failed);
+        };
+        let written = written.into_inner().unwrap_or_else(PoisonError::into_inner);
+        for blob in written {
+            if may_have_committed && blob.taken_by == attempts {
+                continue;
+            }
+            if let Err(error) = self.content().delete(&blob.id).await {
+                tracing::warn!(id = blob.id.0, %error, "deleting a blob no commit references failed, so it stays");
+            }
         }
+        outcome
     }
 
     // serve runs read and hands its result to the kernel with hand, as the consistency's result handling for every
@@ -895,6 +937,8 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Send + Sync> FsEngine<St, A, N
             changes: HashMap::new(),
             allocated: Vec::new(),
             reuse: Vec::new(),
+            written: None,
+            attempt: 0,
             mount: self.mount.id,
             content: self.mount.store.content(),
             allocate_inode: &self.allocate_inode,

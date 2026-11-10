@@ -10,6 +10,7 @@ use futures_lite::future::block_on;
 use stores::Stores;
 use stratafs_sqlite::SqliteContent;
 use stratafs_store::content::{ContentId, ContentStore, GetRejection, UnknownContent};
+use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, TransactError};
 
@@ -74,7 +75,7 @@ fn content_a_transaction_puts_commits_with_it() {
 }
 
 #[test]
-fn content_work_that_aborts_puts_is_rolled_back_with_it() {
+fn content_work_that_aborts_puts_is_kept() {
     let stores = Stores::new();
     let store = stores.open();
     let content = SqliteContent::of(&store);
@@ -89,6 +90,13 @@ fn content_work_that_aborts_puts_is_rolled_back_with_it() {
     let Err(TransactError::<Infallible, rusqlite::Error, _>::Aborted(())) = aborted else {
         panic!("the work was not aborted");
     };
+    let mut waiting = block_on(content.get(&id, 0, 7)).unwrap();
+    assert_eq!(waiting.copy_to_bytes(7), &b"aborted"[..]);
+    // making it durable gives it a commit, which writes it
+    block_on(content.ensure_durable(DurableAgainst::SoftwareFailure)).unwrap();
+    let mut stored = block_on(content.get(&id, 2, 5)).unwrap();
+    assert_eq!(stored.copy_to_bytes(5), &b"orted"[..]);
+    block_on(content.delete(&id)).unwrap();
     assert!(matches!(
         block_on(content.get(&id, 0, 0)),
         Err(StoreError::Rejected(GetRejection::UnknownContent(

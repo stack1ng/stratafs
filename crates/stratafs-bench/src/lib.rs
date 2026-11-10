@@ -17,7 +17,7 @@ use stratafs_fs_engine::Eventual;
 use stratafs_fs_engine::StrongUntilDisconnectCached;
 use stratafs_fs_engine::error::{EngineFailure, PosixError};
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
-use stratafs_fs_engine::spillable::referenced_content;
+use stratafs_fs_engine::spillable::{ContentHash, referenced_content};
 use stratafs_fs_engine::{Cached, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_store::content::{ContentId, ContentReference};
@@ -51,6 +51,10 @@ pub struct BenchFsConfig;
 impl FsConfig for BenchFsConfig {
     const LARGEST_INLINE_ENTRY: usize =
         number(option_env!("STRATAFS_BENCH_LARGEST_INLINE_ENTRY"), 4 * 1024);
+
+    fn content_hash(content: &[u8]) -> ContentHash {
+        ContentHash::xxh3(content)
+    }
 }
 
 // The durability limit comes from the build's environment too, as STRATAFS_BENCH_DURABILITY: none, software or power.

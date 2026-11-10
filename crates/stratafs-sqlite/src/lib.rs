@@ -2,6 +2,7 @@ mod vfs;
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_int};
 use std::future::poll_fn;
 use std::io;
@@ -111,8 +112,11 @@ struct Database<S> {
     // alone. A write that starts meanwhile waits for that read, so one awaited inside the read's work never begins.
     running: AtomicUsize,
     writer: Arc<Mutex<Writer>>,
-    // writer_connection is the writer's connection, which a write transaction's work puts and gets content through.
+    // writer_connection is the writer's connection, which a write transaction's work gets content through.
     writer_connection: Arc<std::sync::Mutex<Connection>>,
+    // pending is the content the work of write transactions put since a commit last wrote it. Every commit writes it
+    // ahead of its own writes, so the content is kept whether or not the transaction that put it commits.
+    pending: std::sync::Mutex<HashMap<ContentId, Bytes>>,
     // idle_readers are the connections reads use while the writer is busy, kept open between them. A commit drops
     // every page a reader cached, and a reader mapping the database would map it again, so they read with neither.
     idle_readers: std::sync::Mutex<Vec<std::sync::Mutex<Connection>>>,
@@ -233,6 +237,7 @@ impl<S> SqliteMetadata<S> {
                 checkpointed_pages: 0,
             })),
             writer_connection: connection,
+            pending: std::sync::Mutex::default(),
             idle_readers: std::sync::Mutex::new(Vec::new()),
             syncer: Arc::new(Mutex::new(syncer)),
             syncs_started: AtomicU64::new(0),
@@ -349,7 +354,7 @@ impl<S> Database<S> {
             connection,
             written,
         }));
-        // Content the work puts goes into the transaction, so each poll of the work marks the thread as running it.
+        // Content the work puts waits for a commit, so each poll of the work marks the thread as running it.
         let output = poll_fn(move |context| {
             let _in_write_transaction = InWriteTransaction::start(self);
             working.as_mut().poll(context)
@@ -363,7 +368,20 @@ impl<S> Database<S> {
                 return Err(TransactError::Aborted(error));
             }
         };
+        let pending = match self.store_pending() {
+            Ok(pending) => pending,
+            Err(failure) => {
+                transaction.roll_back().map_err(TransactError::Failed)?;
+                return Err(TransactError::Failed(failure));
+            }
+        };
         transaction.commit().map_err(TransactError::Failed)?;
+        {
+            let mut still_pending = lock(&self.pending);
+            for id in &pending {
+                still_pending.remove(id);
+            }
+        }
         self.notify.notify_waiters(&transaction.written);
         let log_pages = transaction.log_pages.load(Ordering::Relaxed);
         // A log that started over is shorter than at the last checkpoint.
@@ -420,10 +438,30 @@ impl<S> Database<S> {
 
     // ensure_durable makes every commit made before it is called durable against a failure, and resolves once they
     // are. Calls made while a sync runs share the next sync, and one sync runs at a time.
+    // store_pending writes the content waiting for a commit into the write transaction the writer has open, and
+    // returns its ids.
+    fn store_pending(&self) -> rusqlite::Result<Vec<ContentId>> {
+        let pending: Vec<(ContentId, Bytes)> = lock(&self.pending)
+            .iter()
+            .map(|(id, content)| (*id, content.clone()))
+            .collect();
+        let mut connection = lock(&self.writer_connection);
+        for (id, content) in &pending {
+            store_chunks(&mut connection, id, &chunked(content.clone()))?;
+        }
+        Ok(pending.into_iter().map(|(id, _)| id).collect())
+    }
+
     async fn ensure_durable(&self, against: DurableAgainst) -> rusqlite::Result<()>
     where
         S: SpawnBlocking,
     {
+        // content waiting for a commit gets one of its own, so the sync covers it
+        if !lock(&self.pending).is_empty() {
+            self.transact(|transaction| Box::pin(async move { Ok(((), transaction)) }))
+                .await
+                .map_err(content_failure)?;
+        }
         let called = self.syncs_started.load(Ordering::SeqCst);
         let syncer = self.syncer.lock_arc().await;
         let last = syncer.last_against(against);
@@ -561,13 +599,15 @@ impl<S: SpawnBlocking + 'static> ContentStore for SqliteContent<S> {
     type Failure = rusqlite::Error;
     type Content = Bytes;
 
-    // A put the work of a write transaction makes goes into that transaction, which holds the writer meanwhile, so
-    // the content commits with the metadata naming it. Any other put commits on its own, through the writer.
-    async fn put(&self, id: &ContentId, content: impl Buf + Send) -> Result<(), Self::Failure> {
-        let chunks = chunked(content);
+    // A put the work of a write transaction makes cannot commit while that transaction holds the writer, so it waits
+    // for the next commit, whichever transaction's it is. Any other put commits on its own, through the writer.
+    async fn put(&self, id: &ContentId, mut content: impl Buf + Send) -> Result<(), Self::Failure> {
         if in_write_transaction(&self.0) {
-            return store_chunks(&mut lock(&self.0.writer_connection), id, &chunks);
+            let content = content.copy_to_bytes(content.remaining());
+            lock(&self.0.pending).insert(*id, content);
+            return Ok(());
         }
+        let chunks = chunked(content);
         self.0
             .transact(|transaction| {
                 let stored = store_chunks(&mut lock(transaction.connection), id, &chunks);
@@ -577,13 +617,22 @@ impl<S: SpawnBlocking + 'static> ContentStore for SqliteContent<S> {
             .map_err(content_failure)
     }
 
-    // A get the work of a write transaction makes reads inside that transaction, so it finds content the work put.
+    // A get finds content waiting for a commit. One the work of a write transaction makes reads through the writer,
+    // which that transaction holds.
     async fn get(
         &self,
         id: &ContentId,
         offset: u64,
         size: u64,
     ) -> Result<Bytes, StoreError<GetRejection, Self::Failure>> {
+        let pending = lock(&self.0.pending).get(id).cloned();
+        if let Some(content) = pending {
+            let len = content.len() as u64;
+            return match offset.checked_add(size) {
+                Some(end) if end <= len => Ok(content.slice(offset as usize..end as usize)),
+                Some(_) | None => Err(StoreError::Rejected(GetRejection::OutOfBounds { len })),
+            };
+        }
         if in_write_transaction(&self.0) {
             let connection = lock(&self.0.writer_connection);
             return read_content(begun(&connection)?, id, offset, size)?
@@ -599,13 +648,16 @@ impl<S: SpawnBlocking + 'static> ContentStore for SqliteContent<S> {
             .map_err(StoreError::Rejected)
     }
 
-    // A delete the work of a write transaction makes goes into that transaction, as a put does.
+    // A delete holds the writer, so no commit writes the content while it waits for one. A delete the work of a write
+    // transaction makes goes into that transaction.
     async fn delete(&self, id: &ContentId) -> Result<(), Self::Failure> {
         if in_write_transaction(&self.0) {
+            lock(&self.0.pending).remove(id);
             return delete_content(&lock(&self.0.writer_connection), id);
         }
         self.0
             .transact(|transaction| {
+                lock(&self.0.pending).remove(id);
                 let deleted = delete_content(&lock(transaction.connection), id);
                 Box::pin(async move { deleted.map(|()| ((), transaction)) })
             })

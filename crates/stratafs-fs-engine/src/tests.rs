@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use futures_lite::future::block_on;
@@ -12,9 +12,10 @@ use crate::error::PosixError;
 use crate::kernel_cache::NoKernel;
 use crate::test_support::{InMemoryStore, TestEngine, new_test_engine_with};
 
-// Scripted lets every write commit at once. Its holds fail while fail_holds says so, its result handling is what
-// handling says, and cached is every inode the engine told it the kernel caches.
+// Scripted lets every write commit once it refused refusals of them. Its holds fail while fail_holds says so, its
+// result handling is what handling says, and cached is every inode the engine told it the kernel caches.
 struct Scripted {
+    refusals: AtomicUsize,
     fail_holds: AtomicBool,
     handling: Mutex<ResultHandling>,
     cached: Mutex<Vec<Inode>>,
@@ -59,7 +60,12 @@ impl Cached<InMemoryStore> for Scripted {
         _: &HashMap<Inode, Change>,
         _: &mut T,
     ) -> Result<bool, HoldFailed> {
-        Ok(true)
+        let refused = self
+            .refusals
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            });
+        Ok(refused.is_err())
     }
 
     async fn prepare(
@@ -150,6 +156,7 @@ type ScriptedEngine = TestEngine<Scripted>;
 
 fn scripted_engine(handling: ResultHandling) -> ScriptedEngine {
     let scripted = Scripted {
+        refusals: AtomicUsize::new(0),
         fail_holds: AtomicBool::new(false),
         handling: Mutex::new(handling),
         cached: Mutex::default(),
@@ -276,4 +283,77 @@ fn a_change_whose_serving_fails_once_committed_fails_when_it_cannot_reply_uncach
     let stored =
         block_on(engine.read_transact(|txn| Box::pin(async move { txn.getattr(inode).await })));
     assert_eq!(stored.unwrap().unwrap().settable.mode, Mode::OWNER_READ);
+}
+
+// write_spilling writes content, long enough to spill, at the start of inode.
+fn write_spilling(engine: &ScriptedEngine, inode: Inode, content: impl Fn() -> Vec<u8> + Sync) {
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        let content = bytes::Bytes::from(content());
+        Box::pin(async move {
+            let result = txn.write(inode, 0, content).await;
+            result.map(|_| ((), txn))
+        })
+    }))
+    .unwrap();
+}
+
+#[test]
+fn a_write_refused_once_puts_its_blob_once() {
+    let engine = scripted_engine(ResultHandling::Cache);
+    let inode = new_file(&engine);
+    engine.consistency().refusals.store(1, Ordering::SeqCst);
+    write_spilling(&engine, inode, || vec![7; 2000]);
+    assert_eq!(engine.consistency().refusals.load(Ordering::SeqCst), 0);
+    // the second attempt took the first one's blob, so no second id was allocated
+    assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(1)]));
+}
+
+#[test]
+fn an_attempt_that_spills_other_content_than_the_one_before_keeps_only_its_own_blob() {
+    let engine = scripted_engine(ResultHandling::Cache);
+    let inode = new_file(&engine);
+    engine.consistency().refusals.store(1, Ordering::SeqCst);
+    let attempts = AtomicUsize::new(0);
+    write_spilling(&engine, inode, || {
+        vec![attempts.fetch_add(1, Ordering::SeqCst) as u8; 2000]
+    });
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(2)]));
+}
+
+#[test]
+fn a_transaction_that_gives_up_after_spilling_keeps_no_blob() {
+    let engine = scripted_engine(ResultHandling::Cache);
+    let inode = new_file(&engine);
+    let given_up = block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        Box::pin(async move {
+            txn.write(inode, 0, bytes::Bytes::from(vec![7; 2000]))
+                .await
+                .unwrap();
+            Err::<((), _), _>("the work gave up after spilling")
+        })
+    }));
+    assert!(given_up.is_err());
+    assert!(engine.content().ids().is_empty());
+}
+
+#[test]
+fn the_same_content_spilled_twice_by_one_attempt_is_two_blobs() {
+    let engine = scripted_engine(ResultHandling::Cache);
+    let inode = new_file(&engine);
+    engine.consistency().refusals.store(1, Ordering::SeqCst);
+    block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        Box::pin(async move {
+            let content = bytes::Bytes::from(vec![7; 2000]);
+            txn.write(inode, 0, content.clone()).await.unwrap();
+            let result = txn.write(inode, 2000, content).await;
+            result.map(|_| ((), txn))
+        })
+    }))
+    .unwrap();
+    // each attempt references two blobs, and the second attempt took both of the first one's
+    assert_eq!(
+        engine.content().ids(),
+        BTreeSet::from([ContentId(1), ContentId(2)])
+    );
 }

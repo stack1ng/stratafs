@@ -14,7 +14,7 @@ use futures_executor::ThreadPool as SpawnerPool;
 use futures_lite::future::block_on;
 use futures_util::FutureExt;
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
-use stratafs_fs_engine::spillable::referenced_content;
+use stratafs_fs_engine::spillable::{ContentHash, referenced_content};
 use stratafs_fs_engine::strong::ConnectFailure;
 use stratafs_fs_engine::{
     Cached, Eventual, FsConfig, FsEngine, MountId, StrongUntilDisconnectCached, Timestamp,
@@ -58,6 +58,10 @@ pub struct FuseFsConfig;
 
 impl FsConfig for FuseFsConfig {
     const LARGEST_INLINE_ENTRY: usize = 4 * 1024;
+
+    fn content_hash(content: &[u8]) -> ContentHash {
+        ContentHash::xxh3(content)
+    }
 }
 
 // MDBX_CONFIGURATION opens the libmdbx store in 4 KiB pages, committing without a sync of its own, but making a

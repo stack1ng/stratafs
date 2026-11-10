@@ -72,12 +72,17 @@ impl ExtentValue {
                 })
             }
             // the piece is one more reference to the extent's blob
-            SpillableValue::Overflow { reference, length } => Ok(ExtentValue {
+            SpillableValue::Overflow {
+                reference,
+                length,
+                hash,
+            } => Ok(ExtentValue {
                 start: range.start,
                 content_offset,
                 content: SpillableValue::Overflow {
                     reference: ContentReference::Existing(reference.id()),
                     length: *length,
+                    hash: *hash,
                 },
             }),
         }
@@ -260,7 +265,9 @@ where
                                     content: content.slice_ref(visible),
                                 }
                             }
-                            SpillableValue::Overflow { reference, length } => {
+                            SpillableValue::Overflow {
+                                reference, length, ..
+                            } => {
                                 if view_end_in_content > length {
                                     return Err(IoFailure::Corrupt(CorruptValue::InvalidExtent));
                                 }

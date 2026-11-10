@@ -42,7 +42,8 @@ pub trait ContentStore: Send + Sync {
     type Failure: std::error::Error + Send + Sync + 'static;
     type Content: Buf + Send;
 
-    // put keeps content under id, a fresh id no other put was given.
+    // put keeps content under id, a fresh id no other put was given. The content is kept whether or not a metadata
+    // transaction that was running meanwhile commits.
     fn put(
         &self,
         id: &ContentId,
