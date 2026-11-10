@@ -13,7 +13,7 @@ use redb::{Database, StorageBackend};
 use stratafs_lock_synchronized::{LockSynchronizedFailure, LockSynchronizedStore};
 use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
 use stratafs_redb::RedbStore;
-use stratafs_store::content::{ContentHash, ContentStore, GetRejection};
+use stratafs_store::content::{ContentId, ContentStore, GetRejection};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction};
@@ -46,18 +46,23 @@ impl ContentStore for LoggedContent {
 
     fn put(
         &self,
+        id: &ContentId,
         content: impl Buf + Send,
-    ) -> impl Future<Output = Result<ContentHash, Self::Failure>> + Send {
-        self.store.put(content)
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        self.store.put(id, content)
     }
 
     fn get(
         &self,
-        hash: &ContentHash,
+        id: &ContentId,
         offset: u64,
         size: u64,
     ) -> impl Future<Output = Result<Bytes, StoreError<GetRejection, Self::Failure>>> + Send {
-        self.store.get(hash, offset, size)
+        self.store.get(id, offset, size)
+    }
+
+    fn delete(&self, id: &ContentId) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        self.store.delete(id)
     }
 
     async fn ensure_durable(&self, _against: DurableAgainst) -> Result<(), Self::Failure> {

@@ -11,6 +11,7 @@ use futures_core::future::BoxFuture;
 use storekey::{BorrowDecode, Encode};
 use stratafs_runtime::Runtime;
 use stratafs_serialized::little_endian_newtypes;
+use stratafs_store::content::ContentId;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
@@ -76,6 +77,7 @@ type Failed<St, X, E> =
 
 pub struct FsEngine<St: Store, A, N, S, C> {
     allocate_inode: A,
+    allocate_content_id: fn() -> ContentId,
     now: N,
     // mount is the mount the engine is, whose id stamps every change it makes.
     mount: Mount<St>,
@@ -277,6 +279,7 @@ pub struct FsTransaction<'txn, 'engine, T, C, A, N, S> {
     mount: MountId,
     content: &'engine C,
     allocate_inode: &'engine A,
+    allocate_content_id: fn() -> ContentId,
     now: &'engine N,
     config: PhantomData<S>,
 }
@@ -313,6 +316,7 @@ where
     pub fn new(
         store: St,
         allocate_inode: A,
+        allocate_content_id: fn() -> ContentId,
         now: N,
         mount: MountId,
         durability_limit: Option<DurableAgainst>,
@@ -338,6 +342,7 @@ where
         async move {
             let engine = Self {
                 allocate_inode,
+                allocate_content_id,
                 now,
                 mount: Mount {
                     store: Arc::new(store),
@@ -893,6 +898,7 @@ impl<St: Store, A: Sync, N: Sync, S: FsConfig, C: Send + Sync> FsEngine<St, A, N
             mount: self.mount.id,
             content: self.mount.store.content(),
             allocate_inode: &self.allocate_inode,
+            allocate_content_id: self.allocate_content_id,
             now: &self.now,
             config: PhantomData,
         }

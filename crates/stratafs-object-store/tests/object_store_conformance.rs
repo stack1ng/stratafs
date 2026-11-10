@@ -6,8 +6,8 @@ fn memory_store() -> ObjectStoreContentStore {
 }
 
 #[test]
-fn stores_content_under_its_hash() {
-    stratafs_content_conformance::stores_content_under_its_hash(memory_store);
+fn stores_content_under_its_id() {
+    stratafs_content_conformance::stores_content_under_its_id(memory_store);
 }
 
 #[test]
@@ -23,4 +23,19 @@ fn rejects_ranges_beyond_the_content() {
 #[test]
 fn rejects_unknown_content() {
     stratafs_content_conformance::rejects_unknown_content(memory_store);
+}
+
+#[test]
+fn keeps_the_same_content_under_each_id_apart() {
+    stratafs_content_conformance::keeps_the_same_content_under_each_id_apart(memory_store);
+}
+
+#[test]
+fn deletes_content() {
+    stratafs_content_conformance::deletes_content(memory_store);
+}
+
+#[test]
+fn deletes_content_that_is_already_gone() {
+    stratafs_content_conformance::deletes_content_that_is_already_gone(memory_store);
 }

@@ -17,7 +17,7 @@ use mdbx_sys as ffi;
 
 use stratafs_keyed_notify::KeyedNotify;
 use stratafs_range_bounds_map::RangeBoundsMap;
-use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
+use stratafs_store::content::{ContentId, ContentStore, GetRejection, UnknownContent};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
@@ -92,7 +92,7 @@ struct Database<S> {
     writer: Mutex<Writer>,
     // pending is the content put since a commit last wrote it. Every commit writes it ahead of its own writes, so no
     // commit names content that it or an earlier commit did not write.
-    pending: std::sync::Mutex<HashMap<ContentHash, Bytes>>,
+    pending: std::sync::Mutex<HashMap<ContentId, Bytes>>,
     // notify wakes the watches of this store and of other stores of the file.
     notify: KeyedNotify,
     spawner: S,
@@ -178,10 +178,10 @@ impl<S> Database<S> {
         let pending: Vec<_> = self
             .lock_pending()
             .iter()
-            .map(|(hash, content)| (*hash, content.clone()))
+            .map(|(id, content)| (*id, content.clone()))
             .collect();
-        for (hash, content) in &pending {
-            writing.put_content(hash, content)?;
+        for (id, content) in &pending {
+            writing.put_content(id, content)?;
         }
         writer.written.clear();
         for ((start, end), write) in transaction
@@ -205,8 +205,8 @@ impl<S> Database<S> {
         }
         writing.commit()?;
         let mut still_pending = self.lock_pending();
-        for (hash, _) in &pending {
-            still_pending.remove(hash);
+        for (id, _) in &pending {
+            still_pending.remove(id);
         }
         drop(still_pending);
         self.notify.notify_waiters(&writer.written);
@@ -264,7 +264,27 @@ impl<S> Database<S> {
         Ok(())
     }
 
-    fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<ContentHash, Bytes>> {
+    // delete_content removes the content kept under id: from the content put so far when no commit has written it
+    // yet, or else with a commit of its own.
+    async fn delete_content(&self, id: &ContentId) -> Result<(), MdbxFailure>
+    where
+        S: SpawnBlocking,
+    {
+        // Holding the writer keeps any commit from writing the pending content meanwhile.
+        let _writer = self.writer.lock().await;
+        if self.lock_pending().remove(id).is_some() {
+            return Ok(());
+        }
+        loop {
+            if let Some(mut writing) = self.environment.try_write()? {
+                writing.delete_content(id)?;
+                return writing.commit();
+            }
+            self.wait_for_writer().await?;
+        }
+    }
+
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<ContentId, Bytes>> {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -371,32 +391,35 @@ impl<S: SpawnBlocking + 'static> ContentStore for MdbxContent<S> {
     type Content = Bytes;
 
     // A put keeps content in memory until the next commit, which writes it ahead of anything that names it.
-    async fn put(&self, mut content: impl Buf + Send) -> Result<ContentHash, Self::Failure> {
+    async fn put(&self, id: &ContentId, mut content: impl Buf + Send) -> Result<(), Self::Failure> {
         let content = content.copy_to_bytes(content.remaining());
-        let hash = ContentHash::of(&content);
-        self.0.lock_pending().insert(hash, content);
-        Ok(hash)
+        self.0.lock_pending().insert(*id, content);
+        Ok(())
     }
 
     async fn get(
         &self,
-        hash: &ContentHash,
+        id: &ContentId,
         offset: u64,
         size: u64,
     ) -> Result<Bytes, StoreError<GetRejection, Self::Failure>> {
-        let pending = self.0.lock_pending().get(hash).cloned();
+        let pending = self.0.lock_pending().get(id).cloned();
         if let Some(content) = pending {
             within(offset, size, content.len() as u64)?;
             return Ok(content.slice(offset as usize..(offset + size) as usize));
         }
         let snapshot = self.0.environment.snapshot()?;
-        let len = snapshot.content_length(hash)?.ok_or(StoreError::Rejected(
+        let len = snapshot.content_length(id)?.ok_or(StoreError::Rejected(
             GetRejection::UnknownContent(UnknownContent),
         ))?;
         within(offset, size, len)?;
         let mut read = vec![0; usize::try_from(size).expect("a read fits in memory")];
-        snapshot.read_content(hash, offset, &mut read)?;
+        snapshot.read_content(id, offset, &mut read)?;
         Ok(Bytes::from(read))
+    }
+
+    fn delete(&self, id: &ContentId) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        self.0.delete_content(id)
     }
 
     fn ensure_durable(

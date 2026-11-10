@@ -11,10 +11,12 @@ use futures_lite::future::yield_now;
 use futures_util::future::BoxFuture;
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
+use stratafs_fs_engine::spillable::referenced_content;
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::{RedbFailure, RedbStore};
 use stratafs_runtime::Runtime;
+use stratafs_store::content::{ContentId, ContentReference};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::{KeyValueStore, TransactError, TransactionHandle};
@@ -35,6 +37,10 @@ impl TreeConfig for TestTreeConfig {
     const MERGE_BELOW_PERCENT: u8 = 25;
     // a run lasts seconds of virtual time, so its garbage collector runs among its operations
     const GARBAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(1);
+
+    fn referenced_content(key: &[u8], value: &[u8]) -> Option<ContentReference> {
+        referenced_content(key, value)
+    }
 }
 
 pub(crate) type InMemoryStore = LockSynchronizedStore<
@@ -83,10 +89,13 @@ pub(crate) async fn new_store(runtime: Arc<dyn Runtime>) -> Arc<InMemoryStore> {
         .create_with_backend(InMemoryBackend::new())
         .expect("redb opens a database in memory");
     NEXT_NODE.set(1);
+    NEXT_CONTENT_ID.set(1);
     let allocate_node: fn() -> u128 = next_node;
+    let content = ObjectStoreContentStore::new(InMemory::new());
     let tree = Tree::new(
         RedbStore::new(database, Inline).expect("redb starts a store in memory"),
         allocate_node,
+        content.clone(),
         runtime,
     )
     .await
@@ -95,21 +104,25 @@ pub(crate) async fn new_store(runtime: Arc<dyn Runtime>) -> Arc<InMemoryStore> {
         .open(tree.create().await.expect("a tree creates a volume"))
         .await
         .expect("a tree opens the volume it created");
-    Arc::new(LockSynchronizedStore::new(
-        volume,
-        ObjectStoreContentStore::new(InMemory::new()),
-    ))
+    Arc::new(LockSynchronizedStore::new(volume, content))
 }
 
 thread_local! {
     // NEXT_NODE is the next node id of the store a run made, from 1 in every replay, since its garbage collector times
     // its passes by them. A run's tasks all run on its thread.
     static NEXT_NODE: Cell<u128> = const { Cell::new(1) };
+    // NEXT_CONTENT_ID is the next content id of the store a run made, from 1 in every replay, as NEXT_NODE is.
+    static NEXT_CONTENT_ID: Cell<u128> = const { Cell::new(1) };
 }
 
 // next_node allocates a node id no other node of the run's tree has.
 fn next_node() -> u128 {
     NEXT_NODE.replace(NEXT_NODE.get() + 1)
+}
+
+// next_content_id allocates a content id no other content of the run's store has, whichever mount spills it.
+pub(crate) fn next_content_id() -> ContentId {
+    ContentId(NEXT_CONTENT_ID.replace(NEXT_CONTENT_ID.get() + 1))
 }
 
 impl<S: Store> Store for Shared<S> {

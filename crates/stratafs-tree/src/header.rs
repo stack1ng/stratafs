@@ -4,6 +4,7 @@ use std::ops::AddAssign;
 use bytes::Bytes;
 use storekey::{Decode, Encode, EncodeError, Writer};
 use stratafs_serialized::{SerializedShape, serialized_value};
+use stratafs_store::content::ContentId;
 use xxhash_rust::const_xxh32::xxh32;
 use zerocopy::little_endian::{U64, U128};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -29,7 +30,18 @@ impl TryFrom<Bytes> for TreeVolumeId {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+    PartialOrd,
+    Ord,
 )]
 #[repr(transparent)]
 pub(crate) struct NodeId(pub(crate) U128);
@@ -55,9 +67,25 @@ impl<F> Decode<F> for NodeId {
     }
 }
 
-// JobId tells apart the garbage collection jobs written for one node.
+// JobId tells apart the garbage collection jobs written for one node or blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct JobId(pub(crate) u128);
+
+// TreeContentId is a content id as a tree key holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub(crate) struct TreeContentId(pub(crate) u128);
+
+impl From<ContentId> for TreeContentId {
+    fn from(id: ContentId) -> Self {
+        Self(id.0)
+    }
+}
+
+impl From<TreeContentId> for ContentId {
+    fn from(id: TreeContentId) -> Self {
+        Self(id.0)
+    }
+}
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,

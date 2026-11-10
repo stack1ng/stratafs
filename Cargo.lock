@@ -2231,11 +2231,11 @@ dependencies = [
 name = "stratafs-object-store"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "blocking",
  "bytes",
  "cfg_aliases",
  "futures-lite",
- "futures-util",
  "nix",
  "object_store",
  "stratafs-content-conformance",
@@ -2338,7 +2338,6 @@ dependencies = [
  "cfg_aliases",
  "futures-core",
  "thiserror",
- "xxhash-rust",
 ]
 
 [[package]]

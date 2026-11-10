@@ -46,7 +46,7 @@ fn stored_extents_decode_to_the_extent_that_was_stored() {
             start: 4096,
             content_offset: 40,
             content: SpillableValue::Overflow {
-                hash: ContentHash::of(b"blob"),
+                reference: ContentReference::New(ContentId(7)),
                 length: 1 << 20,
             },
         },
@@ -115,8 +115,8 @@ fn file_of_size(engine: &InMemoryEngine, inode: Inode, size: u64) {
     .unwrap();
 }
 
-fn three_extents(engine: &InMemoryEngine, inode: Inode) -> ContentHash {
-    let blob = ContentHash::of(b"blob");
+fn three_extents(engine: &InMemoryEngine, inode: Inode) -> ContentId {
+    let blob = ContentId(7);
     write_extent(
         engine,
         inode,
@@ -135,7 +135,7 @@ fn three_extents(engine: &InMemoryEngine, inode: Inode) -> ContentHash {
             start: 10,
             content_offset: 5,
             content: SpillableValue::Overflow {
-                hash: blob,
+                reference: ContentReference::New(blob),
                 length: 100,
             },
         },
@@ -188,7 +188,7 @@ fn read_plans_the_visible_part_of_each_overlapping_extent() {
                 },
                 ContentPiece::Stored {
                     start: 10,
-                    hash: blob,
+                    id: blob,
                     offset: 5,
                     length: 5
                 },
@@ -202,7 +202,7 @@ fn read_plans_the_visible_part_of_each_overlapping_extent() {
             vec![
                 ContentPiece::Stored {
                     start: 12,
-                    hash: blob,
+                    id: blob,
                     offset: 7,
                     length: 18
                 },
@@ -383,7 +383,7 @@ fn slicing_an_inline_extent_shares_its_bytes_and_starts_at_offset_zero() {
 #[test]
 fn slicing_an_overflow_extent_moves_its_offset_into_the_same_blob() {
     let content = SpillableValue::Overflow {
-        hash: ContentHash::of(b"blob"),
+        reference: ContentReference::New(ContentId(7)),
         length: 100,
     };
     let extent = ExtentValue {
@@ -396,7 +396,10 @@ fn slicing_an_overflow_extent_moves_its_offset_into_the_same_blob() {
         ExtentValue {
             start: 130,
             content_offset: 40,
-            content,
+            content: SpillableValue::Overflow {
+                reference: ContentReference::Existing(ContentId(7)),
+                length: 100,
+            },
         }
     );
 }
@@ -447,6 +450,13 @@ fn stored_extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(u64, ExtentValu
     .unwrap()
 }
 
+// the_only_stored_id is the id of the one blob the engine's content store keeps.
+fn the_only_stored_id(engine: &InMemoryEngine) -> ContentId {
+    let ids = engine.content().ids();
+    assert_eq!(ids.len(), 1, "the content store keeps {ids:?}");
+    *ids.first().unwrap()
+}
+
 fn extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(Range<u64>, Bytes)> {
     stored_extents(engine, inode)
         .into_iter()
@@ -457,10 +467,13 @@ fn extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(Range<u64>, Bytes)> {
                     usize::try_from(extent.content_offset).unwrap()
                         ..usize::try_from(extent.content_offset + length).unwrap(),
                 ),
-                SpillableValue::Overflow { hash, .. } => {
-                    let mut content =
-                        block_on(engine.content().get(&hash, extent.content_offset, length))
-                            .unwrap();
+                SpillableValue::Overflow { reference, .. } => {
+                    let mut content = block_on(engine.content().get(
+                        &reference.id(),
+                        extent.content_offset,
+                        length,
+                    ))
+                    .unwrap();
                     content.copy_to_bytes(content.remaining())
                 }
             };
@@ -732,7 +745,7 @@ fn a_write_stays_inline_while_its_extent_fits_the_largest_inline_entry() {
                 start: 0,
                 content_offset: 0,
                 content: SpillableValue::Overflow {
-                    hash: ContentHash::of(&spills),
+                    reference: ContentReference::New(the_only_stored_id(&engine)),
                     length: spills.len() as u64,
                 },
             }
@@ -749,7 +762,7 @@ fn overwriting_part_of_a_spilled_extent_keeps_pointing_into_its_blob() {
     write(&engine, inode, 0, &content).unwrap();
     write(&engine, inode, 100, b"ab").unwrap();
     let blob = SpillableValue::Overflow {
-        hash: ContentHash::of(&content),
+        reference: ContentReference::Existing(the_only_stored_id(&engine)),
         length: 2000,
     };
     assert_eq!(
@@ -948,7 +961,7 @@ fn shrinking_a_spilled_extent_keeps_pointing_into_its_blob() {
                 start: 0,
                 content_offset: 0,
                 content: SpillableValue::Overflow {
-                    hash: ContentHash::of(&content),
+                    reference: ContentReference::Existing(the_only_stored_id(&engine)),
                     length: 2000,
                 },
             }

@@ -14,6 +14,7 @@ use futures_executor::ThreadPool as SpawnerPool;
 use futures_lite::future::block_on;
 use futures_util::FutureExt;
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
+use stratafs_fs_engine::spillable::referenced_content;
 use stratafs_fs_engine::strong::ConnectFailure;
 use stratafs_fs_engine::{
     Cached, Eventual, FsConfig, FsEngine, MountId, StrongUntilDisconnectCached, Timestamp,
@@ -26,7 +27,7 @@ use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_sqlite::{SqliteContent, SqliteMetadata, SqliteStore};
-use stratafs_store::content::ContentStore;
+use stratafs_store::content::{ContentId, ContentReference, ContentStore};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
@@ -48,6 +49,10 @@ impl TreeConfig for FuseTreeConfig {
     type Range = u16;
     const NODE_CAPACITY: usize = 16 * 1024;
     const MERGE_BELOW_PERCENT: u8 = 25;
+
+    fn referenced_content(key: &[u8], value: &[u8]) -> Option<ContentReference> {
+        referenced_content(key, value)
+    }
 }
 
 pub struct FuseFsConfig;
@@ -226,7 +231,7 @@ pub fn create(arguments: &CreateArguments) -> Result<TreeVolumeId, OpenError> {
 // FILE names its metadata's file in the store directory.
 trait Database {
     type Metadata: KeyValueStore;
-    type Content: ContentStore + 'static;
+    type Content: ContentStore + Clone + 'static;
     type Store: Store;
 
     const FILE: &str;
@@ -399,7 +404,7 @@ async fn open_tree<D: Database>(
 ) -> Result<(StoreTree<D>, D::Content), OpenError> {
     let (metadata, content) = D::open(directory)?;
     let allocate_node: fn() -> u128 = rand::random;
-    let tree = Tree::new(metadata, allocate_node, runtime)
+    let tree = Tree::new(metadata, allocate_node, content.clone(), runtime)
         .await
         .map_err(|error| OpenError::Tree(Box::new(error)))?;
     Ok((tree, content))
@@ -420,9 +425,11 @@ async fn engine<D: Database, C: Cached<D::Store>>(
         StoreError::Failed(failure) => OpenError::Volume(Box::new(failure)),
     })?;
     let allocate_inode: fn() -> u64 = rand::random;
+    let allocate_content_id: fn() -> ContentId = || ContentId(rand::random());
     FsEngine::new(
         D::store(metadata, content),
         allocate_inode,
+        allocate_content_id,
         now as fn() -> Timestamp,
         MountId(rand::random()),
         durability_limit,

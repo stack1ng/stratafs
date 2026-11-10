@@ -14,7 +14,7 @@ use crashable::{CrashableMemory, CrashableStores};
 use futures_lite::future::block_on;
 use stratafs_kv_conformance::runtime::seeded;
 use stratafs_sqlite::{SqliteContent, SqliteMetadata};
-use stratafs_store::content::{ContentHash, ContentStore, GetRejection};
+use stratafs_store::content::{ContentId, ContentStore, GetRejection};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
@@ -258,13 +258,14 @@ fn what_ensure_durable_made_durable_survives_a_crash_with_its_content() {
     let stores = CrashableStores::new(CHECKPOINT_NEVER);
     let (store, memory) = stores.open(SimulatedThreadPool);
     let content = [9; 300 * 1024];
-    let made_durable = commit_content(&store, b"made durable", &content);
+    let (made_durable, left_unsynced) = (ContentId(1), ContentId(2));
+    commit_content(&store, b"made durable", made_durable, &content);
     make_durable(&store, DurableAgainst::PowerFailure);
-    let left_unsynced = commit_content(&store, b"left unsynced", b"unsynced content");
+    commit_content(&store, b"left unsynced", left_unsynced, b"unsynced content");
     let reopened = stores.reopen_synced(memory, SimulatedThreadPool);
     assert_eq!(
         get(&reopened, b"made durable"),
-        Some(Bytes::copy_from_slice(&made_durable.0))
+        Some(Bytes::copy_from_slice(&made_durable.0.to_be_bytes()))
     );
     assert_eq!(
         read(&reopened, &made_durable, content.len()),
@@ -417,34 +418,36 @@ fn get<S: KeyValueStore>(store: &S, key: &'static [u8]) -> Option<Bytes> {
     .unwrap()
 }
 
-// commit_content commits key naming content, which the transaction's work puts, as a file system's write does.
+// commit_content commits key naming content, which the transaction's work puts under id, as a file system's write
+// does.
 fn commit_content<S: SpawnBlocking + 'static>(
     metadata: &SqliteMetadata<S>,
     key: &'static [u8],
+    id: ContentId,
     content: &[u8],
-) -> ContentHash {
+) {
     let stored = SqliteContent::of(metadata);
     let content = Bytes::copy_from_slice(content);
     block_on(metadata.transact(|mut transaction| {
         let (stored, content) = (&stored, content.clone());
         Box::pin(async move {
-            let hash = stored.put(content).await.unwrap();
+            stored.put(&id, content).await.unwrap();
             transaction
-                .set(Bytes::from_static(key), &hash.0[..])
+                .set(Bytes::from_static(key), &id.0.to_be_bytes()[..])
                 .unwrap();
-            Ok::<_, Infallible>((hash, transaction))
+            Ok::<_, Infallible>(((), transaction))
         })
     }))
-    .unwrap()
+    .unwrap();
 }
 
-// read is the whole content of len bytes stored under hash, or None while the store keeps no such content.
+// read is the whole content of len bytes stored under id, or None while the store keeps no such content.
 fn read<S: SpawnBlocking + 'static>(
     metadata: &SqliteMetadata<S>,
-    hash: &ContentHash,
+    id: &ContentId,
     len: usize,
 ) -> Option<Bytes> {
-    match block_on(SqliteContent::of(metadata).get(hash, 0, len as u64)) {
+    match block_on(SqliteContent::of(metadata).get(id, 0, len as u64)) {
         Ok(mut read) => Some(read.copy_to_bytes(read.remaining())),
         Err(StoreError::Rejected(GetRejection::UnknownContent(_))) => None,
         Err(error) => panic!("{error}"),

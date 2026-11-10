@@ -12,6 +12,8 @@ use crate::{ObjectStoreContentStore, ObjectStoreError};
 pub(crate) struct Unflushed {
     root: PathBuf,
     pending: Mutex<Pending>,
+    // flushing is held by each flush and each delete, so no delete removes a file a flush is handing to the disk.
+    pub(crate) flushing: Arc<async_lock::Mutex<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -30,6 +32,16 @@ impl Unflushed {
             .unwrap_or_else(PoisonError::into_inner)
             .files
             .push(self.root.join(path.as_ref()));
+    }
+
+    // forget drops the file at path, which a delete removes, from what a flush hands to the disk.
+    pub(crate) fn forget(&self, path: &object_store::path::Path) {
+        let file = self.root.join(path.as_ref());
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .files
+            .retain(|pending| *pending != file);
     }
 
     // flush makes every file put since the last flush durable against a failure, along with the directories
@@ -73,6 +85,7 @@ impl ObjectStoreContentStore {
             unflushed: Some(Arc::new(Unflushed {
                 root,
                 pending: Mutex::default(),
+                flushing: Arc::default(),
             })),
         })
     }

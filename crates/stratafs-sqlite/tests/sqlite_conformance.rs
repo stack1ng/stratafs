@@ -28,11 +28,9 @@ fn observation_lifecycle() {
 }
 
 #[test]
-fn stores_content_under_its_hash() {
+fn stores_content_under_its_id() {
     let stores = Stores::new();
-    stratafs_content_conformance::stores_content_under_its_hash(|| {
-        SqliteContent::of(&stores.open())
-    });
+    stratafs_content_conformance::stores_content_under_its_id(|| SqliteContent::of(&stores.open()));
 }
 
 #[test]
@@ -53,4 +51,26 @@ fn rejects_ranges_beyond_the_content() {
 fn rejects_unknown_content() {
     let stores = Stores::new();
     stratafs_content_conformance::rejects_unknown_content(|| SqliteContent::of(&stores.open()));
+}
+
+#[test]
+fn keeps_the_same_content_under_each_id_apart() {
+    let stores = Stores::new();
+    stratafs_content_conformance::keeps_the_same_content_under_each_id_apart(|| {
+        SqliteContent::of(&stores.open())
+    });
+}
+
+#[test]
+fn deletes_content() {
+    let stores = Stores::new();
+    stratafs_content_conformance::deletes_content(|| SqliteContent::of(&stores.open()));
+}
+
+#[test]
+fn deletes_content_that_is_already_gone() {
+    let stores = Stores::new();
+    stratafs_content_conformance::deletes_content_that_is_already_gone(|| {
+        SqliteContent::of(&stores.open())
+    });
 }

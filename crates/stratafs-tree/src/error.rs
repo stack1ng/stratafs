@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::sync::Arc;
 
 use stratafs_store::kv::SetRejection;
@@ -17,4 +18,6 @@ pub enum TreeFailure<F, R> {
     RefusedWrite(#[source] SetRejection<R>),
     #[error("the inner store refused a transaction")]
     RefusedTransaction(#[source] R),
+    #[error("the content store failed to delete a blob")]
+    ContentDeletion(#[source] Box<dyn Error + Send + Sync>),
 }

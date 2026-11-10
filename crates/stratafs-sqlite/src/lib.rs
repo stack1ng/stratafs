@@ -20,9 +20,7 @@ use rusqlite::wal::CheckpointMode;
 use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, ffi, params};
 
 use stratafs_keyed_notify::KeyedNotify;
-use stratafs_store::content::{
-    ContentHash, ContentHasher, ContentStore, GetRejection, UnknownContent,
-};
+use stratafs_store::content::{ContentId, ContentStore, GetRejection, UnknownContent};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{
@@ -50,7 +48,7 @@ const CREATE: &str = "
     PRAGMA journal_mode = WAL;
     CREATE TABLE IF NOT EXISTS kv (key BLOB NOT NULL UNIQUE, value BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS content (
-        hash BLOB NOT NULL, chunk INTEGER NOT NULL, data BLOB NOT NULL, UNIQUE (hash, chunk)
+        id BLOB NOT NULL, chunk INTEGER NOT NULL, data BLOB NOT NULL, UNIQUE (id, chunk)
     );
 ";
 // The writer commits without a sync, and keeps the keys clear_range returns in memory. It reads the database mapped
@@ -79,9 +77,10 @@ const CLEAR_BETWEEN: &str = "DELETE FROM kv WHERE key >= ?1 AND key < ?2 RETURNI
 const CLEAR_FROM: &str = "DELETE FROM kv WHERE key >= ?1 RETURNING key";
 // The last chunk of content gives its length.
 const CONTENT_END: &str =
-    "SELECT chunk, length(data) FROM content WHERE hash = ?1 ORDER BY chunk DESC LIMIT 1";
-const CHUNK_ROW: &str = "SELECT rowid FROM content WHERE hash = ?1 AND chunk = ?2";
-const PUT_CHUNK: &str = "INSERT INTO content (hash, chunk, data) VALUES (?1, ?2, ?3)";
+    "SELECT chunk, length(data) FROM content WHERE id = ?1 ORDER BY chunk DESC LIMIT 1";
+const CHUNK_ROW: &str = "SELECT rowid FROM content WHERE id = ?1 AND chunk = ?2";
+const PUT_CHUNK: &str = "INSERT INTO content (id, chunk, data) VALUES (?1, ?2, ?3)";
+const DELETE_CONTENT: &str = "DELETE FROM content WHERE id = ?1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteOpenError {
@@ -564,42 +563,54 @@ impl<S: SpawnBlocking + 'static> ContentStore for SqliteContent<S> {
 
     // A put the work of a write transaction makes goes into that transaction, which holds the writer meanwhile, so
     // the content commits with the metadata naming it. Any other put commits on its own, through the writer.
-    async fn put(&self, content: impl Buf + Send) -> Result<ContentHash, Self::Failure> {
-        let (hash, chunks) = chunked(content);
+    async fn put(&self, id: &ContentId, content: impl Buf + Send) -> Result<(), Self::Failure> {
+        let chunks = chunked(content);
         if in_write_transaction(&self.0) {
-            store_chunks(&mut lock(&self.0.writer_connection), &hash, &chunks)?;
-            return Ok(hash);
+            return store_chunks(&mut lock(&self.0.writer_connection), id, &chunks);
         }
         self.0
             .transact(|transaction| {
-                let stored = store_chunks(&mut lock(transaction.connection), &hash, &chunks);
+                let stored = store_chunks(&mut lock(transaction.connection), id, &chunks);
                 Box::pin(async move { stored.map(|()| ((), transaction)) })
             })
             .await
-            .map_err(content_failure)?;
-        Ok(hash)
+            .map_err(content_failure)
     }
 
     // A get the work of a write transaction makes reads inside that transaction, so it finds content the work put.
     async fn get(
         &self,
-        hash: &ContentHash,
+        id: &ContentId,
         offset: u64,
         size: u64,
     ) -> Result<Bytes, StoreError<GetRejection, Self::Failure>> {
         if in_write_transaction(&self.0) {
             let connection = lock(&self.0.writer_connection);
-            return read_content(begun(&connection)?, hash, offset, size)?
+            return read_content(begun(&connection)?, id, offset, size)?
                 .map_err(StoreError::Rejected);
         }
         self.0
             .read_transact(|transaction| {
-                let read = read_content(&lock(transaction.connection), hash, offset, size);
+                let read = read_content(&lock(transaction.connection), id, offset, size);
                 Box::pin(async move { read })
             })
             .await
             .map_err(content_failure)?
             .map_err(StoreError::Rejected)
+    }
+
+    // A delete the work of a write transaction makes goes into that transaction, as a put does.
+    async fn delete(&self, id: &ContentId) -> Result<(), Self::Failure> {
+        if in_write_transaction(&self.0) {
+            return delete_content(&lock(&self.0.writer_connection), id);
+        }
+        self.0
+            .transact(|transaction| {
+                let deleted = delete_content(&lock(transaction.connection), id);
+                Box::pin(async move { deleted.map(|()| ((), transaction)) })
+            })
+            .await
+            .map_err(content_failure)
     }
 
     fn ensure_durable(
@@ -641,41 +652,39 @@ fn in_write_transaction<S>(database: &Database<S>) -> bool {
     ptr::eq(IN_WRITE_TRANSACTION.get(), ptr::from_ref(database).cast())
 }
 
-// chunked is content as the chunks the store keeps it in, with its hash. Empty content is one empty chunk.
-fn chunked(mut content: impl Buf) -> (ContentHash, Vec<Bytes>) {
-    let mut hasher = ContentHasher::default();
+// chunked is content as the chunks the store keeps it in. Empty content is one empty chunk.
+fn chunked(mut content: impl Buf) -> Vec<Bytes> {
     let mut chunks = Vec::with_capacity(content.remaining().div_ceil(CHUNK_SIZE).max(1));
     loop {
-        let chunk = content.copy_to_bytes(content.remaining().min(CHUNK_SIZE));
-        hasher.update(&chunk);
-        chunks.push(chunk);
+        chunks.push(content.copy_to_bytes(content.remaining().min(CHUNK_SIZE)));
         if !content.has_remaining() {
-            return (hasher.finish(), chunks);
+            return chunks;
         }
     }
 }
 
-// store_chunks keeps every chunk of content under its hash, or none when one fails, unless the store keeps that
-// content already.
+// store_chunks keeps every chunk of content under its id, or none when one fails.
 fn store_chunks(
     connection: &mut Connection,
-    hash: &ContentHash,
+    id: &ContentId,
     chunks: &[Bytes],
 ) -> rusqlite::Result<()> {
-    let stored = begun(connection)?
-        .prepare_cached(CHUNK_ROW)?
-        .query_row(params![&hash.0[..], 0], |_| Ok(()))
-        .optional()?;
-    if stored.is_some() {
-        return Ok(());
-    }
+    begun(connection)?;
     let storing = connection.savepoint()?;
     let mut put = storing.prepare_cached(PUT_CHUNK)?;
     for (index, chunk) in (0_i64..).zip(chunks) {
-        put.execute(params![&hash.0[..], index, &chunk[..]])?;
+        put.execute(params![&id.0.to_be_bytes()[..], index, &chunk[..]])?;
     }
     drop(put);
     storing.commit()
+}
+
+// delete_content removes every chunk of the content kept under id.
+fn delete_content(connection: &Connection, id: &ContentId) -> rusqlite::Result<()> {
+    begun(connection)?
+        .prepare_cached(DELETE_CONTENT)?
+        .execute([&id.0.to_be_bytes()[..]])
+        .map(|_| ())
 }
 
 // content_failure is why a transaction the store ran for content failed.
@@ -691,13 +700,14 @@ fn content_failure(
 // read_content reads size bytes of content from offset, through the blob of each chunk they are in.
 fn read_content(
     connection: &Connection,
-    hash: &ContentHash,
+    id: &ContentId,
     offset: u64,
     size: u64,
 ) -> rusqlite::Result<Result<Bytes, GetRejection>> {
+    let id = id.0.to_be_bytes();
     let last = connection
         .prepare_cached(CONTENT_END)?
-        .query_row([&hash.0[..]], |row| {
+        .query_row([&id[..]], |row| {
             Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
         })
         .optional()?;
@@ -716,7 +726,7 @@ fn read_content(
     let chunk_row = |chunk: u64| {
         connection
             .prepare_cached(CHUNK_ROW)?
-            .query_row(params![&hash.0[..], chunk], |row| row.get(0))
+            .query_row(params![&id[..], chunk], |row| row.get(0))
     };
     let mut content = vec![0; usize::try_from(size).expect("a read fits in memory")];
     let mut chunk = offset / chunk_size;

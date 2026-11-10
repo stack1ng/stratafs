@@ -9,7 +9,7 @@ use bytes::{Buf, Bytes};
 use futures_lite::future::block_on;
 use stores::Stores;
 use stratafs_sqlite::SqliteContent;
-use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
+use stratafs_store::content::{ContentId, ContentStore, GetRejection, UnknownContent};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, TransactError};
 
@@ -28,7 +28,8 @@ fn content_reads_back_from_any_range_across_its_chunks() {
     let store = stores.open();
     let content = SqliteContent::of(&store);
     let long = long_content();
-    let hash = block_on(content.put(long.clone())).unwrap();
+    let id = ContentId(7);
+    block_on(content.put(&id, long.clone())).unwrap();
     let chunk = 256 * 1024;
     for (start, end) in [
         (0, LONG),
@@ -39,7 +40,7 @@ fn content_reads_back_from_any_range_across_its_chunks() {
         (LONG - 1, LONG),
         (LONG, LONG),
     ] {
-        let mut read = block_on(content.get(&hash, start as u64, (end - start) as u64)).unwrap();
+        let mut read = block_on(content.get(&id, start as u64, (end - start) as u64)).unwrap();
         assert_eq!(
             read.copy_to_bytes(read.remaining()),
             long.slice(start..end),
@@ -54,20 +55,21 @@ fn content_a_transaction_puts_commits_with_it() {
     let store = stores.open();
     let content = SqliteContent::of(&store);
     let long = long_content();
-    let (hash, read_inside) = block_on(store.transact(|mut transaction| {
+    let id = ContentId(7);
+    let read_inside = block_on(store.transact(|mut transaction| {
         let (content, long) = (&content, long.clone());
         Box::pin(async move {
-            let hash = content.put(long).await.unwrap();
-            let mut read = content.get(&hash, 0, LONG as u64).await.unwrap();
+            content.put(&id, long).await.unwrap();
+            let mut read = content.get(&id, 0, LONG as u64).await.unwrap();
             transaction
-                .set(Bytes::from_static(b"file"), &hash.0[..])
+                .set(Bytes::from_static(b"file"), &id.0.to_be_bytes()[..])
                 .unwrap();
-            Ok::<_, Infallible>(((hash, read.copy_to_bytes(read.remaining())), transaction))
+            Ok::<_, Infallible>((read.copy_to_bytes(read.remaining()), transaction))
         })
     }))
     .unwrap();
     assert_eq!(read_inside, long);
-    let mut read = block_on(content.get(&hash, 0, LONG as u64)).unwrap();
+    let mut read = block_on(content.get(&id, 0, LONG as u64)).unwrap();
     assert_eq!(read.copy_to_bytes(read.remaining()), long);
 }
 
@@ -76,15 +78,19 @@ fn content_work_that_aborts_puts_is_rolled_back_with_it() {
     let stores = Stores::new();
     let store = stores.open();
     let content = SqliteContent::of(&store);
+    let id = ContentId(7);
     let aborted = block_on(store.transact::<(), _>(|_transaction| {
         let content = &content;
-        Box::pin(async move { Err(content.put(&b"aborted"[..]).await.unwrap()) })
+        Box::pin(async move {
+            content.put(&id, &b"aborted"[..]).await.unwrap();
+            Err(())
+        })
     }));
-    let Err(TransactError::<Infallible, rusqlite::Error, _>::Aborted(hash)) = aborted else {
+    let Err(TransactError::<Infallible, rusqlite::Error, _>::Aborted(())) = aborted else {
         panic!("the work was not aborted");
     };
     assert!(matches!(
-        block_on(content.get(&hash, 0, 0)),
+        block_on(content.get(&id, 0, 0)),
         Err(StoreError::Rejected(GetRejection::UnknownContent(
             UnknownContent
         )))
@@ -111,7 +117,7 @@ fn content_put_while_another_transaction_runs_waits_for_it_and_outlives_its_abor
         });
         holding.wait();
         scope.spawn(|| {
-            put.send(block_on(content.put(&b"put meanwhile"[..])))
+            put.send(block_on(content.put(&ContentId(7), &b"put meanwhile"[..])))
                 .unwrap()
         });
         assert!(
@@ -120,8 +126,26 @@ fn content_put_while_another_transaction_runs_waits_for_it_and_outlives_its_abor
         );
         released.wait();
     });
-    let hash = putting.recv().unwrap().unwrap();
-    assert_eq!(hash, ContentHash::of(b"put meanwhile"));
-    let mut read = block_on(content.get(&hash, 0, 13)).unwrap();
+    putting.recv().unwrap().unwrap();
+    let mut read = block_on(content.get(&ContentId(7), 0, 13)).unwrap();
     assert_eq!(read.copy_to_bytes(read.remaining()), &b"put meanwhile"[..]);
+}
+
+#[test]
+fn content_work_that_aborts_deletes_is_kept() {
+    let stores = Stores::new();
+    let store = stores.open();
+    let content = SqliteContent::of(&store);
+    let id = ContentId(7);
+    block_on(content.put(&id, &b"kept"[..])).unwrap();
+    let aborted = block_on(store.transact::<(), _>(|_transaction| {
+        let content = &content;
+        Box::pin(async move {
+            content.delete(&id).await.unwrap();
+            Err(())
+        })
+    }));
+    assert!(matches!(aborted, Err(TransactError::Aborted(()))));
+    let mut read = block_on(content.get(&id, 0, 4)).unwrap();
+    assert_eq!(read.copy_to_bytes(read.remaining()), &b"kept"[..]);
 }

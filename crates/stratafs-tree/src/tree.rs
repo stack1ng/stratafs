@@ -1,12 +1,15 @@
 use std::convert::Infallible;
+use std::error::Error;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_channel::oneshot;
+use futures_core::future::BoxFuture;
 use stratafs_runtime::Runtime;
 use stratafs_serialized::serialized_value;
+use stratafs_store::content::{ContentId, ContentReference, ContentStore};
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::kv::{
@@ -30,6 +33,33 @@ pub trait TreeConfig: Send + Sync + 'static {
     const GARBAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(60);
     // GARBAGE_COLLECTION_BATCH is the most jobs the garbage collector applies in one transaction.
     const GARBAGE_COLLECTION_BATCH: usize = 32;
+
+    // referenced_content is a leaf entry's reference to a blob, if it has one. The tree counts those references,
+    // so the garbage collector deletes a blob once no leaf entry references it.
+    fn referenced_content(_key: &[u8], _value: &[u8]) -> Option<ContentReference> {
+        None
+    }
+}
+
+// ContentDeleter is the part of a content store the tree uses.
+pub trait ContentDeleter: Send + Sync + 'static {
+    // delete removes the blob kept under id, and succeeds when there is none.
+    fn delete(&self, id: ContentId) -> BoxFuture<'_, Result<(), Box<dyn Error + Send + Sync>>>;
+}
+
+impl<C: ContentStore + 'static> ContentDeleter for C {
+    fn delete(&self, id: ContentId) -> BoxFuture<'_, Result<(), Box<dyn Error + Send + Sync>>> {
+        Box::pin(async move { ContentStore::delete(self, &id).await.map_err(Into::into) })
+    }
+}
+
+// NoContent is the content of a tree whose entries reference none.
+pub struct NoContent;
+
+impl ContentDeleter for NoContent {
+    fn delete(&self, _id: ContentId) -> BoxFuture<'_, Result<(), Box<dyn Error + Send + Sync>>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub(crate) trait TreeConfigLimits: TreeConfig {
@@ -79,6 +109,8 @@ pub struct Tree<S: KeyValueStore, A, C>(Arc<TreeShared<S, A, C>>);
 pub(crate) struct TreeShared<S: KeyValueStore, A, C> {
     pub(crate) store: S,
     pub(crate) id_allocator: A,
+    // content deletes each blob the garbage collector finds unreferenced
+    pub(crate) content: Arc<dyn ContentDeleter>,
     // watches holds each watch that waiters share, for as long as one of them still waits on it
     pub(crate) watches: Mutex<SharedWatches<S::Failure>>,
     // runtime runs each opened volume's garbage collector
@@ -97,6 +129,7 @@ where
     pub async fn new(
         store: S,
         id_allocator: A,
+        content: impl ContentDeleter,
         runtime: Arc<dyn Runtime>,
     ) -> Result<
         Self,
@@ -161,6 +194,7 @@ where
         Ok(Self(Arc::new(TreeShared {
             store,
             id_allocator,
+            content: Arc::new(content),
             watches: Mutex::default(),
             runtime,
             config: PhantomData,

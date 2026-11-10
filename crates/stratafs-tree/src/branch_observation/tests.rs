@@ -12,7 +12,7 @@ use stratafs_store::kv::{KeyValueTransaction, SetRejection};
 use stratafs_store::spawn::Inline;
 
 use super::*;
-use crate::tree::Tree;
+use crate::tree::{NoContent, Tree};
 
 struct SmallNodeConfig;
 
@@ -32,6 +32,7 @@ fn open_volume() -> TreeVolume<RedbStore<Inline>, impl Fn() -> u128, SmallNodeCo
         let tree = Tree::new(
             RedbStore::new(database, Inline).unwrap(),
             allocate_id,
+            NoContent,
             Arc::new(TaskDroppingRuntime),
         )
         .await

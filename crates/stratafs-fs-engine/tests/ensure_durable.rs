@@ -12,6 +12,7 @@ use stratafs_lock_synchronized::{LockSynchronizedMetadata, LockSynchronizedStore
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::ThreadPoolRuntime;
+use stratafs_store::content::ContentId;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::spawn::Inline;
 use stratafs_store::store::Store;
@@ -64,10 +65,12 @@ fn durable_against(durability_limit: Option<DurableAgainst>) -> Vec<DurableAgain
         log: Arc::clone(&log),
     };
     let allocate_inode: fn() -> u64 = || 7;
+    let allocate_content_id: fn() -> ContentId = || ContentId(7);
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
     let engine: FsEngine<_, _, _, TestConfig, _> = block_on(FsEngine::new(
         store,
         allocate_inode,
+        allocate_content_id,
         now,
         MountId(1),
         durability_limit,

@@ -14,7 +14,7 @@ use zerocopy::little_endian::{U64, U128};
 use super::*;
 use crate::header::TreeVolumeId;
 use crate::node::{NodeHeader, NodeKind};
-use crate::tree::Tree;
+use crate::tree::{NoContent, Tree};
 use crate::volume::TreeVolume;
 
 struct SmallConfig;
@@ -74,6 +74,7 @@ fn three_level_volume() -> Volume<RedbStore<Inline>> {
     let tree = block_on(Tree::<_, fn() -> u128, SmallConfig>::new(
         store,
         || 1,
+        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap();

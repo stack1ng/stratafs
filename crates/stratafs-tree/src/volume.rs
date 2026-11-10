@@ -8,6 +8,7 @@ use futures_channel::oneshot;
 use futures_core::future::BoxFuture;
 use smallvec::SmallVec;
 use stratafs_range_bounds_map::RangeBoundsMap;
+use stratafs_store::content::ContentReference;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkingTransaction;
@@ -20,7 +21,7 @@ use zerocopy::KnownLayout;
 use crate::concatenated_bytes::ConcatenatedBytes;
 use crate::error::TreeFailure;
 use crate::header::{NodeId, TreeVolumeId, VolumeHeader};
-use crate::key::TreeKey;
+use crate::key::{Referenced, TreeKey};
 use crate::node::{InternalEntry, LeafEntry};
 use crate::serialized::CorruptValue;
 use crate::tree::{TreeConfig, TreeConfigLimits, TreeShared};
@@ -41,8 +42,8 @@ pub struct TreeTransaction<'txn, T, S: KeyValueStore, A, C> {
         // None here means the bytes were cleared
         Option<Bytes>,
     >,
-    // node_ref_deltas are the current write's reference count changes, netted per node when it ends
-    pub(crate) node_ref_deltas: Vec<(NodeId, i64)>,
+    // ref_deltas are the current write's reference count changes, netted per node and blob when it ends
+    pub(crate) ref_deltas: Vec<(Referenced, i64)>,
 }
 
 // FlushingWork is the error of a transaction's work followed by its flush.
@@ -61,7 +62,7 @@ impl<S: KeyValueStore, A, C> TreeVolume<S, A, C> {
             shared: &self.shared,
             volume: self.id,
             buffered_delta: RangeBoundsMap::new(),
-            node_ref_deltas: Vec::new(),
+            ref_deltas: Vec::new(),
         }
     }
 }
@@ -346,14 +347,37 @@ where
             return Err(StoreError::Rejected(SetRejection::TooLarge));
         }
 
-        self.buffered_delta
-            .insert(&key..=&key, Some(value.copy_to_bytes(value.remaining())));
+        let value = value.copy_to_bytes(value.remaining());
+        self.dereference_replaced_new_content((Included(&key), Included(&key)), Some(&value));
+        self.buffered_delta.insert(&key..=&key, Some(value));
         Ok(())
     }
 
     fn clear_range(&mut self, range: impl RangeBounds<Bytes>) -> Result<(), Self::Failure> {
+        self.dereference_replaced_new_content((range.start_bound(), range.end_bound()), None);
         self.buffered_delta.insert(range, None);
         Ok(())
+    }
+}
+
+impl<T, S: KeyValueStore, A, C: TreeConfig> TreeTransaction<'_, T, S, A, C> {
+    // dereference_replaced_new_content records one reference less for each new blob whose buffered entry in range is
+    // replaced before the tree stores it, as the tree counts a new blob's entry only by storing it. An entry replaced
+    // by the same reference stays.
+    fn dereference_replaced_new_content(
+        &mut self,
+        range: (Bound<&Bytes>, Bound<&Bytes>),
+        replacement: Option<&Bytes>,
+    ) {
+        for ((start, _), buffered) in self.buffered_delta.overlapping(range) {
+            if let (Included(key), Some(buffered)) = (start, buffered)
+                && let Some(ContentReference::New(id)) = C::referenced_content(key, buffered)
+                && replacement.and_then(|replacement| C::referenced_content(key, replacement))
+                    != Some(ContentReference::New(id))
+            {
+                self.ref_deltas.push((Referenced::Content(id.into()), -1));
+            }
+        }
     }
 }
 
@@ -382,8 +406,9 @@ where
             .map_err(with_tree_failure)
             .map_err(refused_write_as_failure)?;
         // both headers now point at the root
-        self.node_ref_deltas.push((from_header.root, 1));
-        self.apply_node_ref_deltas()
+        self.ref_deltas
+            .push((Referenced::Node(from_header.root), 1));
+        self.apply_ref_deltas()
             .await
             .map_err(refused_write_as_failure)?;
 

@@ -89,7 +89,7 @@ where
         while !layer.spans.is_empty() {
             layer = self.fit_layer(volume, layer, packing).await?;
         }
-        self.apply_node_ref_deltas().await
+        self.apply_ref_deltas().await
     }
 
     // fit_layer handles actually fitting the given entries to the given nodes.

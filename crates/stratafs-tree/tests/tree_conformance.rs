@@ -12,7 +12,7 @@ use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
 use stratafs_store::spawn::Inline;
 use stratafs_tree::header::TreeVolumeId;
 use stratafs_tree::serialized::CorruptValue;
-use stratafs_tree::tree::{Tree, TreeConfig};
+use stratafs_tree::tree::{NoContent, Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
 
 struct SingleLeafConfig;
@@ -40,6 +40,7 @@ fn new_tree<C: TreeConfig>() -> Tree<RedbStore<Inline>, impl Fn() -> u128, C> {
     block_on(Tree::new(
         RedbStore::new(database, Inline).unwrap(),
         allocate_id,
+        NoContent,
         Arc::new(TaskDroppingRuntime),
     ))
     .unwrap()

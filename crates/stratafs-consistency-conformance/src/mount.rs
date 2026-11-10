@@ -25,7 +25,7 @@ use stratafs_store::kv::TransactError;
 
 use crate::faults::{Faults, Link};
 use crate::simulation::History;
-use crate::store::{InMemoryStore, SharedStore, new_store};
+use crate::store::{InMemoryStore, SharedStore, new_store, next_content_id};
 
 // PUBLISH_TIMEOUT is how long a strong mount's publish waits for every other holder to handle it.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
@@ -252,6 +252,7 @@ impl Volume {
         let engine = FsEngine::new(
             SharedStore::new(&self.store, &faults),
             allocate_inode,
+            next_content_id,
             epoch as fn() -> Timestamp,
             MountId(index as u64 + 1),
             None,

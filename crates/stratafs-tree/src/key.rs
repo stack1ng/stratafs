@@ -1,18 +1,29 @@
 use bytes::Bytes;
 use storekey::{Decode, Encode};
 
-use crate::header::{JobId, NodeId, TreeVolumeId};
+use crate::header::{JobId, NodeId, TreeContentId, TreeVolumeId};
+
+// Referenced is a node or a blob that a reference count counts the pointers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub(crate) enum Referenced {
+    Node(NodeId),
+    // Content is a blob in the content store
+    Content(TreeContentId),
+}
 
 #[derive(Encode, Decode)]
 pub(crate) enum TreeKey {
     VolumeHeader(TreeVolumeId),
     Node(NodeId),
     Config,
-    // NodeRefCount is a node's count of parent pointers, where a missing count is 1
-    NodeRefCount(NodeId),
-    // Dereference is a job, with an empty value, saying the node lost one parent in the volume's tree.
-    // Deleting a volume must write one for its root and drain the volume's jobs.
-    Dereference(TreeVolumeId, NodeId, JobId),
+
+    RefCount(Referenced),
+    // Dereference is an asynchronous job, with an empty value,
+    // saying that the subject "Referenced" was dereferenced once.
+    Dereference(TreeVolumeId, Referenced, JobId),
+    // ContentDeletion is a contentId that has been marked for deletion.
+    // It should be created created atomically with the dereference, once it reaches 0 refs.
+    ContentDeletion(TreeVolumeId, TreeContentId),
 }
 
 impl From<TreeKey> for Bytes {

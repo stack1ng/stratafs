@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use futures_lite::future::{self, block_on};
 use stratafs_sqlite::{SqliteContent, SqliteMetadata};
-use stratafs_store::content::{ContentHash, ContentStore};
+use stratafs_store::content::{ContentId, ContentStore};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
 use stratafs_store::spawn::ThreadPool;
@@ -100,9 +100,9 @@ fn a_killed_process_keeps_every_commit_it_made_durable_with_its_content() {
     let store = SqliteMetadata::local(&path, ThreadPool).unwrap();
     let stored = SqliteContent::of(&store);
     for index in 0..=durable {
-        let hash = get(&store, key(index)).expect("the commit is durable");
-        let hash = ContentHash(hash[..].try_into().unwrap());
-        let mut read = block_on(stored.get(&hash, 0, CONTENT_SIZE as u64)).unwrap();
+        let id = get(&store, key(index)).expect("the commit is durable");
+        let id = ContentId(u128::from_be_bytes(id[..].try_into().unwrap()));
+        let mut read = block_on(stored.get(&id, 0, CONTENT_SIZE as u64)).unwrap();
         assert_eq!(
             read.copy_to_bytes(read.remaining()),
             content(index),
@@ -114,7 +114,7 @@ fn a_killed_process_keeps_every_commit_it_made_durable_with_its_content() {
 fn commit_content_until_killed(path: &Path) {
     let store = SqliteMetadata::local(path, ThreadPool).unwrap();
     for index in 0..u64::MAX {
-        commit_content(&store, key(index), content(index));
+        commit_content(&store, key(index), ContentId(index.into()), content(index));
         if index % 7 == 0 {
             let against = match index % 2 {
                 0 => DurableAgainst::SoftwareFailure,
@@ -305,14 +305,20 @@ fn content(index: u64) -> Bytes {
     Bytes::from(content)
 }
 
-// commit_content commits key naming content, which the transaction's work puts, as a file system's write does.
-fn commit_content(metadata: &SqliteMetadata<ThreadPool>, key: Bytes, content: Bytes) {
+// commit_content commits key naming content, which the transaction's work puts under id, as a file system's write
+// does.
+fn commit_content(
+    metadata: &SqliteMetadata<ThreadPool>,
+    key: Bytes,
+    id: ContentId,
+    content: Bytes,
+) {
     let stored = SqliteContent::of(metadata);
     block_on(metadata.transact(|mut transaction| {
         let (stored, key, content) = (&stored, key.clone(), content.clone());
         Box::pin(async move {
-            let hash = stored.put(content).await.unwrap();
-            transaction.set(key, &hash.0[..]).unwrap();
+            stored.put(&id, content).await.unwrap();
+            transaction.set(key, &id.0.to_be_bytes()[..]).unwrap();
             Ok::<_, Infallible>(((), transaction))
         })
     }))

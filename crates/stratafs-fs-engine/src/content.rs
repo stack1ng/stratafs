@@ -9,7 +9,7 @@ use std::ops::{Bound, Range};
 use bytes::{Buf, Bytes};
 use futures_util::FutureExt;
 use futures_util::future::join;
-use stratafs_store::content::{ContentHash, ContentStore, GetRejection};
+use stratafs_store::content::{ContentId, ContentReference, ContentStore, GetRejection};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
@@ -22,14 +22,14 @@ use crate::spillable::{SpillableContent, SpillableValue};
 use crate::{FsConfig, FsTransaction, Inode, Timestamp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExtentValue {
+pub(crate) struct ExtentValue {
     start: u64,
     content_offset: u64,
     content: SpillableValue,
 }
 
 impl ExtentValue {
-    const STORED_PREFIX_LENGTH: usize = size_of::<u64>() + size_of::<u64>();
+    pub(crate) const STORED_PREFIX_LENGTH: usize = size_of::<u64>() + size_of::<u64>();
 
     fn from_stored(stored: Bytes) -> Result<Self, CorruptValue> {
         let (start, rest) = stored
@@ -71,10 +71,14 @@ impl ExtentValue {
                     content: SpillableValue::Inline(content.slice_ref(visible)),
                 })
             }
-            SpillableValue::Overflow { .. } => Ok(ExtentValue {
+            // the piece is one more reference to the extent's blob
+            SpillableValue::Overflow { reference, length } => Ok(ExtentValue {
                 start: range.start,
                 content_offset,
-                content: self.content.clone(),
+                content: SpillableValue::Overflow {
+                    reference: ContentReference::Existing(reference.id()),
+                    length: *length,
+                },
             }),
         }
     }
@@ -95,7 +99,7 @@ enum ContentPiece {
     },
     Stored {
         start: u64,
-        hash: ContentHash,
+        id: ContentId,
         offset: u64,
         length: u64,
     },
@@ -132,12 +136,9 @@ impl ContentLoadPlan {
                 match piece {
                     ContentPiece::Inline { content, .. } => Ok(SpillableContent::Inline(content)),
                     ContentPiece::Stored {
-                        hash,
-                        offset,
-                        length,
-                        ..
+                        id, offset, length, ..
                     } => content
-                        .get(&hash, offset, length)
+                        .get(&id, offset, length)
                         .await
                         .map(SpillableContent::Overflow),
                 }
@@ -259,13 +260,13 @@ where
                                     content: content.slice_ref(visible),
                                 }
                             }
-                            SpillableValue::Overflow { hash, length } => {
+                            SpillableValue::Overflow { reference, length } => {
                                 if view_end_in_content > length {
                                     return Err(IoFailure::Corrupt(CorruptValue::InvalidExtent));
                                 }
                                 ContentPiece::Stored {
                                     start: view_start,
-                                    hash,
+                                    id: reference.id(),
                                     offset: view_offset,
                                     length: view_size,
                                 }

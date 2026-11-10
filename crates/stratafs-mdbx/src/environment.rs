@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard, Once, PoisonError};
 
 use bytes::Bytes;
 use mdbx_sys as ffi;
-use stratafs_store::content::ContentHash;
+use stratafs_store::content::ContentId;
 use stratafs_store::durability::DurableAgainst;
 
 use crate::{MdbxConfiguration, MdbxFailure, MdbxOpenError};
@@ -33,8 +33,8 @@ static LOG_FATAL_ONLY: Once = Once::new();
 pub(crate) struct Environment {
     environment: NonNull<ffi::MDBX_env>,
     metadata: ffi::MDBX_dbi,
-    // content keeps each piece of content's length under its hash, and each chunk of it under its hash followed by
-    // the chunk's index.
+    // content keeps each piece of content's length under its id, and each chunk of it under its id followed by the
+    // chunk's index.
     content: ffi::MDBX_dbi,
     largest_key: usize,
     largest_value: usize,
@@ -392,11 +392,12 @@ impl<'env> Snapshot<'env> {
         })
     }
 
-    // content_length is the length of the content kept under hash, or None when the store keeps no such content.
-    pub(crate) fn content_length(&self, hash: &ContentHash) -> Result<Option<u64>, MdbxFailure> {
+    // content_length is the length of the content kept under id, or None when the store keeps no such content.
+    pub(crate) fn content_length(&self, id: &ContentId) -> Result<Option<u64>, MdbxFailure> {
         let transaction = self.lock();
         // SAFETY: the transaction is open and this thread holds it, and the value stays mapped while it is open.
-        let Some(length) = unsafe { find(transaction.0, self.environment.content, &hash.0) }?
+        let Some(length) =
+            unsafe { find(transaction.0, self.environment.content, &id.0.to_be_bytes()) }?
         else {
             return Ok(None);
         };
@@ -407,11 +408,11 @@ impl<'env> Snapshot<'env> {
         )))
     }
 
-    // read_content fills destination with the bytes from offset of the content kept under hash, which holds them,
+    // read_content fills destination with the bytes from offset of the content kept under id, which holds them,
     // through each chunk they are in.
     pub(crate) fn read_content(
         &self,
-        hash: &ContentHash,
+        id: &ContentId,
         offset: u64,
         destination: &mut [u8],
     ) -> Result<(), MdbxFailure> {
@@ -429,7 +430,7 @@ impl<'env> Snapshot<'env> {
                 find(
                     transaction.0,
                     self.environment.content,
-                    &chunk_key(hash, index),
+                    &chunk_key(id, index),
                 )
             }?
             .expect("content keeps every chunk its length covers");
@@ -452,6 +453,25 @@ impl<'env> Snapshot<'env> {
         // SAFETY: the transaction is open and this thread holds it.
         check(unsafe { ffi::mdbx_txn_info(transaction.0.as_ptr(), &mut info, false) })?;
         Ok(info.txn_reader_lag == 0)
+    }
+
+    // content_entries is how many entries the snapshot's content table keeps: each piece of content's length and
+    // chunks.
+    #[cfg(test)]
+    pub(crate) fn content_entries(&self) -> Result<u64, MdbxFailure> {
+        let transaction = self.lock();
+        // SAFETY: MDBX_stat is plain numbers, which mdbx_dbi_stat fills in.
+        let mut stat: ffi::MDBX_stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the transaction is open and this thread holds it, and stat is as large as libmdbx is told.
+        check(unsafe {
+            ffi::mdbx_dbi_stat(
+                transaction.0.as_ptr(),
+                self.environment.content,
+                &mut stat,
+                size_of::<ffi::MDBX_stat>(),
+            )
+        })?;
+        Ok(stat.ms_entries)
     }
 
     fn lock(&self) -> MutexGuard<'_, TransactionPointer> {
@@ -543,40 +563,72 @@ impl WriteTransaction<'_> {
         Ok(())
     }
 
-    // put_content keeps content under hash, in chunks, unless the store keeps it already.
+    // put_content keeps content under id, in chunks.
     pub(crate) fn put_content(
         &mut self,
-        hash: &ContentHash,
+        id: &ContentId,
         content: &[u8],
     ) -> Result<(), MdbxFailure> {
         let length = (content.len() as u64).to_be_bytes();
         // SAFETY: the transaction is open, and libmdbx copies the key and value.
-        match unsafe {
+        check(unsafe {
             ffi::mdbx_put(
                 self.transaction.as_ptr(),
                 self.environment.content,
-                &value_of(&hash.0),
+                &value_of(&id.0.to_be_bytes()),
                 &mut value_of(&length),
-                ffi::MDBX_NOOVERWRITE,
+                ffi::MDBX_UPSERT,
             )
-        } {
-            ffi::MDBX_SUCCESS => {}
-            ffi::MDBX_KEYEXIST => return Ok(()),
-            code => return Err(MdbxFailure(code)),
-        }
+        })?;
         for (index, chunk) in (0..).zip(content.chunks(CHUNK_SIZE)) {
             // SAFETY: as above.
             check(unsafe {
                 ffi::mdbx_put(
                     self.transaction.as_ptr(),
                     self.environment.content,
-                    &value_of(&chunk_key(hash, index)),
+                    &value_of(&chunk_key(id, index)),
                     &mut value_of(chunk),
                     ffi::MDBX_UPSERT,
                 )
             })?;
         }
         Ok(())
+    }
+
+    // delete_content removes the content kept under id, with each of its chunks, unless the store keeps none.
+    pub(crate) fn delete_content(&mut self, id: &ContentId) -> Result<(), MdbxFailure> {
+        let key = id.0.to_be_bytes();
+        // SAFETY: the transaction is open and this thread holds it, and the value stays mapped until the transaction
+        // changes something.
+        let Some(length) = unsafe { find(self.transaction, self.environment.content, &key) }?
+        else {
+            return Ok(());
+        };
+        // SAFETY: as above, and the length is copied out before anything changes.
+        let length = u64::from_be_bytes(
+            unsafe { slice_of(&length) }
+                .try_into()
+                .expect("a content length is eight bytes"),
+        );
+        let chunks = u32::try_from(length.div_ceil(CHUNK_SIZE as u64))
+            .expect("content has fewer chunks than u32 counts");
+        self.delete_content_entry(&key)?;
+        for index in 0..chunks {
+            self.delete_content_entry(&chunk_key(id, index))?;
+        }
+        Ok(())
+    }
+
+    fn delete_content_entry(&mut self, key: &[u8]) -> Result<(), MdbxFailure> {
+        // SAFETY: the transaction is open, and libmdbx only reads the key.
+        check(unsafe {
+            ffi::mdbx_del(
+                self.transaction.as_ptr(),
+                self.environment.content,
+                &value_of(key),
+                ptr::null(),
+            )
+        })
     }
 
     pub(crate) fn commit(self) -> Result<(), MdbxFailure> {
@@ -683,10 +735,10 @@ impl Drop for Walk<'_> {
     }
 }
 
-// chunk_key is the key a chunk of content is kept under: the content's hash, then the chunk's index.
-fn chunk_key(hash: &ContentHash, index: u32) -> [u8; 20] {
+// chunk_key is the key a chunk of content is kept under: the content's id, then the chunk's index.
+fn chunk_key(id: &ContentId, index: u32) -> [u8; 20] {
     let mut key = [0; 20];
-    key[..16].copy_from_slice(&hash.0);
+    key[..16].copy_from_slice(&id.0.to_be_bytes());
     key[16..].copy_from_slice(&index.to_be_bytes());
     key
 }

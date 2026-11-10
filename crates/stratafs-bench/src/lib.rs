@@ -17,8 +17,10 @@ use stratafs_fs_engine::Eventual;
 use stratafs_fs_engine::StrongUntilDisconnectCached;
 use stratafs_fs_engine::error::{EngineFailure, PosixError};
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
+use stratafs_fs_engine::spillable::referenced_content;
 use stratafs_fs_engine::{Cached, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_runtime::{Runtime, ThreadPoolRuntime};
+use stratafs_store::content::{ContentId, ContentReference};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::forkable::{ForkableKeyValueStore, UnknownVolume};
@@ -38,6 +40,10 @@ impl TreeConfig for BenchTreeConfig {
     const NODE_CAPACITY: usize = number(option_env!("STRATAFS_BENCH_NODE_CAPACITY"), 16 * 1024);
     const MERGE_BELOW_PERCENT: u8 =
         number(option_env!("STRATAFS_BENCH_MERGE_BELOW_PERCENT"), 25) as u8;
+
+    fn referenced_content(key: &[u8], value: &[u8]) -> Option<ContentReference> {
+        referenced_content(key, value)
+    }
 }
 
 pub struct BenchFsConfig;
@@ -229,7 +235,7 @@ pub async fn open_store(
     std::fs::create_dir_all(directory).map_err(OpenStoreError::Directory)?;
     let (metadata, content) = open_database(directory)?;
     let allocate_node: fn() -> u128 = rand::random;
-    let tree = Tree::new(metadata, allocate_node, runtime)
+    let tree = Tree::new(metadata, allocate_node, content.clone(), runtime)
         .await
         .map_err(OpenStoreError::Tree)?;
     Ok(Store { tree, content })
@@ -314,9 +320,11 @@ async fn engine(
         StoreError::Failed(failure) => OpenVolumeError::Volume(failure),
     })?;
     let allocate_inode: fn() -> u64 = rand::random;
+    let allocate_content_id: fn() -> ContentId = || ContentId(rand::random());
     FsEngine::new(
         BenchStore::new(metadata, store.content),
         allocate_inode,
+        allocate_content_id,
         now as fn() -> Timestamp,
         MountId(rand::random()),
         DURABILITY_LIMIT,

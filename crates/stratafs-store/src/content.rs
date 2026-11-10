@@ -1,34 +1,28 @@
 use bytes::Buf;
 use thiserror::Error;
-use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
 use crate::durability::DurableAgainst;
 use crate::error::StoreError;
 
-// ContentHash is content's 128 bit xxh3 hash, which names it in a content store. Different content with the same
-// hash would be taken for the same content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ContentHash(pub [u8; 16]);
+// ContentId names a blob in a content store. Each put is given one no other put was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ContentId(pub u128);
 
-impl ContentHash {
-    #[must_use]
-    pub fn of(bytes: &[u8]) -> Self {
-        Self(xxh3_128(bytes).to_be_bytes())
-    }
+// ContentReference is a stored entry's reference to a blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentReference {
+    // New is the reference written with the blob.
+    New(ContentId),
+    // Existing is a reference written to a blob that already had one.
+    Existing(ContentId),
 }
 
-// ContentHasher makes the ContentHash of content given in pieces.
-#[derive(Default)]
-pub struct ContentHasher(Xxh3);
-
-impl ContentHasher {
-    pub fn update(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
+impl ContentReference {
     #[must_use]
-    pub fn finish(&self) -> ContentHash {
-        ContentHash(self.0.digest128().to_be_bytes())
+    pub fn id(self) -> ContentId {
+        match self {
+            ContentReference::New(id) | ContentReference::Existing(id) => id,
+        }
     }
 }
 
@@ -48,17 +42,22 @@ pub trait ContentStore: Send + Sync {
     type Failure: std::error::Error + Send + Sync + 'static;
     type Content: Buf + Send;
 
+    // put keeps content under id, a fresh id no other put was given.
     fn put(
         &self,
+        id: &ContentId,
         content: impl Buf + Send,
-    ) -> impl Future<Output = Result<ContentHash, Self::Failure>> + Send;
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 
     fn get(
         &self,
-        hash: &ContentHash,
+        id: &ContentId,
         offset: u64,
         size: u64,
     ) -> impl Future<Output = Result<Self::Content, StoreError<GetRejection, Self::Failure>>> + Send;
+
+    // delete removes the content kept under id, and succeeds when there is none.
+    fn delete(&self, id: &ContentId) -> impl Future<Output = Result<(), Self::Failure>> + Send;
 
     // ensure_durable makes every put that finished before it is called durable against a failure, and resolves
     // once they are.

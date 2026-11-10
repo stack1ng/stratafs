@@ -180,8 +180,8 @@ where
     use zerocopy::FromBytes;
     use zerocopy::little_endian::{U64, U128};
 
-    use crate::header::{JobId, NodeId, TreeVolumeId, VolumeHeader};
-    use crate::key::TreeKey;
+    use crate::header::{JobId, NodeId, TreeContentId, TreeVolumeId, VolumeHeader};
+    use crate::key::{Referenced, TreeKey};
     use crate::node::Node;
 
     let headers = transaction
@@ -196,12 +196,12 @@ where
         .get_range(
             Bytes::from(TreeKey::Dereference(
                 TreeVolumeId(0),
-                NodeId(U128::new(0)),
+                Referenced::Node(NodeId(U128::new(0))),
                 JobId(0),
             ))
                 ..=Bytes::from(TreeKey::Dereference(
                     TreeVolumeId(u128::MAX),
-                    NodeId(U128::new(u128::MAX)),
+                    Referenced::Content(TreeContentId(u128::MAX)),
                     JobId(u128::MAX),
                 )),
             usize::MAX,
@@ -212,8 +212,10 @@ where
     let mut visited = HashSet::new();
     let mut unvisited = Vec::new();
     for (key, _) in stored_jobs {
-        let Ok(TreeKey::Dereference(_, node, _)) = storekey::decode(&key[..]) else {
-            panic!("a stored job key is valid");
+        let node = match storekey::decode(&key[..]) {
+            Ok(TreeKey::Dereference(_, Referenced::Node(node), _)) => node,
+            Ok(TreeKey::Dereference(_, Referenced::Content(_), _)) => continue,
+            _ => panic!("a stored job key is valid"),
         };
         *jobs.entry(node.0.get()).or_insert(0) += 1;
         if visited.insert(node.0.get()) {
@@ -252,7 +254,7 @@ where
     let mut visited_counts = 0;
     for id in visited {
         let stored = transaction
-            .get(TreeKey::NodeRefCount(NodeId(U128::new(id))).into())
+            .get(TreeKey::RefCount(Referenced::Node(NodeId(U128::new(id)))).into())
             .await
             .expect("the store reads the count");
         visited_counts += usize::from(stored.is_some());
@@ -269,8 +271,10 @@ where
     }
     let stored_counts = transaction
         .get_range(
-            Bytes::from(TreeKey::NodeRefCount(NodeId(U128::new(0))))
-                ..=Bytes::from(TreeKey::NodeRefCount(NodeId(U128::new(u128::MAX)))),
+            Bytes::from(TreeKey::RefCount(Referenced::Node(NodeId(U128::new(0)))))
+                ..=Bytes::from(TreeKey::RefCount(Referenced::Node(NodeId(U128::new(
+                    u128::MAX,
+                ))))),
             usize::MAX,
         )
         .await
@@ -286,6 +290,115 @@ where
         .expect("the store reads the nodes")
         .count();
     stored_nodes == visited_nodes && stored_counts == visited_counts
+}
+
+// content_ref_counts_match_leaves checks that each blob's stored count, where a missing count is 1, equals the entries
+// of every stored leaf that reference it plus its pending jobs, that no count is stored for a blob with neither, and
+// that a blob waiting to be deleted has none of the three.
+#[cfg(test)]
+pub(crate) async fn content_ref_counts_match_leaves<T, C>(transaction: &T) -> bool
+where
+    T: stratafs_store::kv::ReadKeyValueTransaction,
+    C: crate::tree::TreeConfig,
+{
+    use std::collections::HashMap;
+
+    use bytes::Bytes;
+    use zerocopy::FromBytes;
+    use zerocopy::little_endian::{U64, U128};
+
+    use crate::header::{JobId, NodeId, TreeContentId, TreeVolumeId};
+    use crate::key::{Referenced, TreeKey};
+    use crate::node::Node;
+
+    let mut references: HashMap<u128, u64> = HashMap::new();
+    let nodes = transaction
+        .get_range(
+            Bytes::from(TreeKey::Node(NodeId(U128::new(0))))
+                ..=Bytes::from(TreeKey::Node(NodeId(U128::new(u128::MAX)))),
+            usize::MAX,
+        )
+        .await
+        .expect("the store reads the nodes");
+    for (_, stored) in nodes {
+        let (_, node) = Node::<Bytes, C::Range>::read(stored).expect("a stored node is valid");
+        if let Node::Leaf(entries) = node {
+            for index in 0..entries.len() {
+                let entry = entries.get(index).expect("the index is in the node");
+                let (key, value) = entry
+                    .and_then(|entry| entry.key_and_value())
+                    .expect("a stored entry is valid");
+                if let Some(reference) = C::referenced_content(key, value) {
+                    *references.entry(reference.id().0).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let jobs = transaction
+        .get_range(
+            Bytes::from(TreeKey::Dereference(
+                TreeVolumeId(0),
+                Referenced::Node(NodeId(U128::new(0))),
+                JobId(0),
+            ))
+                ..=Bytes::from(TreeKey::Dereference(
+                    TreeVolumeId(u128::MAX),
+                    Referenced::Content(TreeContentId(u128::MAX)),
+                    JobId(u128::MAX),
+                )),
+            usize::MAX,
+        )
+        .await
+        .expect("the store reads the content jobs");
+    for (key, _) in jobs {
+        let id = match storekey::decode(&key[..]) {
+            Ok(TreeKey::Dereference(_, Referenced::Content(id), _)) => id,
+            Ok(TreeKey::Dereference(_, Referenced::Node(_), _)) => continue,
+            _ => panic!("a stored job key is valid"),
+        };
+        *references.entry(id.0).or_insert(0) += 1;
+    }
+    let stored_counts = transaction
+        .get_range(
+            Bytes::from(TreeKey::RefCount(Referenced::Content(TreeContentId(0))))
+                ..=Bytes::from(TreeKey::RefCount(Referenced::Content(TreeContentId(
+                    u128::MAX,
+                )))),
+            usize::MAX,
+        )
+        .await
+        .expect("the store reads the content counts");
+    let mut counts = HashMap::new();
+    for (key, count) in stored_counts {
+        let Ok(TreeKey::RefCount(Referenced::Content(id))) = storekey::decode(&key[..]) else {
+            panic!("a stored content count key is valid");
+        };
+        let count = U64::read_from_bytes(&count).expect("a stored count is a U64");
+        counts.insert(id.0, count.get());
+    }
+    let deletions = transaction
+        .get_range(
+            Bytes::from(TreeKey::ContentDeletion(TreeVolumeId(0), TreeContentId(0)))
+                ..=Bytes::from(TreeKey::ContentDeletion(
+                    TreeVolumeId(u128::MAX),
+                    TreeContentId(u128::MAX),
+                )),
+            usize::MAX,
+        )
+        .await
+        .expect("the store reads the content deletions");
+    for (key, _) in deletions {
+        let Ok(TreeKey::ContentDeletion(_, id)) = storekey::decode(&key[..]) else {
+            panic!("a stored content deletion key is valid");
+        };
+        if references.contains_key(&id.0) || counts.contains_key(&id.0) {
+            return false;
+        }
+    }
+    counts.keys().all(|id| references.contains_key(id))
+        && references
+            .iter()
+            .all(|(id, references)| counts.get(id).copied().unwrap_or(1) == *references)
 }
 
 #[cfg(test)]

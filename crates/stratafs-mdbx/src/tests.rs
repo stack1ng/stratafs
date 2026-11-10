@@ -8,11 +8,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_lite::future::block_on;
 use mdbx_sys as ffi;
+use stratafs_store::content::{ContentId, ContentStore};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction};
 use stratafs_store::spawn::Inline;
 
-use crate::{MdbxConfiguration, MdbxGeometry, MdbxMetadata, MdbxOpenError};
+use crate::{MdbxConfiguration, MdbxContent, MdbxGeometry, MdbxMetadata, MdbxOpenError};
 
 // CONFIGURATION opens a test store in 4 KiB pages, committing without syncs, with libmdbx making no durable point of
 // its own, so only ensure_durable syncs.
@@ -185,4 +186,30 @@ fn a_file_with_pages_too_small_for_the_largest_entry_is_refused() {
         MdbxMetadata::open(directory.path().join("store.mdbx"), &CONFIGURATION, Inline),
         Err(MdbxOpenError::PagesTooSmall)
     ));
+}
+
+#[test]
+fn deleting_content_removes_its_length_and_every_chunk() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = open(directory.path().join("store.mdbx"));
+    let content = MdbxContent::of(&store);
+    let content_entries = || {
+        store
+            .0
+            .environment
+            .snapshot()
+            .unwrap()
+            .content_entries()
+            .unwrap()
+    };
+    // Content one byte longer than three chunks keeps a length and four chunks.
+    let long = Bytes::from(vec![7; 3 * 256 * 1024 + 1]);
+    block_on(content.put(&ContentId(1), long.clone())).unwrap();
+    block_on(content.put(&ContentId(2), Bytes::new())).unwrap();
+    block_on(content.ensure_durable(DurableAgainst::SoftwareFailure)).unwrap();
+    assert_eq!(content_entries(), 5 + 1);
+    block_on(content.delete(&ContentId(1))).unwrap();
+    assert_eq!(content_entries(), 1);
+    block_on(content.delete(&ContentId(2))).unwrap();
+    assert_eq!(content_entries(), 0);
 }

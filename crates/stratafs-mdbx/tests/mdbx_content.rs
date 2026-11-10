@@ -7,7 +7,7 @@ use bytes::{Buf, Bytes};
 use common::Stores;
 use futures_lite::future::block_on;
 use stratafs_mdbx::MdbxContent;
-use stratafs_store::content::{ContentHash, ContentStore, GetRejection, UnknownContent};
+use stratafs_store::content::{ContentId, ContentStore, GetRejection, UnknownContent};
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
@@ -22,15 +22,15 @@ fn long_content() -> Bytes {
         .collect()
 }
 
-fn read(content: &MdbxContent<Inline>, hash: &ContentHash, start: usize, end: usize) -> Bytes {
-    let mut read = block_on(content.get(hash, start as u64, (end - start) as u64)).unwrap();
+fn read(content: &MdbxContent<Inline>, id: &ContentId, start: usize, end: usize) -> Bytes {
+    let mut read = block_on(content.get(id, start as u64, (end - start) as u64)).unwrap();
     read.copy_to_bytes(read.remaining())
 }
 
 #[test]
-fn stores_content_under_its_hash() {
+fn stores_content_under_its_id() {
     let stores = Stores::new();
-    stratafs_content_conformance::stores_content_under_its_hash(|| MdbxContent::of(&stores.open()));
+    stratafs_content_conformance::stores_content_under_its_id(|| MdbxContent::of(&stores.open()));
 }
 
 #[test]
@@ -54,17 +54,39 @@ fn rejects_unknown_content() {
 }
 
 #[test]
+fn keeps_the_same_content_under_each_id_apart() {
+    let stores = Stores::new();
+    stratafs_content_conformance::keeps_the_same_content_under_each_id_apart(|| {
+        MdbxContent::of(&stores.open())
+    });
+}
+
+#[test]
+fn deletes_content() {
+    let stores = Stores::new();
+    stratafs_content_conformance::deletes_content(|| MdbxContent::of(&stores.open()));
+}
+
+#[test]
+fn deletes_content_that_is_already_gone() {
+    let stores = Stores::new();
+    stratafs_content_conformance::deletes_content_that_is_already_gone(|| {
+        MdbxContent::of(&stores.open())
+    });
+}
+
+#[test]
 fn content_written_to_the_file_reads_back_from_any_range_across_its_chunks() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("store.mdbx");
     let long = long_content();
-    let hash = {
+    let id = ContentId(7);
+    {
         let content = MdbxContent::of(&configuration::open(&path, Inline).unwrap());
-        let hash = block_on(content.put(long.clone())).unwrap();
+        block_on(content.put(&id, long.clone())).unwrap();
         // ensure_durable writes the content no commit has written yet.
         block_on(content.ensure_durable(DurableAgainst::SoftwareFailure)).unwrap();
-        hash
-    };
+    }
     let content = MdbxContent::of(&configuration::open(&path, Inline).unwrap());
     let chunk = 256 * 1024;
     for (start, end) in [
@@ -77,7 +99,7 @@ fn content_written_to_the_file_reads_back_from_any_range_across_its_chunks() {
         (LONG, LONG),
     ] {
         assert_eq!(
-            read(&content, &hash, start, end),
+            read(&content, &id, start, end),
             long.slice(start..end),
             "{start}..{end}"
         );
@@ -95,9 +117,10 @@ fn content_a_transaction_puts_commits_with_the_metadata_naming_it() {
         let (content, long) = (&content, &long);
         block_on(metadata.transact(|mut transaction| {
             Box::pin(async move {
-                let hash = content.put(long.clone()).await.unwrap();
+                let id = ContentId(7);
+                content.put(&id, long.clone()).await.unwrap();
                 transaction
-                    .set(Bytes::from_static(b"file"), &hash.0[..])
+                    .set(Bytes::from_static(b"file"), &id.0.to_be_bytes()[..])
                     .unwrap();
                 Ok::<_, Infallible>(((), transaction))
             })
@@ -118,23 +141,23 @@ fn content_a_transaction_puts_commits_with_the_metadata_naming_it() {
         })
     }))
     .unwrap();
-    let hash = ContentHash(named[..].try_into().unwrap());
-    assert_eq!(read(&content, &hash, 0, LONG), long);
+    let id = ContentId(u128::from_be_bytes(named[..].try_into().unwrap()));
+    assert_eq!(read(&content, &id, 0, LONG), long);
 }
 
 #[test]
 fn content_no_commit_writes_is_gone_after_the_store_closes() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("store.mdbx");
-    let hash = {
+    let id = ContentId(7);
+    {
         let content = MdbxContent::of(&configuration::open(&path, Inline).unwrap());
-        let hash = block_on(content.put(long_content())).unwrap();
-        assert_eq!(read(&content, &hash, 0, LONG), long_content());
-        hash
-    };
+        block_on(content.put(&id, long_content())).unwrap();
+        assert_eq!(read(&content, &id, 0, LONG), long_content());
+    }
     let content = MdbxContent::of(&configuration::open(&path, Inline).unwrap());
     assert!(matches!(
-        block_on(content.get(&hash, 0, 0)),
+        block_on(content.get(&id, 0, 0)),
         Err(StoreError::Rejected(GetRejection::UnknownContent(
             UnknownContent
         )))
@@ -142,24 +165,29 @@ fn content_no_commit_writes_is_gone_after_the_store_closes() {
 }
 
 #[test]
-fn content_put_again_once_written_reads_back_whole_and_refuses_reads_past_its_end() {
+fn content_deleted_once_written_is_gone_from_the_file_and_the_rest_reads_back_whole() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("store.mdbx");
     let long = long_content();
-    let hash = {
+    let (deleted, kept) = (ContentId(1), ContentId(2));
+    {
         let content = MdbxContent::of(&configuration::open(&path, Inline).unwrap());
-        let mut hash = None;
-        // The second put finds the content in the file already.
-        for _ in 0..2 {
-            hash = Some(block_on(content.put(long.clone())).unwrap());
-            block_on(content.ensure_durable(DurableAgainst::SoftwareFailure)).unwrap();
-        }
-        hash.unwrap()
-    };
+        block_on(content.put(&deleted, long.clone())).unwrap();
+        block_on(content.put(&kept, long.clone())).unwrap();
+        block_on(content.ensure_durable(DurableAgainst::SoftwareFailure)).unwrap();
+        block_on(content.delete(&deleted)).unwrap();
+        block_on(content.ensure_durable(DurableAgainst::SoftwareFailure)).unwrap();
+    }
     let content = MdbxContent::of(&configuration::open(&path, Inline).unwrap());
-    assert_eq!(read(&content, &hash, 0, LONG), long);
     assert!(matches!(
-        block_on(content.get(&hash, LONG as u64, 1)),
+        block_on(content.get(&deleted, 0, 0)),
+        Err(StoreError::Rejected(GetRejection::UnknownContent(
+            UnknownContent
+        )))
+    ));
+    assert_eq!(read(&content, &kept, 0, LONG), long);
+    assert!(matches!(
+        block_on(content.get(&kept, LONG as u64, 1)),
         Err(StoreError::Rejected(GetRejection::OutOfBounds { len })) if len == LONG as u64
     ));
 }

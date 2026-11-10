@@ -2,7 +2,6 @@ use std::convert::Infallible;
 
 use futures_lite::future::block_on;
 use stratafs_object_store::ObjectStoreError;
-use stratafs_store::content::ContentHash;
 
 use super::*;
 use crate::PurgeWaits;
@@ -166,14 +165,15 @@ fn a_large_annotation_spills_to_the_content_store_and_reads_back() {
         get_annotation(&engine, Inode::ROOT, macos(b"large")).unwrap(),
         Some(Bytes::from(value.clone()))
     );
-    assert!(
-        block_on(
-            engine
-                .content()
-                .get(&ContentHash::of(&value), 0, value.len() as u64)
-        )
-        .is_ok()
-    );
+    let ids = engine.content().ids();
+    assert_eq!(ids.len(), 1);
+    let mut stored = block_on(
+        engine
+            .content()
+            .get(ids.first().unwrap(), 0, value.len() as u64),
+    )
+    .unwrap();
+    assert_eq!(stored.copy_to_bytes(stored.remaining()), value);
 }
 
 #[test]

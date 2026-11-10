@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, ThreadId};
@@ -32,6 +33,7 @@ use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::ThreadPoolRuntime;
+use stratafs_store::content::ContentId;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::TransactError;
 use stratafs_store::spawn::SpawnBlocking;
@@ -73,6 +75,10 @@ async fn new_engine(
         .create_with_backend(InMemoryBackend::new())
         .map_err(io::Error::other)?;
     let allocate_inode: fn() -> u64 = || 7;
+    // Content ids count across every test engine, so none is given twice.
+    static NEXT_CONTENT_ID: AtomicU64 = AtomicU64::new(1);
+    let allocate_content_id: fn() -> ContentId =
+        || ContentId(NEXT_CONTENT_ID.fetch_add(1, Ordering::Relaxed).into());
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
     FsEngine::new(
         LockSynchronizedStore::new(
@@ -80,6 +86,7 @@ async fn new_engine(
             ObjectStoreContentStore::new(InMemory::new()),
         ),
         allocate_inode,
+        allocate_content_id,
         now,
         MountId(1),
         Some(DurableAgainst::PowerFailure),

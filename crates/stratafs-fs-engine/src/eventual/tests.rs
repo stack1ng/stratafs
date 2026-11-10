@@ -62,6 +62,7 @@ fn auto_invalidating_engine() -> (InMemoryEngine, mpsc::Receiver<Inode>) {
 fn another_client(engine: &InMemoryEngine) -> InMemoryEngine {
     FsEngine {
         allocate_inode: engine.allocate_inode,
+        allocate_content_id: engine.allocate_content_id,
         now: engine.now,
         mount: Mount {
             store: Arc::clone(&engine.mount.store),

@@ -1,26 +1,32 @@
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use bytes::{Buf, Bytes};
 use futures_executor::ThreadPool;
 use futures_lite::future::block_on;
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
 use stratafs_lock_synchronized::LockSynchronizedStore;
-use stratafs_object_store::ObjectStoreContentStore;
+use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
 use stratafs_redb::{RedbFailure, RedbStore};
 use stratafs_runtime::{TaskDroppingRuntime, ThreadPoolRuntime};
+use stratafs_store::content::{ContentId, ContentReference, ContentStore, GetRejection};
 use stratafs_store::durability::DurableAgainst;
+use stratafs_store::error::StoreError;
 use stratafs_store::forkable::ForkableKeyValueStore;
 use stratafs_store::kv::TransactError;
 use stratafs_store::spawn::Inline;
 use stratafs_tree::error::TreeFailure;
+use stratafs_tree::header::TreeVolumeId;
 use stratafs_tree::tree::{Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
 use crate::kernel_cache::{KernelCache, NoKernel};
+use crate::spillable::referenced_content;
 use crate::{Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
 
 // TEST_MOUNT is the mount test engines are.
@@ -39,12 +45,79 @@ impl TreeConfig for TestTreeConfig {
     type Range = u16;
     const NODE_CAPACITY: usize = 4096;
     const MERGE_BELOW_PERCENT: u8 = 25;
+
+    fn referenced_content(key: &[u8], value: &[u8]) -> Option<ContentReference> {
+        referenced_content(key, value)
+    }
 }
 
 pub(crate) type InMemoryStore = LockSynchronizedStore<
     TreeVolume<RedbStore<Inline>, fn() -> u128, TestTreeConfig>,
-    ObjectStoreContentStore,
+    ListedContent,
 >;
+
+// ListedContent keeps content in memory, and lists the id of every blob it keeps.
+#[derive(Clone)]
+pub(crate) struct ListedContent {
+    store: ObjectStoreContentStore,
+    ids: Arc<Mutex<BTreeSet<ContentId>>>,
+}
+
+impl ListedContent {
+    fn new() -> Self {
+        Self {
+            store: ObjectStoreContentStore::new(InMemory::new()),
+            ids: Arc::default(),
+        }
+    }
+
+    // ids is the id of every blob the store keeps.
+    pub(crate) fn ids(&self) -> BTreeSet<ContentId> {
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl ContentStore for ListedContent {
+    type Failure = ObjectStoreError;
+    type Content = Bytes;
+
+    async fn put(&self, id: &ContentId, content: impl Buf + Send) -> Result<(), Self::Failure> {
+        self.store.put(id, content).await?;
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(*id);
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        id: &ContentId,
+        offset: u64,
+        size: u64,
+    ) -> impl Future<Output = Result<Bytes, StoreError<GetRejection, Self::Failure>>> + Send {
+        self.store.get(id, offset, size)
+    }
+
+    async fn delete(&self, id: &ContentId) -> Result<(), Self::Failure> {
+        self.store.delete(id).await?;
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        Ok(())
+    }
+
+    fn ensure_durable(
+        &self,
+        against: DurableAgainst,
+    ) -> impl Future<Output = Result<(), Self::Failure>> + Send {
+        self.store.ensure_durable(against)
+    }
+}
 
 pub(crate) type MetadataFailure = TreeFailure<RedbFailure, Infallible>;
 
@@ -57,6 +130,7 @@ thread_local! {
     static CLOCK: Cell<i64> = const { Cell::new(0) };
     static NEXT_INODE: Cell<u64> = const { Cell::new(1) };
     static NEXT_NODE: Cell<u128> = const { Cell::new(1) };
+    static NEXT_CONTENT_ID: Cell<u128> = const { Cell::new(1) };
 }
 
 pub(crate) fn set_clock(at: i64) {
@@ -75,6 +149,10 @@ fn next_node() -> u128 {
     NEXT_NODE.replace(NEXT_NODE.get() + 1)
 }
 
+fn next_content_id() -> ContentId {
+    ContentId(NEXT_CONTENT_ID.replace(NEXT_CONTENT_ID.get() + 1))
+}
+
 pub(crate) fn new_test_engine() -> InMemoryEngine {
     new_test_engine_for(NoKernel)
 }
@@ -89,37 +167,95 @@ pub(crate) fn new_test_engine_with<C: Cached<InMemoryStore>>(
     consistency: C,
     kernel: impl KernelCache,
 ) -> TestEngine<C> {
-    let database = redb::Database::builder()
-        .create_with_backend(InMemoryBackend::new())
-        .unwrap();
-    NEXT_INODE.set(1);
-    NEXT_NODE.set(1);
-    let allocate_inode: fn() -> u64 = next_inode;
-    let allocate_node: fn() -> u128 = next_node;
-    let now: fn() -> Timestamp = clock;
-    block_on(async {
+    let volumes = TestVolumes::new();
+    let volume = volumes.create();
+    volumes.engine_with(volume, consistency, kernel)
+}
+
+pub(crate) type TestTree = Tree<RedbStore<Inline>, fn() -> u128, TestTreeConfig>;
+
+// TestVolumes is a tree of volumes in memory and the content their engines share. Only a test runs its garbage
+// collection.
+pub(crate) struct TestVolumes {
+    tree: TestTree,
+    pub(crate) content: ListedContent,
+}
+
+impl TestVolumes {
+    pub(crate) fn new() -> Self {
+        let database = redb::Database::builder()
+            .create_with_backend(InMemoryBackend::new())
+            .unwrap();
+        NEXT_INODE.set(1);
+        NEXT_NODE.set(1);
+        NEXT_CONTENT_ID.set(1);
+        let allocate_node: fn() -> u128 = next_node;
+        let content = ListedContent::new();
         // node ids count per thread, so the tree runs no garbage collector on another thread
-        let tree = Tree::new(
+        let tree = block_on(Tree::new(
             RedbStore::new(database, Inline).unwrap(),
             allocate_node,
+            content.clone(),
             Arc::new(TaskDroppingRuntime),
-        )
-        .await
+        ))
         .unwrap();
-        let volume = tree.open(tree.create().await.unwrap()).await.unwrap();
-        FsEngine::new(
-            LockSynchronizedStore::new(volume, ObjectStoreContentStore::new(InMemory::new())),
-            allocate_inode,
-            now,
-            TEST_MOUNT,
-            Some(DurableAgainst::PowerFailure),
-            consistency,
-            kernel,
-            Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
-        )
-        .await
-        .unwrap()
-    })
+        Self { tree, content }
+    }
+
+    pub(crate) fn create(&self) -> TreeVolumeId {
+        block_on(self.tree.create()).unwrap()
+    }
+
+    pub(crate) fn collect_garbage(&self, volume: TreeVolumeId) -> Result<(), MetadataFailure> {
+        block_on(async {
+            self.tree
+                .open(volume)
+                .await
+                .unwrap()
+                .collect_garbage()
+                .await
+        })
+    }
+
+    // collect_garbage_and_delete runs two passes, the second deleting the blobs the first left unreferenced.
+    pub(crate) fn collect_garbage_and_delete(
+        &self,
+        volume: TreeVolumeId,
+    ) -> Result<(), MetadataFailure> {
+        self.collect_garbage(volume)?;
+        self.collect_garbage(volume)
+    }
+
+    pub(crate) fn engine(&self, volume: TreeVolumeId) -> InMemoryEngine {
+        self.engine_with(volume, Eventual::default(), NoKernel)
+    }
+
+    // engine_with is an engine of volume with consistency, whose inodes kernel caches.
+    pub(crate) fn engine_with<C: Cached<InMemoryStore>>(
+        &self,
+        volume: TreeVolumeId,
+        consistency: C,
+        kernel: impl KernelCache,
+    ) -> TestEngine<C> {
+        let allocate_inode: fn() -> u64 = next_inode;
+        let now: fn() -> Timestamp = clock;
+        block_on(async {
+            let volume = self.tree.open(volume).await.unwrap();
+            FsEngine::new(
+                LockSynchronizedStore::new(volume, self.content.clone()),
+                allocate_inode,
+                next_content_id,
+                now,
+                TEST_MOUNT,
+                Some(DurableAgainst::PowerFailure),
+                consistency,
+                kernel,
+                Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
+            )
+            .await
+            .unwrap()
+        })
+    }
 }
 
 pub(crate) fn aborted<R: Debug, F: Debug, E>(error: TransactError<R, F, E>) -> E {

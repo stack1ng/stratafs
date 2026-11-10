@@ -4,6 +4,7 @@ use bytes::BytesMut;
 use smallvec::{SmallVec, smallvec};
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, SetRejection};
+use zerocopy::FromBytes;
 use zerocopy::little_endian::U128;
 
 use super::span_mutation_plan::SpanMutationPlan;
@@ -12,10 +13,10 @@ use super::{LayerNode, LayerSpan};
 use crate::descent::DescentSteps;
 use crate::error::TreeFailure;
 use crate::header::{NodeId, VolumeHeader};
-use crate::key::TreeKey;
-use crate::node::{InternalEntry, LEFTMOST_SEPARATOR, Node, NodeHeader, NodeKind};
+use crate::key::{Referenced, TreeKey};
+use crate::node::{InternalEntry, LEFTMOST_SEPARATOR, LeafEntry, Node, NodeHeader, NodeKind};
 use crate::serialized::CorruptValue;
-use crate::slotted::SlottedList;
+use crate::slotted::{AddressableRange, SlottedList};
 use crate::tree::TreeConfig;
 use crate::volume::{TreeTransaction, with_tree_failure};
 use crate::write_over_layer::LayerNodeMutation::{Create, Delete, Promote, Update};
@@ -209,7 +210,10 @@ where
                 root,
                 epoch: volume.epoch,
             })?;
-            self.node_ref_deltas.extend([(root, 1), (volume.root, -1)]);
+            self.ref_deltas.extend([
+                (Referenced::Node(root), 1),
+                (Referenced::Node(volume.root), -1),
+            ]);
         }
         Ok(None)
     }
@@ -226,6 +230,31 @@ where
         SlottedList<BytesMut, [u8], u32>,
         StoreError<SetRejection<S::Rejection>, TreeFailure<T::Failure, S::Rejection>>,
     > {
+        // A leaf span's old entries are compared with its new ones to count its blobs' references. A copied leaf's
+        // original keeps its references.
+        if kind == NodeKind::Leaf {
+            let old_entries = plan
+                .mutations
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    Update { node, .. } | Delete { node } => Some(node),
+                    Create { .. } | Promote { .. } => None,
+                })
+                .flat_map(|node| {
+                    let owned = node.node.epoch == volume.epoch;
+                    leaf_entries(&node.stored_entries).map(move |entry| Ok((owned, entry?)))
+                });
+            let new_entries = plan
+                .mutations
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    Create { entries, .. } | Update { entries, .. } => Some(entries),
+                    Delete { .. } | Promote { .. } => None,
+                })
+                .flat_map(leaf_entries);
+            self.push_content_ref_deltas(old_entries, new_entries)
+                .map_err(corrupt)?;
+        }
         let mut parent_entries = SlottedList::<BytesMut, InternalEntry, u32>::empty();
         for mutation in plan.mutations {
             match mutation {
@@ -243,7 +272,7 @@ where
                             ),
                         )
                         .map_err(with_tree_failure)?;
-                    self.node_ref_deltas.push((new_node_id, -1));
+                    self.ref_deltas.push((Referenced::Node(new_node_id), -1));
                     if kind == NodeKind::Internal {
                         self.push_child_ref_deltas(&entries, 1).map_err(corrupt)?;
                     }
@@ -272,7 +301,7 @@ where
                         )
                         .map_err(with_tree_failure)?;
                     if target != node.node.id {
-                        self.node_ref_deltas.push((target, -1));
+                        self.ref_deltas.push((Referenced::Node(target), -1));
                     } else if kind == NodeKind::Internal {
                         self.push_child_ref_deltas(&node.stored_entries, -1)
                             .map_err(corrupt)?;
@@ -288,7 +317,7 @@ where
                             .clear(TreeKey::Node(node.node.id).into())
                             .map_err(TreeFailure::Store)
                             .map_err(StoreError::Failed)?;
-                        self.node_ref_deltas.push((node.node.id, 1));
+                        self.ref_deltas.push((Referenced::Node(node.node.id), 1));
                         if kind == NodeKind::Internal {
                             self.push_child_ref_deltas(&node.stored_entries, -1)
                                 .map_err(corrupt)?;
@@ -306,4 +335,16 @@ where
 
 fn corrupt<F, R>(error: CorruptValue) -> StoreError<SetRejection<R>, TreeFailure<F, R>> {
     StoreError::Failed(TreeFailure::Corrupt(error))
+}
+
+// leaf_entries reads each of a leaf's untyped entries as its key and value.
+fn leaf_entries<B: AsRef<[u8]>, R: AddressableRange>(
+    entries: &SlottedList<B, [u8], R>,
+) -> impl Iterator<Item = Result<(&[u8], &[u8]), CorruptValue>> {
+    (0..entries.len()).map(|index| {
+        let entry = entries.get(index).expect("the index is in the leaf")?;
+        LeafEntry::<R>::ref_from_bytes(entry)
+            .map_err(|_| CorruptValue::WrongLength)?
+            .key_and_value()
+    })
 }

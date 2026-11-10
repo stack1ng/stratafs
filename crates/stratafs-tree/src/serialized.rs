@@ -30,7 +30,7 @@ pub enum CorruptValue {
     EmptyInternalNode,
     #[error("a stored key is not a valid tree key")]
     InvalidKey,
-    #[error("a node has more pending dereference jobs than its reference count")]
+    #[error("a node or blob has more pending dereference jobs than its reference count")]
     RefCountBelowZero,
 }
 
