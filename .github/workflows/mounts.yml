@@ -43,16 +43,11 @@ jobs:
           ! mountpoint -q "$mount_point"
           SCRIPT
 
-  macos-probe:
+  # xcode-27 is the hosted image that runs macOS 27, whose FSKit the module is built for.
+  macos:
     runs-on: xcode-27
     steps:
       - uses: actions/checkout@v4
-      - name: System
-        run: |
-          sw_vers
-          csrutil status || true
-          system_profiler SPHardwareDataType | grep -E "Model Identifier|UDID" || true
-          xcodebuild -version || true
       - name: Install the toolchain rust-toolchain.toml names
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -60,5 +55,7 @@ jobs:
         env:
           STRATAFS_BENCH_STORE: sqlite
         run: cargo build --release --locked --package stratafs-bench --bins
-      - name: Enable the module and mount a volume through FSKit
-        run: .github/scripts/macos-mount-probe.sh
+      - name: Mount a volume through FSKit
+        run: |
+          sw_vers
+          .github/scripts/mount-fskit.sh
