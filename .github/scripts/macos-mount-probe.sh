@@ -72,13 +72,6 @@ diagnose() {
   log show --last 4m --style compact --predicate 'process == "fskitd" OR process == "fskit_agent" OR process == "amfid" OR process CONTAINS "stratafs" OR eventMessage CONTAINS[c] "stratafs" OR subsystem CONTAINS[c] "fskit"' 2>/dev/null | tail -80
 }
 
-echo "=== A: ad hoc with the module entitlement"
-assemble "$sources/extension.entitlements"
-enable
-if try_mount "$RUNNER_TEMP/store-a" "$RUNNER_TEMP/mount-a"; then echo "RESULT A mounted"; else echo "RESULT A failed"; diagnose; fi
-
-echo "=== B: ad hoc without the module entitlement"
-grep -v -A1 "fskit.fsmodule" "$sources/extension.entitlements" > /dev/null
 /usr/bin/python3 - "$sources/extension.entitlements" "$RUNNER_TEMP/extension-without-module.entitlements" <<'PYTHON'
 import plistlib, sys
 with open(sys.argv[1], 'rb') as file:
@@ -87,11 +80,36 @@ entitlements.pop('com.apple.developer.fskit.fsmodule', None)
 with open(sys.argv[2], 'wb') as file:
     plistlib.dump(entitlements, file)
 PYTHON
-pkill -9 -f stratafs-bench-extension 2>/dev/null
 assemble "$RUNNER_TEMP/extension-without-module.entitlements"
 enable
-if try_mount "$RUNNER_TEMP/store-b" "$RUNNER_TEMP/mount-b"; then echo "RESULT B mounted"; else echo "RESULT B failed"; diagnose; fi
 
-echo "=== C: the store and mount point in the home directory"
-if try_mount "$HOME/store-c" "$HOME/mount-c"; then echo "RESULT C mounted"; else echo "RESULT C failed"; diagnose; fi
+echo "=== two mounts of one volume"
+store=$RUNNER_TEMP/store-two
+first=$RUNNER_TEMP/mount-first
+second=$RUNNER_TEMP/mount-second
+mkdir -p "$first" "$second"
+volume=$("$built/stratafs-bench" create "$store")
+echo "volume $volume"
+/sbin/mount -F -t stratafs -o "volume=$volume" "$store" "$first"; echo "first mount exit $?"
+/sbin/mount -F -t stratafs -o "volume=$volume" "$store" "$second"; echo "second mount exit $?"
+/sbin/mount | grep -i strata
+pgrep -fl stratafs-bench-extension
+if [ "$(/sbin/mount | grep -c '(stratafs')" = 2 ]; then
+  echo one > "$first/file"
+  sleep 2
+  echo "second reads: $(cat "$second/file" 2>&1)"
+  ls "$second" > /dev/null
+  echo two-longer > "$first/file"
+  echo new > "$first/another"
+  for wait in 1 3 10; do
+    sleep "$wait"
+    echo "after ${wait}s more the second reads: $(cat "$second/file" 2>&1), lists: $(ls "$second" | tr '\n' ' ')"
+  done
+  [ "$(cat "$second/file")" = two-longer ] && echo "RESULT the second mount saw the first mount's overwrite" || echo "RESULT the second mount kept stale content"
+  [ -e "$second/another" ] && echo "RESULT the second mount saw the new name" || echo "RESULT the second mount missed the new name"
+else
+  echo "RESULT two mounts of one volume did not both come up"
+fi
+/sbin/umount "$first"; /sbin/umount "$second"
+log show --last 3m --style compact --predicate 'process CONTAINS "stratafs" OR (process == "fskitd" AND eventMessage CONTAINS[c] "cache") OR eventMessage CONTAINS[c] "setCacheState" OR eventMessage CONTAINS[c] "not permitted"' 2>/dev/null | tail -40
 exit 0
