@@ -151,6 +151,7 @@ fn install() {
                     ThreadPoolRuntime(ThreadPool::new().unwrap()),
                     async |mounted: &Path,
                            volume: Bytes,
+                           _: ConsistencyKind,
                            kernel: FsKitCache,
                            runtime: Arc<dyn Runtime>| {
                         if mounted != store() {
@@ -161,6 +162,7 @@ fn install() {
                             [0xbb] => Err(TestOpenError::Busy),
                             _ => new_engine(kernel, runtime)
                                 .await
+                                .map(OpenedEngine::from)
                                 .map_err(TestOpenError::Engine),
                         }
                     }
@@ -278,7 +280,7 @@ fn activate(volume: &FSVolume, arguments: &[&str]) -> Replied {
 
 // mounted is the volume volume loaded from the test store and activated.
 fn mounted(volume: &str) -> Retained<FSVolume> {
-    let volume_option = format!("volume={volume}");
+    let volume_option = format!("volume={volume},consistency=eventual");
     let loaded = load(&new_file_system(), &store_resource()).expect("the store loads");
     assert_eq!(activate(&loaded, &["-o", &volume_option]), Ok(()));
     loaded
@@ -379,13 +381,31 @@ fn activate_opens_the_volume_its_options_name_or_replies_why_not() {
         (&[][..], libc::EINVAL, "no volume was given"),
         (&["-o", "volume=zz"], libc::EINVAL, "not hex"),
         (
-            &["-o", "volume=ab01,rdonly"],
+            &["-o", "volume=ab01,consistency=eventual,rdonly"],
             libc::EINVAL,
             "rdonly is not a mount option",
         ),
         (&["-x"], libc::EINVAL, "could not be read"),
-        (&["-o", "volume=ff"], libc::EIO, "the store is down"),
-        (&["-o", "volume=bb"], libc::EBUSY, "open in another mount"),
+        (
+            &["-o", "volume=ab01"],
+            libc::EINVAL,
+            "no consistency was given",
+        ),
+        (
+            &["-o", "volume=ab01,consistency=weak"],
+            libc::EINVAL,
+            "weak is not a consistency",
+        ),
+        (
+            &["-o", "volume=ff,consistency=eventual"],
+            libc::EIO,
+            "the store is down",
+        ),
+        (
+            &["-o", "volume=bb,consistency=eventual"],
+            libc::EBUSY,
+            "open in another mount",
+        ),
     ] {
         let loaded = load(&new_file_system(), &store_resource()).expect("the store loads");
         assert!(

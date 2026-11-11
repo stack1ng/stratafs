@@ -1,0 +1,25 @@
+[package]
+name = "stratafs-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+clap.workspace = true
+nix.workspace = true
+rand.workspace = true
+stratafs-websocket-pubsub-native = { path = "../stratafs-websocket-pubsub-native" }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["poll"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+bytes.workspace = true
+hex.workspace = true
+stratafs-fskit.workspace = true
+
+[lints]
+workspace = true

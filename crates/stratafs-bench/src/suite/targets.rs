@@ -54,8 +54,15 @@ pub fn set_up(config: &TargetConfig) -> Result<Target, SuiteError> {
             })
         }
         TargetConfig::Stratafs {
-            store, mount_point, ..
-        } => mounted(name, mount_point, stratafs(store, mount_point)?),
+            store,
+            mount_point,
+            consistency,
+            ..
+        } => mounted(
+            name,
+            mount_point,
+            stratafs(store, mount_point, consistency)?,
+        ),
         TargetConfig::Juicefs {
             binary,
             store,
@@ -76,16 +83,20 @@ fn mounted(name: String, mount_point: &Path, mounting: Mounting) -> Result<Targe
     })
 }
 
-// stratafs makes a fresh volume in the store directory, mounted with the installed FSKit module.
+// stratafs makes a fresh volume in the store directory, mounted with the installed FSKit module and consistency.
 #[cfg(target_os = "macos")]
-fn stratafs(store: &Path, mount_point: &Path) -> Result<Mounting, SuiteError> {
+fn stratafs(store: &Path, mount_point: &Path, consistency: &str) -> Result<Mounting, SuiteError> {
     use futures_lite::future::block_on;
     use stratafs_fskit::mount_options::MountOptions;
 
+    let consistency = consistency
+        .parse()
+        .map_err(|error| SuiteError::Config(format!("a stratafs target's consistency: {error}")))?;
     let volume = block_on(crate::create_volume(store))
         .map_err(|error| SuiteError::Config(format!("creating a stratafs volume: {error}")))?;
     let options = MountOptions {
         volume,
+        consistency,
         durability_cadence: None,
     };
     Ok(Mounting {
@@ -99,7 +110,11 @@ fn stratafs(store: &Path, mount_point: &Path) -> Result<Mounting, SuiteError> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn stratafs(_store: &Path, _mount_point: &Path) -> Result<Mounting, SuiteError> {
+fn stratafs(
+    _store: &Path,
+    _mount_point: &Path,
+    _consistency: &str,
+) -> Result<Mounting, SuiteError> {
     Err(SuiteError::Config(
         "stratafs targets only mount on macOS so far".to_owned(),
     ))

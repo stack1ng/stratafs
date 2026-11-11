@@ -21,6 +21,7 @@ kind = "stratafs"
 name = "stratafs"
 store = "/Volumes/StrataBench/stratafs-store"
 mount_point = "/Volumes/StrataBench/stratafs-mount"
+consistency = "eventual"
 
 # JuiceFS through macFUSE's FSKit backend, which needs no kernel extension: install macFUSE 5.4 and enable its
 # File System Extensions. `cargo xtask juicefs` builds the juicefs this uses; the 1.4.2 release crashes on M5 Macs.

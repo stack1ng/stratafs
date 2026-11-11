@@ -1,6 +1,6 @@
 #!/bin/bash
 # Assembles the benchmark FSKit module, signs it with the Developer ID identity and provisioning profile the
-# environment carries, enables it in FSKit's list of enabled modules, and mounts a volume with it.
+# environment carries, and enables it in FSKit's list of enabled modules.
 set -euo pipefail
 
 workspace=$(pwd)
@@ -52,14 +52,3 @@ killall fskit_agent || true
 sudo killall fskitd || true
 sleep 3
 pluginkit -m -p com.apple.fskit.fsmodule | grep -q "^+.*$module"
-
-store=$RUNNER_TEMP/store
-mount_point=$RUNNER_TEMP/mounted
-mkdir -p "$mount_point"
-volume=$("$built/stratafs-bench" create "$store")
-/sbin/mount -F -t stratafs -o "volume=$volume" "$store" "$mount_point"
-/sbin/mount | grep "(stratafs"
-echo mounted > "$mount_point/file"
-cat "$mount_point/file"
-/sbin/umount "$mount_point"
-! /sbin/mount | grep -q "(stratafs"

@@ -12,15 +12,17 @@ fn tree_volume(id: &[u8]) -> TreeVolumeId {
 fn a_volume_is_written_as_lowercase_hex_after_its_name() {
     let options = MountOptions {
         volume: Bytes::from_static(&[0xab, 0x01]),
+        consistency: ConsistencyKind::Eventual,
         durability_cadence: None,
     };
-    assert_eq!(options.to_string(), "volume=ab01");
+    assert_eq!(options.to_string(), "volume=ab01,consistency=eventual");
 }
 
 #[test]
 fn written_options_parse_back_to_their_volume() {
     let options = MountOptions {
         volume: tree_volume(&[0xcd; 16]),
+        consistency: ConsistencyKind::Strong,
         durability_cadence: Some(Duration::from_secs(5)),
     };
     assert_eq!(
@@ -34,13 +36,15 @@ fn written_options_parse_back_to_their_volume() {
 
 #[test]
 fn parsing_accepts_uppercase_hex() {
-    let options: MountOptions<Bytes> = "volume=AB01".parse().unwrap();
+    let options: MountOptions<Bytes> = "volume=AB01,consistency=eventual".parse().unwrap();
     assert_eq!(options.volume, Bytes::from_static(&[0xab, 0x01]));
 }
 
 #[test]
 fn a_later_volume_overrides_an_earlier_one() {
-    let options: MountOptions<Bytes> = "volume=ab01,volume=cd02".parse().unwrap();
+    let options: MountOptions<Bytes> = "volume=ab01,volume=cd02,consistency=eventual"
+        .parse()
+        .unwrap();
     assert_eq!(options.volume, Bytes::from_static(&[0xcd, 0x02]));
 }
 
@@ -87,17 +91,50 @@ fn parsing_rejects_bytes_that_are_not_a_volume() {
 }
 
 #[test]
-fn a_durability_cadence_is_written_in_seconds_after_the_volume() {
+fn parsing_needs_a_consistency() {
+    assert!(matches!(
+        "volume=ab01".parse::<MountOptions<Bytes>>(),
+        Err(MountOptionsError::NoConsistency)
+    ));
+}
+
+#[test]
+fn parsing_rejects_a_consistency_that_is_not_strong_or_eventual() {
+    for consistency in ["", "Strong", "weak"] {
+        assert!(
+            matches!(
+                format!("volume=ab01,consistency={consistency}").parse::<MountOptions<Bytes>>(),
+                Err(MountOptionsError::NotAConsistency(_))
+            ),
+            "{consistency} parsed"
+        );
+    }
+}
+
+#[test]
+fn a_later_consistency_overrides_an_earlier_one() {
+    let options: MountOptions<Bytes> = "volume=ab01,consistency=strong,consistency=eventual"
+        .parse()
+        .unwrap();
+    assert_eq!(options.consistency, ConsistencyKind::Eventual);
+}
+
+#[test]
+fn a_durability_cadence_is_written_in_seconds_after_the_consistency() {
     let options = MountOptions {
         volume: Bytes::from_static(&[0xab, 0x01]),
+        consistency: ConsistencyKind::Strong,
         durability_cadence: Some(Duration::from_secs(30)),
     };
-    assert_eq!(options.to_string(), "volume=ab01,durability_cadence=30");
+    assert_eq!(
+        options.to_string(),
+        "volume=ab01,consistency=strong,durability_cadence=30"
+    );
 }
 
 #[test]
 fn parsing_leaves_the_durability_cadence_out_unless_given() {
-    let options: MountOptions<Bytes> = "volume=ab01".parse().unwrap();
+    let options: MountOptions<Bytes> = "volume=ab01,consistency=eventual".parse().unwrap();
     assert_eq!(options.durability_cadence, None);
 }
 

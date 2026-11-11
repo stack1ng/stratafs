@@ -11,15 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_executor::ThreadPool as SpawnerPool;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-#[cfg(consistency = "eventual")]
-use stratafs_fs_engine::Eventual;
-#[cfg(consistency = "strong")]
-use stratafs_fs_engine::StrongUntilDisconnectCached;
 use stratafs_fs_engine::error::{EngineFailure, PosixError};
 use stratafs_fs_engine::holds::{ConnectFailure, Failure};
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
 use stratafs_fs_engine::spillable::{ContentHash, referenced_content};
-use stratafs_fs_engine::{FsConfig, FsEngine, MountId, Timestamp};
+use stratafs_fs_engine::{Cached, Eventual, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_store::content::{ContentId, ContentReference};
 use stratafs_store::durability::DurableAgainst;
@@ -143,21 +139,10 @@ pub type BenchVolume = TreeVolume<Database, fn() -> u128, BenchTreeConfig>;
 type VolumeRejection = <BenchVolume as KeyValueStore>::Rejection;
 type VolumeFailure = <BenchVolume as KeyValueStore>::Failure;
 
-// The consistency comes from the build's environment too, as STRATAFS_BENCH_CONSISTENCY: eventual or strong. Every
-// mount reaches the coordinator whose URL is in the store directory's coordinator file.
-#[cfg(consistency = "eventual")]
-pub type BenchConsistency = Eventual;
-#[cfg(consistency = "strong")]
-pub type BenchConsistency = StrongUntilDisconnectCached;
-
-pub type BenchEngine = FsEngine<
-    BenchVolume,
-    Client<u64>,
-    fn() -> u64,
-    fn() -> Timestamp,
-    BenchFsConfig,
-    BenchConsistency,
->;
+// BenchEngine is a mount's engine with consistency C. Every mount reaches the coordinator whose URL is in the store
+// directory's coordinator file.
+pub type BenchEngine<C> =
+    FsEngine<BenchVolume, Client<u64>, fn() -> u64, fn() -> Timestamp, BenchFsConfig, C>;
 
 // Store is the store directory opened: the tree holding every volume.
 pub struct Store {
@@ -283,16 +268,17 @@ fn open_database(directory: &Path) -> Result<Database, OpenStoreError> {
     Ok(Database::new(metadata, content))
 }
 
-// open_volume opens volume from the store in directory, as an engine that invalidates kernel's cache, running its
-// work on runtime.
-pub async fn open_volume(
+// open_volume opens volume from the store in directory, as an engine with consistency that invalidates kernel's cache,
+// running its work on runtime.
+pub async fn open_volume<C: Cached<BenchVolume, Client<u64>>>(
     directory: &Path,
     volume: TreeVolumeId,
+    consistency: C,
     kernel: impl KernelCache,
     runtime: Arc<dyn Runtime>,
-) -> Result<BenchEngine, OpenVolumeError> {
+) -> Result<BenchEngine<C>, OpenVolumeError> {
     let store = open_store(directory, Arc::clone(&runtime)).await?;
-    engine(directory, store, volume, kernel, runtime).await
+    engine(directory, store, volume, consistency, kernel, runtime).await
 }
 
 // create_volume makes a new, empty volume in the store in directory, and returns its id.
@@ -310,17 +296,26 @@ pub async fn create_volume(directory: &Path) -> Result<TreeVolumeId, CreateVolum
         .await
         .map_err(CreateVolumeError::Create)?;
     // Opening the engine makes the volume's root directory, so a mount finds it ready.
-    engine(directory, store, volume, NoKernel, runtime).await?;
+    engine(
+        directory,
+        store,
+        volume,
+        Eventual::default(),
+        NoKernel,
+        runtime,
+    )
+    .await?;
     Ok(volume)
 }
 
-async fn engine(
+async fn engine<C: Cached<BenchVolume, Client<u64>>>(
     directory: &Path,
     store: Store,
     volume: TreeVolumeId,
+    consistency: C,
     kernel: impl KernelCache,
     runtime: Arc<dyn Runtime>,
-) -> Result<BenchEngine, OpenVolumeError> {
+) -> Result<BenchEngine<C>, OpenVolumeError> {
     let opened = store.tree.open(volume).await.map_err(|error| match error {
         StoreError::Rejected(UnknownVolume) => OpenVolumeError::UnknownVolume,
         StoreError::Failed(failure) => OpenVolumeError::Volume(failure),
@@ -336,22 +331,12 @@ async fn engine(
         DURABILITY_LIMIT,
         connect(directory, volume)?,
         PUBLISH_TIMEOUT,
-        consistency(),
+        consistency,
         kernel,
         runtime,
     )
     .await
     .map_err(OpenVolumeError::Root)
-}
-
-#[cfg(consistency = "eventual")]
-fn consistency() -> BenchConsistency {
-    Eventual::default()
-}
-
-#[cfg(consistency = "strong")]
-fn consistency() -> BenchConsistency {
-    StrongUntilDisconnectCached
 }
 
 // PUBLISH_TIMEOUT is how long a write waits for every other mount holding what it changes. It is longer than the

@@ -4,7 +4,7 @@ use std::process::{Command, ExitStatus};
 
 use bytes::Bytes;
 
-use crate::mount_options::MountOptions;
+use crate::mount_options::{ConsistencyKind, MountOptions};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
@@ -14,11 +14,12 @@ pub enum MountError {
     Failed { status: ExitStatus, stderr: String },
 }
 
-// mount mounts volume from the store directory special on mount_point.
+// mount mounts volume from the store directory special on mount_point, with consistency.
 pub fn mount<V: Clone + Into<Bytes>>(
     // mount(8)'s -t external_type: https://keith.github.io/xcode-man-pages/mount.8.html#t
     external_type: &str,
     volume: V,
+    consistency: ConsistencyKind,
     // mount(8)'s special: https://keith.github.io/xcode-man-pages/mount.8.html#DESCRIPTION
     special: &Path,
     // mount(8)'s mount_point: https://keith.github.io/xcode-man-pages/mount.8.html#DESCRIPTION
@@ -29,6 +30,7 @@ pub fn mount<V: Clone + Into<Bytes>>(
         .arg(
             MountOptions {
                 volume,
+                consistency,
                 durability_cadence: None,
             }
             .to_string(),
