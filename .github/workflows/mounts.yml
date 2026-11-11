@@ -23,22 +23,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build the FUSE daemon
         run: cargo build --release --locked --package stratafs-fuse
-      # A new volume's root belongs to root, so root mounts it and writes to it.
+      # A new volume's root belongs to root, and only the user who mounted a volume reaches it, so root does it all.
       - name: Mount a volume through FUSE
         run: |
+          sudo --preserve-env=RUNNER_TEMP bash -e <<'SCRIPT'
           uname -r
           store="$RUNNER_TEMP/store"
           mount_point="$RUNNER_TEMP/mounted"
           mkdir -p "$mount_point"
-          volume=$(sudo target/release/stratafs-fuse create "$store" --store sqlite)
-          sudo target/release/stratafs-fuse mount "$store" "$mount_point" --volume "$volume" --store sqlite --consistency eventual &
+          volume=$(target/release/stratafs-fuse create "$store" --store sqlite)
+          target/release/stratafs-fuse mount "$store" "$mount_point" --volume "$volume" --store sqlite --consistency eventual &
           for _ in $(seq 1 30); do mountpoint -q "$mount_point" && break; sleep 1; done
           mountpoint "$mount_point"
           grep stratafs /proc/mounts
-          sudo sh -c "echo mounted > '$mount_point/file' && cat '$mount_point/file'"
-          sudo umount "$mount_point"
+          echo mounted > "$mount_point/file"
+          cat "$mount_point/file"
+          umount "$mount_point"
           wait
           ! mountpoint -q "$mount_point"
+          SCRIPT
 
   macos-probe:
     runs-on: xcode-27

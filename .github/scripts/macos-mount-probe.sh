@@ -91,7 +91,9 @@ mkdir -p "$first" "$second"
 volume=$("$built/stratafs-bench" create "$store")
 echo "volume $volume"
 /sbin/mount -F -t stratafs -o "volume=$volume" "$store" "$first"; echo "first mount exit $?"
-/sbin/mount -F -t stratafs -o "volume=$volume" "$store" "$second"; echo "second mount exit $?"
+# FSKit takes a second mount of the same resource for busy, so the second mount reaches the store through a link
+ln -s "$store" "$RUNNER_TEMP/store-two-link"
+/sbin/mount -F -t stratafs -o "volume=$volume" "$RUNNER_TEMP/store-two-link" "$second"; echo "second mount exit $?"
 /sbin/mount | grep -i strata
 pgrep -fl stratafs-bench-extension
 if [ "$(/sbin/mount | grep -c '(stratafs')" = 2 ]; then
