@@ -56,6 +56,15 @@ jobs:
           STRATAFS_BENCH_STORE: sqlite
         run: cargo build --release --locked --package stratafs-bench --bins
       - name: Mount a volume through FSKit
+        env:
+          DEVELOPER_ID_CERTIFICATE: ${{ secrets.DEVELOPER_ID_CERTIFICATE }}
+          DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          FSKIT_PROVISIONING_PROFILE: ${{ secrets.FSKIT_PROVISIONING_PROFILE }}
         run: |
           sw_vers
           .github/scripts/mount-fskit.sh
+      - name: Probe two mounts of one volume
+        if: always()
+        run: |
+          .github/scripts/probe-two-fskit-mounts.sh
+          log show --last 6m --style compact --predicate 'process == "amfid" OR (process == "kernel" AND eventMessage CONTAINS "AMFI")' 2>/dev/null | grep -i -E "strata|restricted|profile" | tail -12 | cut -c1-260 || true
