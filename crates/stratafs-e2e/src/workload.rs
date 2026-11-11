@@ -16,9 +16,9 @@ use crate::{ConsistencyKind, Mount, Progress};
 pub const SHARED: &str = "shared";
 
 // SHARED_ERRORS are the errors an operation on the shared directory may fail with, as another thread may have changed
-// what it names. EPERM is macOS's answer to removing a directory as a file, and EBUSY the engine's to two mounts
-// changing one directory's name at once.
-const SHARED_ERRORS: [Errno; 7] = [
+// what it names. EPERM is macOS's answer to removing a directory as a file. EBUSY and ESTALE are the engine's, to two
+// mounts changing one file or directory at once and to a file another mount deleted, as the README lists.
+const SHARED_ERRORS: [Errno; 8] = [
     Errno::ENOENT,
     Errno::EEXIST,
     Errno::ENOTEMPTY,
@@ -26,6 +26,7 @@ const SHARED_ERRORS: [Errno; 7] = [
     Errno::EISDIR,
     Errno::EPERM,
     Errno::EBUSY,
+    Errno::ESTALE,
 ];
 
 // directory is the name of the directory only thread changes.
