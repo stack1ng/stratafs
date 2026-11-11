@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use stratafs_fs_engine::strong::ConnectFailure;
+use stratafs_fs_engine::holds::ConnectFailure;
 use stratafs_pubsub_conformance::{MemoryClient, MemoryVolume, Volume};
 
 use crate::activity::{FaultKind, REFUSALS};

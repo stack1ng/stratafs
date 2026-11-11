@@ -21,6 +21,7 @@ use stratafs_fs_engine::directories::{EntryChange, NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, EngineFailure, IoFailure, PosixError};
 use stratafs_fs_engine::kernel_cache::KernelCache;
 use stratafs_fs_engine::{Cached, FsConfig, FsEngine, Inode, ResultHandling, Timestamp};
+use stratafs_pubsub::PubSub;
 use stratafs_runtime::Runtime;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::TransactError;
@@ -77,15 +78,16 @@ const GENERATION: Generation = Generation(0);
 
 // Volume is a mounted volume's engine. Each operation replies when it finishes, on FUSE's thread unless it has to
 // wait, and then on runtime.
-pub(crate) struct Volume<St, A, N, S, C>
+pub(crate) struct Volume<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
-    pub(crate) engine: FsEngine<St, A, N, S, C>,
+    pub(crate) engine: FsEngine<St, P, A, N, S, C>,
     pub(crate) runtime: Arc<dyn Runtime>,
     pub(crate) items: Arc<Items>,
     // kernel is the kernel's cache of the volume's inodes, the one the engine invalidates.
@@ -98,16 +100,17 @@ where
 
 // make_durable_on_cadence makes the volume durable against a power failure every period, on a thread of its own,
 // until the volume is dropped.
-pub(crate) fn make_durable_on_cadence<St, A, N, S, C>(
-    volume: Weak<Volume<St, A, N, S, C>>,
+pub(crate) fn make_durable_on_cadence<St, P, A, N, S, C>(
+    volume: Weak<Volume<St, P, A, N, S, C>>,
     stopped: mpsc::Receiver<()>,
     period: Duration,
 ) where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
     std::thread::Builder::new()
         .name("durability cadence".to_owned())
@@ -128,13 +131,14 @@ pub(crate) fn make_durable_on_cadence<St, A, N, S, C>(
 
 // Dropping the volume, once its last operation ends, makes every commit durable, up to the engine's durability limit,
 // and says whether that worked.
-impl<St, A, N, S, C> Drop for Volume<St, A, N, S, C>
+impl<St, P, A, N, S, C> Drop for Volume<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
     fn drop(&mut self) {
         // The cadence's thread has stopped when the send fails.
@@ -211,13 +215,14 @@ const LINUX: &[u8] = b"linux";
 // platform.
 const PORTABLE_PREFIX: &[u8] = b"user.";
 
-impl<St, A, N, S, C> Volume<St, A, N, S, C>
+impl<St, P, A, N, S, C> Volume<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
     pub(crate) fn getattr(self: Arc<Self>, inode: Inode, reply: ReplyAttr) {
         self.run(move |volume| async move {

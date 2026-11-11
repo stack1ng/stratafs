@@ -348,14 +348,26 @@ where
         }
     }
 
-    // delete_inode deletes every key of inode, whose attributes were item.
+    // delete_inode deletes every key of inode, whose attributes were item. An inode this transaction made leaves no
+    // change behind, and one it changed already is deleted with the version it had before the transaction.
     fn delete_inode(
         &mut self,
         inode: Inode,
-        item: Attributes,
+        mut item: Attributes,
     ) -> impl Future<Output = Result<(), T::Failure>> + Send {
         async move {
-            self.changes.insert(inode, Change::Deleted(item));
+            match self.changes.get(&inode) {
+                Some(Change::Written(made)) if made.change_version.number == 0 => {
+                    self.changes.remove(&inode);
+                }
+                Some(Change::Written(_)) => {
+                    item.change_version.number -= 1;
+                    self.changes.insert(inode, Change::Deleted(item));
+                }
+                Some(Change::Deleted(_)) | None => {
+                    self.changes.insert(inode, Change::Deleted(item));
+                }
+            }
             let keys = self
                 .metadata
                 .get_range(every_key_of(inode), usize::MAX)
@@ -380,7 +392,7 @@ where
         async move {
             self.remove_name(dir, position, inode, item.kind)
                 .map_err(IoFailure::Metadata)?;
-            item.record_change(now, self.mount);
+            self.record_change(inode, item, now);
             match item.kind {
                 FileType::Directory => item.hard_link_count = 0,
                 FileType::File | FileType::SymbolicLink => {
@@ -411,7 +423,7 @@ where
         now: Timestamp,
     ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
         directory.settable.content_changed_at = now;
-        directory.record_change(now, self.mount);
+        self.record_change(dir, directory, now);
         self.write_attributes(dir, directory)
     }
 
@@ -559,7 +571,7 @@ where
                 .checked_add(1)
                 .ok_or(HardLinkError::TooManyLinks)?;
             let now = self.now();
-            item.record_change(now, self.mount);
+            self.record_change(inode, &mut item, now);
             self.write_attributes(inode, &item)?;
             self.add_name(dir, position, name, inode, item.kind)?;
             self.write_entry_change(dir, &mut directory, now)?;
@@ -819,7 +831,7 @@ where
                     if other.parent == new_dir {
                         other.parent = dir;
                     }
-                    other.record_change(now, self.mount);
+                    self.record_change(target.inode, &mut other, now);
                     self.write_attributes(target.inode, &other)?;
                     Some((target.inode, other, target.position))
                 }
@@ -867,7 +879,7 @@ where
             if item.parent == dir {
                 item.parent = new_dir;
             }
-            item.record_change(now, self.mount);
+            self.record_change(source.inode, &mut item, now);
             self.write_attributes(source.inode, &item)?;
             if moves_between_directories {
                 from.hard_link_count = from

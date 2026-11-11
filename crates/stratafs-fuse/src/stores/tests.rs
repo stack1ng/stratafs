@@ -33,9 +33,17 @@ fn reopened<D: Database>(database: StoreKind) {
         let tree = open_tree::<D>(directory.path(), Arc::clone(&runtime))
             .await
             .unwrap();
-        engine::<D, Eventual>(&tree, volume, None, Eventual::default(), NoKernel, runtime)
-            .await
-            .unwrap();
+        engine::<D, Eventual>(
+            &tree,
+            volume,
+            None,
+            no_coordinator(),
+            Eventual::default(),
+            NoKernel,
+            runtime,
+        )
+        .await
+        .unwrap();
     });
 }
 
@@ -67,6 +75,7 @@ fn a_volume_a_store_never_made_is_unknown() {
             &tree,
             TreeVolumeId::try_from(Bytes::from(vec![7; 16])).unwrap(),
             None,
+            no_coordinator(),
             Eventual::default(),
             NoKernel,
             runtime,
@@ -85,7 +94,7 @@ fn a_mount_of_a_store_never_made_makes_nothing() {
         volume: TreeVolumeId::try_from(Bytes::from(vec![7; 16])).unwrap(),
         database: StoreKind::Sqlite,
         consistency: ConsistencyKind::Eventual,
-        coordinator: None,
+        coordinator: "ws://127.0.0.1:7600".to_owned(),
         durability_limit: DurabilityLimit::Power,
         durability_cadence: Duration::from_secs(30),
         allow_other: false,

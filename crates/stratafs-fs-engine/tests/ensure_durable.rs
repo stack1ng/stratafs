@@ -1,8 +1,10 @@
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_executor::ThreadPool;
 use futures_lite::future::block_on;
+use futures_util::FutureExt;
 use object_store::memory::InMemory;
 use redb::Database;
 use redb::backends::InMemoryBackend;
@@ -11,6 +13,7 @@ use stratafs_fs_engine::spillable::ContentHash;
 use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_lock_synchronized::{LockSynchronizedMetadata, LockSynchronizedStore};
 use stratafs_object_store::ObjectStoreContentStore;
+use stratafs_pubsub_conformance::MemoryVolume;
 use stratafs_redb::RedbStore;
 use stratafs_runtime::ThreadPoolRuntime;
 use stratafs_store::content::ContentId;
@@ -72,16 +75,23 @@ fn durable_against(durability_limit: Option<DurableAgainst>) -> Vec<DurableAgain
     let allocate_inode: fn() -> u64 = || 7;
     let allocate_content_id: fn() -> ContentId = || ContentId(7);
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
-    let engine: FsEngine<_, _, _, TestConfig, _> = block_on(FsEngine::new(
+    let runtime = Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap()));
+    let pubsub = MemoryVolume::<u64>::new(runtime.clone());
+    let engine: FsEngine<_, _, _, _, TestConfig, _> = block_on(FsEngine::new(
         store,
         allocate_inode,
         allocate_content_id,
         now,
         MountId(1),
         durability_limit,
+        move || {
+            let client = pubsub.connect();
+            async move { Ok(client) }.boxed()
+        },
+        Duration::from_secs(1),
         Eventual::default(),
         NoKernel,
-        Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
+        runtime,
     ))
     .unwrap();
     for against in [

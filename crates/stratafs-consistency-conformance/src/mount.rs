@@ -2,33 +2,36 @@
 // call the engine as that kernel's integration does. What every kernel's mount shares is here.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use futures_util::FutureExt;
 use futures_util::future::try_join_all;
-use stratafs_fs_engine::attributes::{Attributes, ChangeVersion};
+use stratafs_fs_engine::attributes::Attributes;
 use stratafs_fs_engine::content::error::ReadError;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::error::{EngineFailure, Posix, PosixError};
+use stratafs_fs_engine::holds::{ConsistencyFailure, Failure as MountFailure};
 use stratafs_fs_engine::kernel_cache::KernelCache;
 use stratafs_fs_engine::spillable::ContentHash;
-use stratafs_fs_engine::strong::{Pending, StrongFailure};
+use stratafs_fs_engine::writes::Pending;
 use stratafs_fs_engine::{
-    Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, StrongUntilDisconnectCached,
-    Timestamp,
+    Cached, Eventual, FsConfig, FsEngine, Inode, Mount as EngineMount, MountId, PurgeWaits,
+    ResultHandling, StrongUntilDisconnectCached, Timestamp,
 };
+use stratafs_pubsub::PubSub;
 use stratafs_pubsub_conformance::{MemoryClient, MemoryVolume};
 use stratafs_runtime::Runtime;
 use stratafs_store::kv::TransactError;
+use stratafs_store::store::Store;
 
 use crate::faults::{Faults, Link};
 use crate::simulation::History;
 use crate::store::{InMemoryStore, SharedStore, new_store, next_content_id};
 
-// PUBLISH_TIMEOUT is how long a strong mount's publish waits for every other holder to handle it.
+// PUBLISH_TIMEOUT is how long a mount's publish waits for every other holder to handle it.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 
 // READ_LENGTH is how much a read asks for, more than any file holds, and LISTING_BATCH how many entries a listing
@@ -48,63 +51,196 @@ impl FsConfig for OneKibInline {
 
 type AllocateInode = Box<dyn Fn() -> u64 + Send + Sync>;
 
+type Memory = MemoryClient<u64>;
+
 pub(crate) type Engine<C> =
-    FsEngine<SharedStore, AllocateInode, fn() -> Timestamp, OneKibInline, C>;
+    FsEngine<SharedStore, Memory, AllocateInode, fn() -> Timestamp, OneKibInline, C>;
 
 // Consistency is a consistency under test, which each mount of a volume gets its own of.
-pub(crate) trait Consistency: Cached<SharedStore, Failure: Uncommitted> {
-    fn new(volume: &Volume, faults: &Arc<Faults>) -> Self;
-    // pending is every pending change version of state, the consistency's own state of some inodes.
-    fn pending(state: &Self::InodeState) -> Vec<(Inode, ChangeVersion)>;
+pub(crate) trait Consistency: Cached<SharedStore, Memory> {
+    // new is the consistency of the mount at index.
+    fn new(index: usize) -> Self;
+    // eventual says whether the mount at index is eventual, whose reads the check of the history leaves out, and
+    // which must serve the final version once the mounts settle.
+    fn eventual(index: usize) -> bool;
 }
 
-// Uncommitted is a consistency's failure, which says whether the write it failed committed nothing.
+// Uncommitted is a mount's failure, which says whether the write it failed committed nothing.
 pub(crate) trait Uncommitted {
     fn uncommitted(&self) -> bool;
 }
 
-impl Consistency for StrongUntilDisconnectCached<MemoryClient<u64>> {
-    fn new(_: &Volume, faults: &Arc<Faults>) -> Self {
-        let faults = Arc::clone(faults);
-        StrongUntilDisconnectCached::new(
-            move || {
-                let faults = Arc::clone(&faults);
-                Box::pin(async move { faults.connect().await })
-            },
-            PUBLISH_TIMEOUT,
-        )
+impl Consistency for StrongUntilDisconnectCached {
+    fn new(_: usize) -> Self {
+        StrongUntilDisconnectCached
     }
 
-    fn pending(state: &Pending) -> Vec<(Inode, ChangeVersion)> {
-        state
-            .iter()
-            .map(|(inode, version)| (*inode, *version))
-            .collect()
+    fn eventual(_: usize) -> bool {
+        false
     }
 }
 
-impl<F, R, M> Uncommitted for StrongFailure<F, R, M> {
+impl<F, R, M> Uncommitted for ConsistencyFailure<F, R, M> {
     fn uncommitted(&self) -> bool {
         matches!(
             self,
-            StrongFailure::Contended | StrongFailure::Publish(_) | StrongFailure::Uninvalidated(_)
+            ConsistencyFailure::Contended
+                | ConsistencyFailure::Publish(_)
+                | ConsistencyFailure::Uninvalidated(_)
         )
     }
 }
 
 impl Consistency for Eventual {
-    fn new(_: &Volume, _: &Arc<Faults>) -> Self {
+    fn new(_: usize) -> Self {
         Eventual::default()
     }
 
-    fn pending((): &()) -> Vec<(Inode, ChangeVersion)> {
-        Vec::new()
+    fn eventual(_: usize) -> bool {
+        true
     }
 }
 
-impl Uncommitted for Infallible {
-    fn uncommitted(&self) -> bool {
-        match *self {}
+// Mixed is the consistency of a mount of a volume whose mounts are eventual where a bit of EVENTUAL is set, by index,
+// and strong where it is not.
+pub(crate) enum Mixed<const EVENTUAL: u8> {
+    Strong(StrongUntilDisconnectCached),
+    Eventual(Box<Eventual>),
+}
+
+impl<const EVENTUAL: u8> Consistency for Mixed<EVENTUAL> {
+    fn new(index: usize) -> Self {
+        match Self::eventual(index) {
+            true => Mixed::Eventual(Box::default()),
+            false => Mixed::Strong(StrongUntilDisconnectCached),
+        }
+    }
+
+    fn eventual(index: usize) -> bool {
+        EVENTUAL >> index & 1 == 1
+    }
+}
+
+impl<const EVENTUAL: u8> stratafs_fs_engine::Consistency for Mixed<EVENTUAL> {}
+
+// Mixed is a consistency of every store, so rustc proves its futures Send once for every store, as FsEngine::new says.
+impl<St: Store, P: PubSub<Message = u64>, const EVENTUAL: u8> Cached<St, P> for Mixed<EVENTUAL> {
+    type Ticket = u64;
+
+    fn reading(&self, mount: &EngineMount<St, P>) -> u64 {
+        match self {
+            Mixed::Strong(strong) => strong.reading(mount),
+            Mixed::Eventual(eventual) => eventual.reading(mount),
+        }
+    }
+
+    async fn before_caching(
+        &self,
+        mount: &EngineMount<St, P>,
+        inodes: &[Inode],
+        ticket: u64,
+    ) -> Result<bool, MountFailure<P, St>> {
+        match self {
+            Mixed::Strong(strong) => strong.before_caching(mount, inodes, ticket).await,
+            Mixed::Eventual(eventual) => eventual.before_caching(mount, inodes, ticket).await,
+        }
+    }
+
+    fn result_handling(
+        &self,
+        mount: &EngineMount<St, P>,
+        reads: &[(Inode, Attributes)],
+        pending: &Pending,
+        ticket: u64,
+        began: u64,
+        purge_waits: PurgeWaits,
+        no_cache_honoured: bool,
+    ) -> ResultHandling {
+        match self {
+            Mixed::Strong(strong) => strong.result_handling(
+                mount,
+                reads,
+                pending,
+                ticket,
+                began,
+                purge_waits,
+                no_cache_honoured,
+            ),
+            Mixed::Eventual(eventual) => eventual.result_handling(
+                mount,
+                reads,
+                pending,
+                ticket,
+                began,
+                purge_waits,
+                no_cache_honoured,
+            ),
+        }
+    }
+
+    fn result_handling_listed(
+        &self,
+        mount: &EngineMount<St, P>,
+        reads: &[(Inode, Attributes)],
+        pending: &Pending,
+        ticket: u64,
+    ) -> ResultHandling {
+        match self {
+            Mixed::Strong(strong) => strong.result_handling_listed(mount, reads, pending, ticket),
+            Mixed::Eventual(eventual) => {
+                eventual.result_handling_listed(mount, reads, pending, ticket)
+            }
+        }
+    }
+
+    async fn settled(
+        &self,
+        mount: &EngineMount<St, P>,
+        reads: &[(Inode, Attributes)],
+        pending: &Pending,
+        ticket: u64,
+        purge_waits: PurgeWaits,
+    ) -> Result<(), MountFailure<P, St>> {
+        match self {
+            Mixed::Strong(strong) => {
+                strong
+                    .settled(mount, reads, pending, ticket, purge_waits)
+                    .await
+            }
+            Mixed::Eventual(eventual) => {
+                eventual
+                    .settled(mount, reads, pending, ticket, purge_waits)
+                    .await
+            }
+        }
+    }
+
+    fn cached(&self, mount: &EngineMount<St, P>, inode: Inode, seen: &Attributes) {
+        match self {
+            Mixed::Strong(strong) => strong.cached(mount, inode, seen),
+            Mixed::Eventual(eventual) => eventual.cached(mount, inode, seen),
+        }
+    }
+
+    fn forget(&self, mount: &EngineMount<St, P>, inode: Inode) {
+        match self {
+            Mixed::Strong(strong) => strong.forget(mount, inode),
+            Mixed::Eventual(eventual) => eventual.forget(mount, inode),
+        }
+    }
+
+    fn write_back(&self) -> bool {
+        match self {
+            Mixed::Strong(strong) => Cached::<St, P>::write_back(strong),
+            Mixed::Eventual(eventual) => Cached::<St, P>::write_back(&**eventual),
+        }
+    }
+
+    fn holds(&self) -> bool {
+        match self {
+            Mixed::Strong(strong) => Cached::<St, P>::holds(strong),
+            Mixed::Eventual(eventual) => Cached::<St, P>::holds(&**eventual),
+        }
     }
 }
 
@@ -254,6 +390,7 @@ impl Volume {
         let next_inode = Arc::clone(&self.next_inode);
         let allocate_inode: AllocateInode =
             Box::new(move || next_inode.fetch_add(1, Ordering::SeqCst));
+        let connecting = Arc::clone(&faults);
         let engine = FsEngine::new(
             SharedStore::new(&self.store, &faults),
             allocate_inode,
@@ -261,7 +398,12 @@ impl Volume {
             epoch as fn() -> Timestamp,
             MountId(index as u64 + 1),
             None,
-            C::new(self, &faults),
+            move || {
+                let faults = Arc::clone(&connecting);
+                async move { faults.connect().await }.boxed()
+            },
+            PUBLISH_TIMEOUT,
+            C::new(index),
             kernel.cache(),
             Arc::clone(&self.runtime),
         )
@@ -337,10 +479,10 @@ impl<C: Consistency, K> Mount<C, K> {
         &self,
         inodes: &[Inode],
     ) -> Result<Vec<(Inode, MountId)>, Failure> {
-        let state = self.engine.inode_state(inodes).await;
-        let state = state.map_err(|_| Failure::Unknown(PosixError::EIO))?;
+        let pending = self.engine.pending(inodes).await;
+        let pending = pending.map_err(|_| Failure::Unknown(PosixError::EIO))?;
         let mut live = Vec::new();
-        for (inode, version) in C::pending(&state) {
+        for (inode, version) in pending {
             let stored = self
                 .engine
                 .read_transact(|transaction| {

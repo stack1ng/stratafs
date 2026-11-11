@@ -23,6 +23,7 @@ use nix::mount::{MntFlags, umount2};
 use nix::sys::signal::{SigSet, Signal};
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{Cached, FsConfig, FsEngine, Timestamp};
+use stratafs_pubsub::PubSub;
 use stratafs_runtime::Runtime;
 use stratafs_store::store::Store;
 
@@ -50,19 +51,20 @@ pub enum MountError<F> {
 // ends, making commits durable each durability_cadence, on fsync and on unmount, to every user when allow_other says
 // so and otherwise to the one mounting it. A request that waits finishes on runtime, which needs threads of its own.
 // SIGINT and SIGTERM unmount, so the caller blocks them in every thread it starts, as the daemon's main does first.
-pub fn mount<St, A, N, S, C, F>(
+pub fn mount<St, P, A, N, S, C, F>(
     runtime: Arc<dyn Runtime>,
     mount_point: &Path,
     durability_cadence: Duration,
     allow_other: bool,
-    open_volume: impl AsyncFnOnce(FuseCache, Arc<dyn Runtime>) -> Result<FsEngine<St, A, N, S, C>, F>,
+    open_volume: impl AsyncFnOnce(FuseCache, Arc<dyn Runtime>) -> Result<FsEngine<St, P, A, N, S, C>, F>,
 ) -> Result<(), MountError<F>>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
     F: Error,
 {
     let items = Arc::new(Items::new());

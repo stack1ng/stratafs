@@ -1,3 +1,5 @@
+use std::ops::RangeInclusive;
+
 use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::select;
@@ -76,15 +78,21 @@ pub(crate) const STRONG_FAULTS: &[FaultKind] = &[
     FaultKind::Dies,
 ];
 // An eventual mount whose kernel refuses an invalidation keeps its copy until the kernel's own cache expires, which the
-// model kernel's never does, and it has no pub/sub to cut.
-pub(crate) const EVENTUAL_FAULTS: &[FaultKind] = &[FaultKind::StoreFails, FaultKind::Dies];
+// model kernel's never does.
+pub(crate) const EVENTUAL_FAULTS: &[FaultKind] = &[
+    FaultKind::Cut,
+    FaultKind::StoreFails,
+    FaultKind::ConnectFails,
+    FaultKind::Dies,
+];
 
-// simulated_activity is the activity of two or three mounts, each with one or two apps, and faults of kinds.
+// simulated_activity is the activity of as many mounts as mounts says, each with one or two apps, and faults of kinds.
 pub(crate) fn simulated_activity(
     kinds: &'static [FaultKind],
+    mounts: RangeInclusive<usize>,
 ) -> impl Strategy<Value = SimulatedActivity> {
     (
-        vec(vec(vec(operation(), 1..=4), 1..=2), 2..=3),
+        vec(vec(vec(operation(), 1..=4), 1..=2), mounts),
         prop_oneof![
             2 => Just(Vec::new()),
             1 => vec(fault(kinds), 1..=2),

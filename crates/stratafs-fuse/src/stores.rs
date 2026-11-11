@@ -13,9 +13,10 @@ use clap::{Args, ValueEnum};
 use futures_executor::ThreadPool as SpawnerPool;
 use futures_lite::future::block_on;
 use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
+use stratafs_fs_engine::holds::ConnectFailure;
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
 use stratafs_fs_engine::spillable::{ContentHash, referenced_content};
-use stratafs_fs_engine::strong::ConnectFailure;
 use stratafs_fs_engine::{
     Cached, Eventual, FsConfig, FsEngine, MountId, StrongUntilDisconnectCached, Timestamp,
 };
@@ -82,9 +83,8 @@ const MDBX_CONFIGURATION: MdbxConfiguration<'static> = MdbxConfiguration {
     shared_options: &[(mdbx_sys::MDBX_opt_sync_bytes, 256 << 20)],
 };
 
-// PUBLISH_TIMEOUT is how long a strong mount's write waits for every other mount holding what it changes. It is longer
-// than the coordinator takes to drop a mount that went silent, so only a coordinator that stopped answering fails a
-// write.
+// PUBLISH_TIMEOUT is how long a mount's write waits for every other mount holding what it changes. It is longer than
+// the coordinator takes to drop a mount that went silent, so only a coordinator that stopped answering fails a write.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -140,10 +140,9 @@ pub struct MountArguments {
     pub consistency: ConsistencyKind,
     #[arg(
         long,
-        required_if_eq("consistency", "strong"),
-        help = "The WebSocket URL of the coordinator strong mounts of the volume share, such as ws://127.0.0.1:7600"
+        help = "The WebSocket URL of the coordinator the mounts of the volume share, such as ws://127.0.0.1:7600"
     )]
-    pub coordinator: Option<String>,
+    pub coordinator: String,
     #[arg(
         long,
         value_enum,
@@ -200,22 +199,22 @@ pub fn mount(
 ) -> Result<(), MountError<OpenError>> {
     match (arguments.database, arguments.consistency) {
         (StoreKind::Mdbx, ConsistencyKind::Strong) => {
-            serve::<Mdbx, _>(arguments, runtime, || strong(arguments))
+            serve::<Mdbx, _>(arguments, runtime, StrongUntilDisconnectCached)
         }
         (StoreKind::Mdbx, ConsistencyKind::Eventual) => {
-            serve::<Mdbx, _>(arguments, runtime, eventual)
+            serve::<Mdbx, _>(arguments, runtime, Eventual::default())
         }
         (StoreKind::Redb, ConsistencyKind::Strong) => {
-            serve::<Redb, _>(arguments, runtime, || strong(arguments))
+            serve::<Redb, _>(arguments, runtime, StrongUntilDisconnectCached)
         }
         (StoreKind::Redb, ConsistencyKind::Eventual) => {
-            serve::<Redb, _>(arguments, runtime, eventual)
+            serve::<Redb, _>(arguments, runtime, Eventual::default())
         }
         (StoreKind::Sqlite, ConsistencyKind::Strong) => {
-            serve::<Sqlite, _>(arguments, runtime, || strong(arguments))
+            serve::<Sqlite, _>(arguments, runtime, StrongUntilDisconnectCached)
         }
         (StoreKind::Sqlite, ConsistencyKind::Eventual) => {
-            serve::<Sqlite, _>(arguments, runtime, eventual)
+            serve::<Sqlite, _>(arguments, runtime, Eventual::default())
         }
     }
 }
@@ -242,7 +241,8 @@ trait Database {
 
 type Volume<D> = TreeVolume<<D as Database>::Store, fn() -> u128, FuseTreeConfig>;
 
-type Engine<D, C> = FsEngine<Volume<D>, fn() -> u64, fn() -> Timestamp, FuseFsConfig, C>;
+type Engine<D, C> =
+    FsEngine<Volume<D>, Client<u64>, fn() -> u64, fn() -> Timestamp, FuseFsConfig, C>;
 
 struct Mdbx;
 
@@ -298,11 +298,11 @@ impl Database for Sqlite {
     }
 }
 
-// serve mounts the volume arguments name from a store of database D, with the consistency made by consistency.
-fn serve<D: Database, C: Cached<Volume<D>>>(
+// serve mounts the volume arguments name from a store of database D, with consistency.
+fn serve<D: Database, C: Cached<Volume<D>, Client<u64>>>(
     arguments: &MountArguments,
     runtime: Arc<dyn Runtime>,
-    consistency: impl FnOnce() -> Result<C, OpenError>,
+    consistency: C,
 ) -> Result<(), MountError<OpenError>> {
     let limit = match arguments.durability_limit {
         DurabilityLimit::None => None,
@@ -324,7 +324,8 @@ fn serve<D: Database, C: Cached<Volume<D>>>(
                 &tree,
                 arguments.volume,
                 limit,
-                consistency()?,
+                connect(arguments)?,
+                consistency,
                 kernel,
                 runtime,
             )
@@ -347,11 +348,13 @@ async fn create_volume<D: Database>(directory: &Path) -> Result<TreeVolumeId, Op
         .create()
         .await
         .map_err(|error| OpenError::Create(Box::new(error)))?;
-    // Opening the engine makes the volume's root directory, so a mount finds it ready.
+    // Opening the engine makes the volume's root directory, so a mount finds it ready. Making it writes nothing any
+    // other mount holds, so it reaches no coordinator.
     let engine = engine::<D, Eventual>(
         &tree,
         volume,
         Some(DurableAgainst::PowerFailure),
+        no_coordinator(),
         Eventual::default(),
         NoKernel,
         runtime,
@@ -386,11 +389,16 @@ async fn open_tree<D: Database>(
         .map_err(|error| OpenError::Tree(Box::new(error)))
 }
 
-// engine opens volume of tree as an engine that invalidates kernel's cache, running its work on runtime.
-async fn engine<D: Database, C: Cached<Volume<D>>>(
+// engine opens volume of tree as an engine that invalidates kernel's cache, running its work on runtime, and reaches
+// the volume's coordinator through connect.
+async fn engine<D: Database, C: Cached<Volume<D>, Client<u64>>>(
     tree: &StoreTree<D>,
     volume: TreeVolumeId,
     durability_limit: Option<DurableAgainst>,
+    connect: impl Fn() -> BoxFuture<'static, Result<Client<u64>, ConnectFailure>>
+    + Send
+    + Sync
+    + 'static,
     consistency: C,
     kernel: impl KernelCache,
     runtime: Arc<dyn Runtime>,
@@ -408,6 +416,8 @@ async fn engine<D: Database, C: Cached<Volume<D>>>(
         now as fn() -> Timestamp,
         MountId(rand::random()),
         durability_limit,
+        connect,
+        PUBLISH_TIMEOUT,
         consistency,
         kernel,
         runtime,
@@ -416,20 +426,15 @@ async fn engine<D: Database, C: Cached<Volume<D>>>(
     .map_err(|error| OpenError::Root(Box::new(error)))
 }
 
-fn eventual() -> Result<Eventual, OpenError> {
-    Ok(Eventual::default())
-}
-
-type Strong = StrongUntilDisconnectCached<Client<u64>>;
-
-// strong is the strong consistency of a mount of the volume arguments name, which joins /volume/<its id> at the
-// coordinator, as each volume's inodes are its own keys. The client runs on a Tokio runtime of its own, which the
-// consistency keeps.
-fn strong(arguments: &MountArguments) -> Result<Strong, OpenError> {
-    let coordinator = arguments
-        .coordinator
-        .as_deref()
-        .expect("the command line requires a coordinator for a strong mount");
+// connect connects a mount of the volume arguments name to the coordinator, joining /volume/<its id> there, as each
+// volume's inodes are its own keys. The client runs on a Tokio runtime of its own, which connect keeps.
+fn connect(
+    arguments: &MountArguments,
+) -> Result<
+    impl Fn() -> BoxFuture<'static, Result<Client<u64>, ConnectFailure>> + Send + Sync + 'static,
+    OpenError,
+> {
+    let coordinator = &arguments.coordinator;
     let url = format!(
         "{}/volume/{}",
         coordinator.trim_end_matches('/'),
@@ -452,11 +457,17 @@ fn strong(arguments: &MountArguments) -> Result<Strong, OpenError> {
         }
         .boxed()
     };
-    Ok(StrongUntilDisconnectCached::new(connect, PUBLISH_TIMEOUT))
+    Ok(connect)
+}
+
+// no_coordinator is the connect of an engine that reaches no coordinator, which fails each write that needs one.
+fn no_coordinator()
+-> impl Fn() -> BoxFuture<'static, Result<Client<u64>, ConnectFailure>> + Send + Sync + 'static {
+    || async { Err("the engine reaches no coordinator".into()) }.boxed()
 }
 
 // Connecting is a connect running on the client's runtime, which stops when nothing waits for it any more, such as
-// once the consistency's connect time limit passes.
+// once the engine's connect time limit passes.
 struct Connecting<T>(tokio::task::JoinHandle<T>);
 
 impl<T> Drop for Connecting<T> {

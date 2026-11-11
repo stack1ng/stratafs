@@ -1,34 +1,23 @@
-use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use futures_lite::future::block_on;
-use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
+use stratafs_pubsub::PubSubError;
+use stratafs_pubsub_conformance::MemoryClient;
 
 use super::*;
 use crate::attributes::Mode;
 use crate::directories::NewItem;
-use crate::error::PosixError;
 use crate::kernel_cache::NoKernel;
 use crate::test_support::{InMemoryStore, TestEngine, new_test_engine_with};
 
-// Scripted lets every write commit once it refused refusals of them. Its holds fail while fail_holds says so, its
-// result handling is what handling says, and cached is every inode the engine told it the kernel caches.
+// Scripted's holds fail once holds_left of them succeeded, its result handling is what handling says, and cached is
+// every inode the engine told it the kernel caches.
 struct Scripted {
-    refusals: AtomicUsize,
-    fail_holds: AtomicBool,
+    holds_left: AtomicUsize,
     handling: Mutex<ResultHandling>,
     cached: Mutex<Vec<Inode>>,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("holding failed on purpose")]
-struct HoldFailed;
-
-impl From<&HoldFailed> for PosixError {
-    fn from(_: &HoldFailed) -> Self {
-        PosixError::EIO
-    }
 }
 
 impl Scripted {
@@ -39,68 +28,37 @@ impl Scripted {
 
 impl Consistency for Scripted {}
 
-impl Cached<InMemoryStore> for Scripted {
-    type Failure = HoldFailed;
-    type Prepared = ();
+type Memory = MemoryClient<u64>;
+
+impl Cached<InMemoryStore, Memory> for Scripted {
     type Ticket = u64;
-    type InodeState = ();
 
-    async fn inode_state<T: ReadKeyValueTransaction<Failure = MetadataFailure<InMemoryStore>>>(
-        &self,
-        _: &T,
-        _: &[Inode],
-    ) -> Result<(), HoldFailed> {
-        Ok(())
-    }
-
-    async fn may_commit<T: KeyValueTransaction<Failure = MetadataFailure<InMemoryStore>>>(
-        &self,
-        _: &Mount<InMemoryStore>,
-        _: Option<&()>,
-        _: &HashMap<Inode, Change>,
-        _: &mut T,
-    ) -> Result<bool, HoldFailed> {
-        let refused = self
-            .refusals
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            });
-        Ok(refused.is_err())
-    }
-
-    async fn prepare(
-        &self,
-        _: &Mount<InMemoryStore>,
-        _: Option<()>,
-        _: HashMap<Inode, Change>,
-        _: PurgeWaits,
-    ) -> Result<(), HoldFailed> {
-        Ok(())
-    }
-
-    async fn finish(&self, _: &Mount<InMemoryStore>, (): (), _: Option<&HashMap<Inode, Change>>) {}
-
-    fn reading(&self) -> u64 {
+    fn reading(&self, _: &Mount<InMemoryStore, Memory>) -> u64 {
         0
     }
 
-    async fn hold(
+    async fn before_caching(
         &self,
-        _: &Mount<InMemoryStore>,
+        _: &Mount<InMemoryStore, Memory>,
         _: &[Inode],
         _: u64,
-    ) -> Result<bool, HoldFailed> {
-        match self.fail_holds.load(Ordering::SeqCst) {
-            true => Err(HoldFailed),
-            false => Ok(true),
+    ) -> Result<bool, Failure<Memory, InMemoryStore>> {
+        let held = self
+            .holds_left
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            });
+        match held {
+            Ok(_) => Ok(true),
+            Err(_) => Err(ConsistencyFailure::Hold(PubSubError::TimedOut)),
         }
     }
 
     fn result_handling(
         &self,
-        _: &Mount<InMemoryStore>,
+        _: &Mount<InMemoryStore, Memory>,
         _: &[(Inode, Attributes)],
-        (): &(),
+        _: &Pending,
         _: u64,
         _: u64,
         _: PurgeWaits,
@@ -111,9 +69,9 @@ impl Cached<InMemoryStore> for Scripted {
 
     fn result_handling_listed(
         &self,
-        _: &Mount<InMemoryStore>,
+        _: &Mount<InMemoryStore, Memory>,
         _: &[(Inode, Attributes)],
-        (): &(),
+        _: &Pending,
         _: u64,
     ) -> ResultHandling {
         *self.handling.lock().unwrap_or_else(PoisonError::into_inner)
@@ -121,33 +79,29 @@ impl Cached<InMemoryStore> for Scripted {
 
     async fn settled(
         &self,
-        _: &Mount<InMemoryStore>,
+        _: &Mount<InMemoryStore, Memory>,
         _: &[(Inode, Attributes)],
-        (): &(),
+        _: &Pending,
         _: u64,
         _: PurgeWaits,
-    ) -> Result<(), HoldFailed> {
+    ) -> Result<(), Failure<Memory, InMemoryStore>> {
         Ok(())
     }
 
-    async fn reread(
-        &self,
-        _: &Mount<InMemoryStore>,
-        committed: &[(Inode, Attributes)],
-    ) -> Result<(Vec<(Inode, Attributes)>, ()), HoldFailed> {
-        Ok((committed.to_vec(), ()))
-    }
-
-    fn cached(&self, _: &Mount<InMemoryStore>, inode: Inode, _: &Attributes) {
+    fn cached(&self, _: &Mount<InMemoryStore, Memory>, inode: Inode, _: &Attributes) {
         self.cached
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(inode);
     }
 
-    fn forget(&self, _: &Mount<InMemoryStore>, _: Inode) {}
+    fn forget(&self, _: &Mount<InMemoryStore, Memory>, _: Inode) {}
 
     fn write_back(&self) -> bool {
+        false
+    }
+
+    fn holds(&self) -> bool {
         false
     }
 }
@@ -156,8 +110,7 @@ type ScriptedEngine = TestEngine<Scripted>;
 
 fn scripted_engine(handling: ResultHandling) -> ScriptedEngine {
     let scripted = Scripted {
-        refusals: AtomicUsize::new(0),
-        fail_holds: AtomicBool::new(false),
+        holds_left: AtomicUsize::new(usize::MAX),
         handling: Mutex::new(handling),
         cached: Mutex::default(),
     };
@@ -259,10 +212,7 @@ fn a_read_an_integration_cannot_reply_uncached_is_taken_again() {
 fn a_change_whose_serving_fails_once_committed_hands_over_what_it_committed_uncached() {
     let engine = scripted_engine(ResultHandling::Cache);
     let inode = new_file(&engine);
-    engine
-        .consistency()
-        .fail_holds
-        .store(true, Ordering::SeqCst);
+    engine.consistency().holds_left.store(0, Ordering::SeqCst);
     let (handling, handed) = chmod(&engine, inode, Mode::OWNER_READ, |_| true).unwrap();
     assert_eq!(handling, ResultHandling::NoCache);
     assert_eq!(handed.settable.mode, Mode::OWNER_READ);
@@ -272,10 +222,7 @@ fn a_change_whose_serving_fails_once_committed_hands_over_what_it_committed_unca
 fn a_change_whose_serving_fails_once_committed_fails_when_it_cannot_reply_uncached() {
     let engine = scripted_engine(ResultHandling::Cache);
     let inode = new_file(&engine);
-    engine
-        .consistency()
-        .fail_holds
-        .store(true, Ordering::SeqCst);
+    engine.consistency().holds_left.store(0, Ordering::SeqCst);
     let changed = chmod(&engine, inode, Mode::OWNER_READ, |handling| {
         handling == ResultHandling::Cache
     });
@@ -285,25 +232,50 @@ fn a_change_whose_serving_fails_once_committed_fails_when_it_cannot_reply_uncach
     assert_eq!(stored.unwrap().unwrap().settable.mode, Mode::OWNER_READ);
 }
 
-// write_spilling writes content, long enough to spill, at the start of inode.
-fn write_spilling(engine: &ScriptedEngine, inode: Inode, content: impl Fn() -> Vec<u8> + Sync) {
+// write_spilling writes content, long enough to spill, at the start of inode, and from its second attempt on writes also
+// to each of others, which the attempt before did not announce. It returns how many attempts ran.
+fn write_spilling(
+    engine: &ScriptedEngine,
+    inode: Inode,
+    others: &[Inode],
+    content: impl Fn() -> Vec<u8> + Sync,
+) -> usize {
+    let attempts = AtomicUsize::new(0);
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
         let content = bytes::Bytes::from(content());
+        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+        let others = if attempt == 0 { &[][..] } else { others };
         Box::pin(async move {
-            let result = txn.write(inode, 0, content).await;
-            result.map(|_| ((), txn))
+            txn.write(inode, 0, content).await.unwrap();
+            for other in others {
+                txn.write(*other, 0, bytes::Bytes::from_static(b"x"))
+                    .await
+                    .unwrap();
+            }
+            Ok::<_, std::convert::Infallible>(((), txn))
         })
     }))
     .unwrap();
+    attempts.into_inner()
+}
+
+// new_named_file makes a file named name in the root.
+fn new_named_file(engine: &ScriptedEngine, name: &'static [u8]) -> Inode {
+    let created = block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        Box::pin(async move {
+            let result = txn.create(Inode::ROOT, name, NewItem::File, |_| {}).await;
+            result.map(|result| (result, txn))
+        })
+    }));
+    created.unwrap().inode
 }
 
 #[test]
 fn a_write_refused_once_puts_its_blob_once() {
     let engine = scripted_engine(ResultHandling::Cache);
     let inode = new_file(&engine);
-    engine.consistency().refusals.store(1, Ordering::SeqCst);
-    write_spilling(&engine, inode, || vec![7; 2000]);
-    assert_eq!(engine.consistency().refusals.load(Ordering::SeqCst), 0);
+    // A write to a file that exists commits only once it announced the file's next version, so it runs twice.
+    assert_eq!(write_spilling(&engine, inode, &[], || vec![7; 2000]), 2);
     // the second attempt took the first one's blob, so no second id was allocated
     assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(1)]));
 }
@@ -312,9 +284,12 @@ fn a_write_refused_once_puts_its_blob_once() {
 fn a_write_refused_twice_puts_its_blob_once() {
     let engine = scripted_engine(ResultHandling::Cache);
     let inode = new_file(&engine);
-    engine.consistency().refusals.store(2, Ordering::SeqCst);
-    write_spilling(&engine, inode, || vec![7; 2000]);
-    assert_eq!(engine.consistency().refusals.load(Ordering::SeqCst), 0);
+    let other = new_named_file(&engine, b"other");
+    // The second attempt also changes a file the first did not, which it announces before a third attempt commits.
+    assert_eq!(
+        write_spilling(&engine, inode, &[other], || vec![7; 2000]),
+        3
+    );
     assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(1)]));
 }
 
@@ -322,12 +297,11 @@ fn a_write_refused_twice_puts_its_blob_once() {
 fn an_attempt_that_spills_other_content_than_the_one_before_keeps_only_its_own_blob() {
     let engine = scripted_engine(ResultHandling::Cache);
     let inode = new_file(&engine);
-    engine.consistency().refusals.store(1, Ordering::SeqCst);
     let attempts = AtomicUsize::new(0);
-    write_spilling(&engine, inode, || {
+    let ran = write_spilling(&engine, inode, &[], || {
         vec![attempts.fetch_add(1, Ordering::SeqCst) as u8; 2000]
     });
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(ran, 2);
     assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(2)]));
 }
 
@@ -351,8 +325,9 @@ fn a_transaction_that_gives_up_after_spilling_keeps_no_blob() {
 fn the_same_content_spilled_twice_by_one_attempt_is_two_blobs() {
     let engine = scripted_engine(ResultHandling::Cache);
     let inode = new_file(&engine);
-    engine.consistency().refusals.store(1, Ordering::SeqCst);
+    let attempts = AtomicUsize::new(0);
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        attempts.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             let content = bytes::Bytes::from(vec![7; 2000]);
             txn.write(inode, 0, content.clone()).await.unwrap();
@@ -361,6 +336,7 @@ fn the_same_content_spilled_twice_by_one_attempt_is_two_blobs() {
         })
     }))
     .unwrap();
+    assert_eq!(attempts.into_inner(), 2);
     // each attempt references two blobs, and the second attempt took both of the first one's
     assert_eq!(
         engine.content().ids(),

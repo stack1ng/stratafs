@@ -3,14 +3,19 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use futures_core::future::BoxFuture;
 use futures_executor::ThreadPool;
 use futures_lite::future::block_on;
+use futures_util::FutureExt;
 use object_store::memory::InMemory;
 use redb::backends::InMemoryBackend;
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
+use stratafs_pubsub::PubSub;
+use stratafs_pubsub_conformance::{MemoryClient, MemoryVolume};
 use stratafs_redb::{RedbFailure, RedbStore};
 use stratafs_runtime::{TaskDroppingRuntime, ThreadPoolRuntime};
 use stratafs_store::content::{ContentId, ContentReference, ContentStore, GetRejection};
@@ -25,12 +30,16 @@ use stratafs_tree::tree::{Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
 
 use crate::attributes::Restrictions;
+use crate::holds::ConnectFailure;
 use crate::kernel_cache::{KernelCache, NoKernel};
 use crate::spillable::{ContentHash, referenced_content};
 use crate::{Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
 
 // TEST_MOUNT is the mount test engines are.
 pub(crate) const TEST_MOUNT: MountId = MountId(1);
+
+// PUBLISH_TIMEOUT is how long a test engine's publish waits for every other holder to handle it.
+pub(crate) const PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) struct OneKibInline;
 
@@ -128,8 +137,8 @@ pub(crate) type MetadataFailure = TreeFailure<RedbFailure, Infallible>;
 
 pub(crate) type InMemoryEngine = TestEngine<Eventual>;
 
-pub(crate) type TestEngine<C> =
-    FsEngine<InMemoryStore, fn() -> u64, fn() -> Timestamp, OneKibInline, C>;
+pub(crate) type TestEngine<C, P = MemoryClient<u64>> =
+    FsEngine<InMemoryStore, P, fn() -> u64, fn() -> Timestamp, OneKibInline, C>;
 
 thread_local! {
     static CLOCK: Cell<i64> = const { Cell::new(0) };
@@ -168,7 +177,7 @@ pub(crate) fn new_test_engine_for(kernel: impl KernelCache) -> InMemoryEngine {
 }
 
 // new_test_engine_with is a test engine with consistency, whose inodes kernel caches.
-pub(crate) fn new_test_engine_with<C: Cached<InMemoryStore>>(
+pub(crate) fn new_test_engine_with<C: Cached<InMemoryStore, MemoryClient<u64>>>(
     consistency: C,
     kernel: impl KernelCache,
 ) -> TestEngine<C> {
@@ -177,14 +186,28 @@ pub(crate) fn new_test_engine_with<C: Cached<InMemoryStore>>(
     volumes.engine_with(volume, consistency, kernel)
 }
 
+// new_test_engine_reaching is a test engine with consistency, whose inodes kernel caches, of a volume whose pub/sub
+// connect reaches and whose publishes wait timeout for holders.
+pub(crate) fn new_test_engine_reaching<P: PubSub<Message = u64>, C: Cached<InMemoryStore, P>>(
+    connect: impl Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync + 'static,
+    timeout: Duration,
+    consistency: C,
+    kernel: impl KernelCache,
+) -> TestEngine<C, P> {
+    let volumes = TestVolumes::new();
+    let volume = volumes.create();
+    volumes.engine_reaching(volume, TEST_MOUNT, connect, timeout, consistency, kernel)
+}
+
 pub(crate) type TestTree =
     Tree<LockSynchronizedStore<RedbStore<Inline>, ListedContent>, fn() -> u128, TestTreeConfig>;
 
-// TestVolumes is a tree of volumes in memory and the content their engines share. Only a test runs its garbage
-// collection.
+// TestVolumes is a tree of volumes in memory, the content their engines share, and the pub/sub they reach. Only a test
+// runs its garbage collection.
 pub(crate) struct TestVolumes {
     tree: TestTree,
     pub(crate) content: ListedContent,
+    pubsub: Arc<MemoryVolume<u64>>,
 }
 
 impl TestVolumes {
@@ -204,7 +227,14 @@ impl TestVolumes {
             Arc::new(TaskDroppingRuntime),
         ))
         .unwrap();
-        Self { tree, content }
+        let pubsub = Arc::new(MemoryVolume::new(Arc::new(ThreadPoolRuntime(
+            ThreadPool::new().unwrap(),
+        ))));
+        Self {
+            tree,
+            content,
+            pubsub,
+        }
     }
 
     pub(crate) fn create(&self) -> TreeVolumeId {
@@ -235,13 +265,46 @@ impl TestVolumes {
         self.engine_with(volume, Eventual::default(), NoKernel)
     }
 
-    // engine_with is an engine of volume with consistency, whose inodes kernel caches.
-    pub(crate) fn engine_with<C: Cached<InMemoryStore>>(
+    // engine_with is an engine of volume with consistency, whose inodes kernel caches, reaching the volumes' pub/sub.
+    pub(crate) fn engine_with<C: Cached<InMemoryStore, MemoryClient<u64>>>(
         &self,
         volume: TreeVolumeId,
         consistency: C,
         kernel: impl KernelCache,
     ) -> TestEngine<C> {
+        self.engine_reaching(
+            volume,
+            TEST_MOUNT,
+            self.connect(),
+            PUBLISH_TIMEOUT,
+            consistency,
+            kernel,
+        )
+    }
+
+    // connect connects a client of the volumes' pub/sub.
+    pub(crate) fn connect(
+        &self,
+    ) -> impl Fn() -> BoxFuture<'static, Result<MemoryClient<u64>, ConnectFailure>> + Send + Sync + 'static
+    {
+        let pubsub = Arc::clone(&self.pubsub);
+        move || {
+            let client = pubsub.connect();
+            async move { Ok(client) }.boxed()
+        }
+    }
+
+    // engine_reaching is the engine of volume that is mount, with consistency, whose inodes kernel caches, of a volume
+    // whose pub/sub connect reaches and whose publishes wait timeout for holders.
+    pub(crate) fn engine_reaching<P: PubSub<Message = u64>, C: Cached<InMemoryStore, P>>(
+        &self,
+        volume: TreeVolumeId,
+        mount: MountId,
+        connect: impl Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync + 'static,
+        timeout: Duration,
+        consistency: C,
+        kernel: impl KernelCache,
+    ) -> TestEngine<C, P> {
         let allocate_inode: fn() -> u64 = next_inode;
         let now: fn() -> Timestamp = clock;
         block_on(async {
@@ -251,8 +314,10 @@ impl TestVolumes {
                 allocate_inode,
                 next_content_id,
                 now,
-                TEST_MOUNT,
+                mount,
                 Some(DurableAgainst::PowerFailure),
+                connect,
+                timeout,
                 consistency,
                 kernel,
                 Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),

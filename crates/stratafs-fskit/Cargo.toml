@@ -18,6 +18,7 @@ extension = [
     "dep:objc2-foundation",
     "dep:objc2-fs-kit",
     "dep:stratafs-fs-engine",
+    "dep:stratafs-pubsub",
     "dep:stratafs-runtime",
     "dep:stratafs-store",
     "dep:tracing",
@@ -37,6 +38,7 @@ objc2 = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 objc2-fs-kit = { workspace = true, optional = true }
 stratafs-fs-engine = { workspace = true, optional = true }
+stratafs-pubsub = { workspace = true, optional = true }
 stratafs-runtime = { workspace = true, optional = true }
 stratafs-store = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -49,6 +51,7 @@ object_store.workspace = true
 redb = "4.4.0"
 stratafs-lock-synchronized.workspace = true
 stratafs-object-store.workspace = true
+stratafs-pubsub-conformance.workspace = true
 stratafs-redb.workspace = true
 stratafs-tree.workspace = true
 

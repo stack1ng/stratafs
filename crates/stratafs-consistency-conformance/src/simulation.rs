@@ -69,8 +69,8 @@ impl History {
     }
 }
 
-// Ending is what a run must show once its activity is done: a linearizable history, or every mount serving the
-// final version once they settle.
+// Ending is whether a run must show a linearizable history of its strong mounts once its activity is done. Every
+// eventual mount must serve the final version once the mounts settle either way.
 #[derive(Clone, Copy)]
 pub(crate) enum Ending {
     Linearizable,
@@ -99,6 +99,11 @@ where
         tainted += left_out;
         for fault in &activity.faults {
             let mount = fault.mount % activity.mounts.len();
+            // An eventual mount whose kernel refuses an invalidation keeps its copy, which the model kernel never
+            // drops, so only a strong mount's kernel refuses.
+            if fault.kind == FaultKind::Refused && C::eventual(mount) {
+                continue;
+            }
             let count = counted[mount].of(fault.kind);
             planned[mount].push((
                 fault.kind,
@@ -137,7 +142,7 @@ where
                     check_strict(&history)?;
                 }
                 let tainted = match ending {
-                    Ending::Linearizable => check_linearizable::<K>(made, history)?,
+                    Ending::Linearizable => check_linearizable::<C, K>(made, history)?,
                     Ending::Converges => 0,
                 };
                 Ok((counted, tainted))
@@ -225,7 +230,7 @@ where
         mount.faults.plan(Vec::new());
     }
     volume.runtime.sleep(SETTLED).await;
-    let mut live: Vec<_> = mounts
+    let live: Vec<_> = mounts
         .iter()
         .enumerate()
         .filter(|(_, mount)| !mount.faults.dead())
@@ -234,13 +239,18 @@ where
     if let Some(client) = live.first() {
         announcements_settled(client, &mounts, &volume.inodes()).await?;
     }
+    let (eventual, mut strong): (Vec<_>, Vec<_>) = live
+        .into_iter()
+        .partition(|client| C::eventual(client.app.0));
+    // The eventual mounts are checked first, as a strong mount's read may settle a write whose writer died.
+    converged(&eventual).await?;
     match ending {
         Ending::Linearizable => {
-            for client in &mut live {
+            for client in &mut strong {
                 client.read_everything().await;
             }
         }
-        Ending::Converges => converged(&live).await?,
+        Ending::Converges => {}
     }
     Ok((made, history.take(), counted))
 }
@@ -282,10 +292,11 @@ where
             let (served, stale) = client.served(path).await;
             // UPSTREAM KERNEL BUG PIN: attributes a reply brought in after the kernel let go of the item stay stale, so
             // only the rest is compared.
+            let mount = MountId(client.app.0 as u64 + 1);
             let same = if stale {
                 without_attributes(&served) == without_attributes(&stored)
             } else {
-                served == stored
+                served == stored || settled_own_write(&served, &stored, mount)
             };
             if stored.is_none() || !same {
                 return Err(TestCaseError::fail(format!(
@@ -304,6 +315,30 @@ fn without_attributes(
 ) -> Option<Option<(Inode, &Bytes)>> {
     file.as_ref()
         .map(|file| file.as_ref().map(|(inode, _, content)| (*inode, content)))
+}
+
+// settled_own_write says whether the file served differs from the one stored only in a change version one older, where
+// the stored one is mount's. A settle of mount's own write moves the change version and nothing else, which mount's auto
+// invalidator takes for its own change, so it keeps its copy.
+fn settled_own_write(
+    served: &Option<Option<(Inode, Attributes, Bytes)>>,
+    stored: &Option<Option<(Inode, Attributes, Bytes)>>,
+    mount: MountId,
+) -> bool {
+    let (Some(Some((served_inode, served, served_content))), Some(Some((inode, stored, content)))) =
+        (served, stored)
+    else {
+        return false;
+    };
+    let with_stored_version = |attributes: &Attributes| Attributes {
+        change_version: stored.change_version,
+        ..attributes.clone()
+    };
+    served_inode == inode
+        && served_content == content
+        && served.change_version.number + 1 == stored.change_version.number
+        && stored.change_version.mount == mount
+        && with_stored_version(served) == *stored
 }
 
 // directory is the inode of the directory named name, of directories, the inode of each of DIRECTORIES.
@@ -686,9 +721,10 @@ fn check_strict(history: &[Event]) -> Result<(), TestCaseError> {
 }
 
 // check_linearizable fails unless some order of the operations' steps, each between its operation's invocation and end,
-// explains what each returned. It leaves out the reads of a mount cut off until it connected again, or dead, and what
-// its writes returned, and a write that failed in a way that may have committed may or may not take effect.
-fn check_linearizable<K: KernelModel>(
+// explains what each returned. It leaves out the reads and failed changes of an eventual mount, and what its changes
+// returned, the reads of a mount cut off until it connected again, or dead, and what its writes returned, and a write
+// that failed in a way that may have committed may or may not take effect.
+fn check_linearizable<C: Consistency, K: KernelModel>(
     made: Namespace,
     history: Vec<Event>,
 ) -> Result<usize, TestCaseError> {
@@ -731,9 +767,18 @@ fn check_linearizable<K: KernelModel>(
             continue;
         }
         let (end, ended) = ends[id];
-        let not_held = excused
-            .iter()
-            .any(|(mount, start, stop)| *mount == id.app.0 && at < *stop && end > *start);
+        // An eventual mount's kernel may answer its reads, fail its changes, and hand the attributes a change returns,
+        // from what it caches.
+        let eventual = C::eventual(id.app.0);
+        if eventual
+            && (operation.reads() || matches!(ended, Event::Returned(_, Outcome::Failed(_))))
+        {
+            continue;
+        }
+        let not_held = eventual
+            || excused
+                .iter()
+                .any(|(mount, start, stop)| *mount == id.app.0 && at < *stop && end > *start);
         // A failure that committed nothing is left out, and so is a write's outcome the check does not hold it to.
         let (returned, committed) = match ended {
             Event::Returned(_, outcome) if !not_held => (Some(outcome.clone()), true),

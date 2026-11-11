@@ -144,8 +144,8 @@ serialized_value! {
 }
 
 serialized_value! {
-    // ChangeVersion counts an inode's changes, and names the mount that made the latest. Every change moves the
-    // number by one, whichever mount makes it.
+    // ChangeVersion counts an inode's changes, and names the mount that made the latest. Every transaction that changes
+    // the inode moves the number by one, whichever mount makes it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ChangeVersion as LittleEndianChangeVersion {
         pub mount: MountId,
@@ -171,10 +171,14 @@ serialized_shape! {
     }
 }
 
-impl Attributes {
-    pub(crate) fn record_change(&mut self, now: Timestamp, mount: MountId) {
-        self.attribute_changed_at = now;
-        self.change_version = self.change_version.after(mount);
+impl<T, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
+    // record_change records a change at now to inode, whose attributes are attributes. The change version moves once
+    // per transaction, so an inode the transaction changed or made already keeps the version it has.
+    pub(crate) fn record_change(&self, inode: Inode, attributes: &mut Attributes, now: Timestamp) {
+        attributes.attribute_changed_at = now;
+        if !self.changes.contains_key(&inode) {
+            attributes.change_version = attributes.change_version.after(self.mount);
+        }
     }
 }
 
@@ -303,7 +307,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             {
                 attributes.settable.content_changed_at = now;
             }
-            attributes.record_change(now, self.mount);
+            self.record_change(inode, &mut attributes, now);
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)
         }

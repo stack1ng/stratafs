@@ -6,14 +6,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use futures_util::future::{AbortHandle, Abortable};
-use stratafs_store::kv::{KeyValueStore, KeyValueTransaction, ReadKeyValueTransaction};
+use stratafs_pubsub::PubSub;
+use stratafs_store::kv::KeyValueStore;
 use stratafs_store::store::Store;
 
 use crate::attributes::{Attributes, read_attributes};
+use crate::holds::Failure;
 use crate::key::FsKey;
-use crate::{
-    Cached, Change, Consistency, Inode, MetadataFailure, Mount, PurgeWaits, ResultHandling,
-};
+use crate::writes::Pending;
+use crate::{Cached, Consistency, Inode, MetadataFailure, Mount, PurgeWaits, ResultHandling};
 
 // Eventual serves reads from a cache that may lag behind other clients' writes.
 pub struct Eventual {
@@ -99,8 +100,8 @@ pub(crate) fn invalidated<St: Store>(
         .changed(FsKey::new_attributes(inode).into(), Some(Bytes::from(seen)))
 }
 
-// Eventual invalidates an inode once a write to it commits: once its stored attributes differ from seen. It lets
-// every write commit, and takes again a read begun before the kernel last let go of one of its inodes.
+// Eventual invalidates an inode once a write to it commits: once its stored attributes differ from seen. It holds
+// nothing, and takes again a read begun before the kernel last let go of one of its inodes.
 impl Eventual {
     // forgotten is the bucket holding the number taken when the kernel last let go of inode.
     fn forgotten(&self, inode: Inode) -> &AtomicU64 {
@@ -113,47 +114,19 @@ impl Eventual {
     }
 }
 
-impl<St: Store> Cached<St> for Eventual {
-    type Failure = Infallible;
-    type Prepared = ();
+impl<St: Store, P: PubSub> Cached<St, P> for Eventual {
     type Ticket = u64;
-    type InodeState = ();
 
-    async fn inode_state<T: ReadKeyValueTransaction<Failure = MetadataFailure<St>>>(
-        &self,
-        _: &T,
-        _: &[Inode],
-    ) -> Result<(), Infallible> {
-        Ok(())
-    }
-
-    async fn may_commit<T: KeyValueTransaction<Failure = MetadataFailure<St>>>(
-        &self,
-        _: &Mount<St>,
-        _: Option<&()>,
-        _: &HashMap<Inode, Change>,
-        _: &mut T,
-    ) -> Result<bool, Infallible> {
-        Ok(true)
-    }
-
-    async fn prepare(
-        &self,
-        _: &Mount<St>,
-        _: Option<()>,
-        _: HashMap<Inode, Change>,
-        _: PurgeWaits,
-    ) -> Result<(), Infallible> {
-        Ok(())
-    }
-
-    async fn finish(&self, _: &Mount<St>, (): (), _: Option<&HashMap<Inode, Change>>) {}
-
-    fn reading(&self) -> u64 {
+    fn reading(&self, _: &Mount<St, P>) -> u64 {
         self.clock.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    async fn hold(&self, _: &Mount<St>, inodes: &[Inode], ticket: u64) -> Result<bool, Infallible> {
+    async fn before_caching(
+        &self,
+        _: &Mount<St, P>,
+        inodes: &[Inode],
+        ticket: u64,
+    ) -> Result<bool, Failure<P, St>> {
         Ok(self.taken_after(ticket, inodes.iter().copied()))
     }
 
@@ -161,9 +134,9 @@ impl<St: Store> Cached<St> for Eventual {
     // land after a newer one this mount handed over, which the auto invalidator then takes for the kernel's own.
     fn result_handling(
         &self,
-        _: &Mount<St>,
+        _: &Mount<St, P>,
         reads: &[(Inode, Attributes)],
-        (): &(),
+        _: &Pending,
         ticket: u64,
         _: u64,
         _: PurgeWaits,
@@ -177,9 +150,9 @@ impl<St: Store> Cached<St> for Eventual {
 
     fn result_handling_listed(
         &self,
-        _: &Mount<St>,
+        _: &Mount<St, P>,
         _: &[(Inode, Attributes)],
-        (): &(),
+        _: &Pending,
         _: u64,
     ) -> ResultHandling {
         ResultHandling::Cache
@@ -187,26 +160,18 @@ impl<St: Store> Cached<St> for Eventual {
 
     async fn settled(
         &self,
-        _: &Mount<St>,
+        _: &Mount<St, P>,
         _: &[(Inode, Attributes)],
-        (): &(),
+        _: &Pending,
         _: u64,
         _: PurgeWaits,
-    ) -> Result<(), Infallible> {
+    ) -> Result<(), Failure<P, St>> {
         Ok(())
-    }
-
-    async fn reread(
-        &self,
-        _: &Mount<St>,
-        committed: &[(Inode, Attributes)],
-    ) -> Result<(Vec<(Inode, Attributes)>, ()), Infallible> {
-        Ok((committed.to_vec(), ()))
     }
 
     // cached tells Eventual the kernel now caches the given inode as seen.
     // This is then used to coordinate an auto invalidator for this inode.
-    fn cached(&self, mount: &Mount<St>, inode: Inode, seen: &Attributes) {
+    fn cached(&self, mount: &Mount<St, P>, inode: Inode, seen: &Attributes) {
         let (stop, stopped) = AbortHandle::new_pair();
         let id = self
             .auto_invalidators
@@ -288,7 +253,7 @@ impl<St: Store> Cached<St> for Eventual {
     }
 
     // forget tells Eventual the kernel no longer caches inode.
-    fn forget(&self, _: &Mount<St>, inode: Inode) {
+    fn forget(&self, _: &Mount<St, P>, inode: Inode) {
         let at = self.clock.fetch_add(1, Ordering::SeqCst) + 1;
         self.forgotten(inode).fetch_max(at, Ordering::SeqCst);
         if let Some(running) = self
@@ -304,6 +269,10 @@ impl<St: Store> Cached<St> for Eventual {
 
     fn write_back(&self) -> bool {
         true
+    }
+
+    fn holds(&self) -> bool {
+        false
     }
 }
 

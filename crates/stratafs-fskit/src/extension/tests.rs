@@ -10,6 +10,7 @@ use block2::RcBlock;
 use bytes::Bytes;
 use futures_executor::ThreadPool;
 use futures_lite::future::block_on;
+use futures_util::FutureExt;
 use objc2::encode::RefEncode;
 use objc2::{AllocAnyThread, msg_send};
 use objc2_foundation::{NSError, NSString, NSURL};
@@ -32,6 +33,7 @@ use stratafs_fs_engine::spillable::ContentHash;
 use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
+use stratafs_pubsub_conformance::{MemoryClient, MemoryVolume};
 use stratafs_redb::RedbStore;
 use stratafs_runtime::ThreadPoolRuntime;
 use stratafs_store::content::ContentId;
@@ -56,7 +58,8 @@ impl FsConfig for TestConfig {
 
 type TestStore = LockSynchronizedStore<RedbStore<SimulatedThreadPool>, ObjectStoreContentStore>;
 
-type TestEngine = FsEngine<TestStore, fn() -> u64, fn() -> Timestamp, TestConfig, Eventual>;
+type TestEngine =
+    FsEngine<TestStore, MemoryClient<u64>, fn() -> u64, fn() -> Timestamp, TestConfig, Eventual>;
 
 // SimulatedThreadPool yields before it does the work, as a thread pool does when the work is not done by the
 // first poll, so making commits durable makes its operation wait.
@@ -85,6 +88,7 @@ async fn new_engine(
     let allocate_content_id: fn() -> ContentId =
         || ContentId(NEXT_CONTENT_ID.fetch_add(1, Ordering::Relaxed).into());
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
+    let pubsub = MemoryVolume::new(Arc::clone(&runtime));
     FsEngine::new(
         LockSynchronizedStore::new(
             RedbStore::new(database, SimulatedThreadPool).map_err(io::Error::other)?,
@@ -95,6 +99,11 @@ async fn new_engine(
         now,
         MountId(1),
         Some(DurableAgainst::PowerFailure),
+        move || {
+            let client = pubsub.connect();
+            async move { Ok(client) }.boxed()
+        },
+        Duration::from_secs(1),
         Eventual::default(),
         kernel,
         runtime,

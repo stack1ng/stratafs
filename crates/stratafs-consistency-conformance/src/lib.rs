@@ -1,6 +1,7 @@
 // stratafs-consistency-conformance checks the engine's consistencies: several mounts of one volume, each a real engine
 // with a model of a kernel, macOS's through FSKit or Linux's through FUSE, run fuzzed activity on a replaying runtime.
-// A strong mount's history must be linearizable, and eventual mounts must all serve the final version once they settle.
+// The strong mounts' history must be linearizable, counting every mount's writes, and eventual mounts must all serve the
+// final version once they settle.
 
 mod activity;
 mod faults;
@@ -14,16 +15,16 @@ mod store;
 pub use stratafs_runtime::replay as runtime;
 
 use std::io::Write;
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use proptest::prelude::{ProptestConfig, any};
 use proptest::proptest;
 use proptest::test_runner::FileFailurePersistence;
 use stratafs_fs_engine::{Eventual, StrongUntilDisconnectCached};
-use stratafs_pubsub_conformance::MemoryClient;
 
 use crate::activity::{EVENTUAL_FAULTS, STRONG_FAULTS, simulated_activity};
-use crate::mount::{KernelModel, Mount, Operations};
+use crate::mount::{KernelModel, Mixed, Mount, Operations};
 use crate::runtime::ReplayingRuntime;
 use crate::simulation::{Ending, simulate};
 
@@ -34,7 +35,7 @@ pub enum Kernel {
     SimulatedLinuxFuse,
 }
 
-type Strong = StrongUntilDisconnectCached<MemoryClient<u64>>;
+type Strong = StrongUntilDisconnectCached;
 
 // strong_is_linearizable runs fuzzed activity on strong until disconnect, cached mounts, and fails if the history is
 // not linearizable, leaving out what a mount cut off from the pub/sub did before it noticed, or a write is left
@@ -54,7 +55,7 @@ where
     Mount<Strong, K>: Operations,
 {
     let tainted = AtomicUsize::new(0);
-    proptest!(config(K::REGRESSIONS), |(activity in simulated_activity(STRONG_FAULTS), seed in any::<u64>())| {
+    proptest!(config(K::REGRESSIONS), |(activity in simulated_activity(STRONG_FAULTS, 2..=3), seed in any::<u64>())| {
         let left_out = simulate::<_, Strong, K>(&runtime, Ending::Linearizable, activity, seed)?;
         tainted.fetch_add(left_out, Ordering::Relaxed);
     });
@@ -80,9 +81,55 @@ fn converges<R: ReplayingRuntime, K: KernelModel>(runtime: R)
 where
     Mount<Eventual, K>: Operations,
 {
-    proptest!(config(K::REGRESSIONS), |(activity in simulated_activity(EVENTUAL_FAULTS), seed in any::<u64>())| {
+    proptest!(config(K::REGRESSIONS), |(activity in simulated_activity(EVENTUAL_FAULTS, 2..=3), seed in any::<u64>())| {
         simulate::<_, Eventual, K>(&runtime, Ending::Converges, activity, seed)?;
     });
+}
+
+// strong_and_eventual_on_one_volume runs fuzzed activity on mounts of one volume in three layouts, strong then eventual
+// mounts, strong then two eventual ones, and eventual then strong ones, and fails if the strong mounts' history,
+// counting the eventual mounts' writes, is not linearizable, or an eventual mount does not serve the final version once
+// they settle.
+pub fn strong_and_eventual_on_one_volume<R: ReplayingRuntime>(kernel: Kernel, runtime: R) {
+    match kernel {
+        Kernel::SimulatedFsKit => layouts::<_, simulated_fskit_kernel::Kernel>(&runtime),
+        Kernel::SimulatedLinuxFuse => layouts::<_, simulated_linux_fuse_kernel::Kernel>(&runtime),
+    }
+}
+
+// layouts runs mixed in each layout, with as many mounts as make it.
+fn layouts<R: ReplayingRuntime, K: KernelModel>(runtime: &R)
+where
+    Mount<Mixed<0b010>, K>: Operations,
+    Mount<Mixed<0b110>, K>: Operations,
+    Mount<Mixed<0b001>, K>: Operations,
+{
+    mixed::<_, Mixed<0b010>, K>(runtime, 2..=3);
+    mixed::<_, Mixed<0b110>, K>(runtime, 3..=3);
+    mixed::<_, Mixed<0b001>, K>(runtime, 2..=3);
+}
+
+// mixed runs fuzzed activity on as many mounts of one volume as mounts says, each strong or eventual as C says, and
+// fails if the strong mounts' history is not linearizable or an eventual mount does not serve the final version once
+// they settle.
+fn mixed<R: ReplayingRuntime, C: mount::Consistency, K: KernelModel>(
+    runtime: &R,
+    mounts: RangeInclusive<usize>,
+) where
+    Mount<C, K>: Operations,
+{
+    let tainted = AtomicUsize::new(0);
+    proptest!(config(K::REGRESSIONS), |(activity in simulated_activity(STRONG_FAULTS, mounts.clone()), seed in any::<u64>())| {
+        let left_out = simulate::<_, C, K>(runtime, Ending::Linearizable, activity, seed)?;
+        tainted.fetch_add(left_out, Ordering::Relaxed);
+    });
+    // UPSTREAM KERNEL BUG PIN: written to stderr directly, so the test harness does not capture it.
+    let _ = writeln!(
+        std::io::stderr(),
+        "left out {} reads answered with {}",
+        tainted.into_inner(),
+        K::TAINTED
+    );
 }
 
 // CASES is how many activities each check runs, unless PROPTEST_CASES says otherwise.
