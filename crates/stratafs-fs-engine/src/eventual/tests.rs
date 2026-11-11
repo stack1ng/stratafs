@@ -5,12 +5,15 @@ use std::time::Duration;
 
 use futures_core::future::BoxFuture;
 use futures_lite::future::{block_on, poll_once};
+use stratafs_pubsub_conformance::MemoryClient;
 
 use super::*;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::directories::NewItem;
 use crate::kernel_cache::{Answered, Asked, KernelCache, NoKernel, Uninvalidated};
-use crate::test_support::{InMemoryEngine, InMemoryStore, new_test_engine, new_test_engine_for};
+use crate::test_support::{
+    InMemoryEngine, InMemoryStore, PUBLISH_TIMEOUT, TestVolumes, new_test_engine,
+};
 use crate::{FsEngine, MountId, PurgeWaits, ResultHandling};
 
 // ChannelKernel is a kernel cache that sends each inode it is asked to invalidate.
@@ -51,25 +54,30 @@ impl KernelCache for ChannelKernel {
     }
 }
 
-// auto_invalidating_engine is a test engine whose inodes a kernel caches, with the inodes it invalidates.
-fn auto_invalidating_engine() -> (InMemoryEngine, mpsc::Receiver<Inode>) {
+// auto_invalidating_engine is a test engine of volumes whose inodes a kernel caches, with the inodes it invalidates.
+fn auto_invalidating_engine() -> (TestVolumes, InMemoryEngine, mpsc::Receiver<Inode>) {
     let (sender, invalidated) = mpsc::channel();
-    (new_test_engine_for(ChannelKernel(sender)), invalidated)
+    let volumes = TestVolumes::new();
+    let volume = volumes.create();
+    let engine = volumes.engine_with(volume, Eventual::default(), ChannelKernel(sender));
+    (volumes, engine, invalidated)
 }
 
 // another_client is a second engine on engine's store, whose inodes no kernel caches, so its writes are another
-// client's.
-fn another_client(engine: &InMemoryEngine) -> InMemoryEngine {
+// client's. It reaches the pub/sub of volumes, engine's.
+fn another_client(volumes: &TestVolumes, engine: &InMemoryEngine) -> InMemoryEngine {
     FsEngine {
         allocate_inode: engine.allocate_inode,
         allocate_content_id: engine.allocate_content_id,
         now: engine.now,
-        mount: Mount {
-            store: Arc::clone(&engine.mount.store),
-            kernel: Arc::new(NoKernel),
-            runtime: Arc::clone(&engine.mount.runtime),
-            id: MountId(2),
-        },
+        mount: Mount::new(
+            Arc::clone(&engine.mount.store),
+            Arc::new(NoKernel),
+            Arc::clone(&engine.mount.runtime),
+            MountId(2),
+            volumes.connect(),
+            PUBLISH_TIMEOUT,
+        ),
         durability_limit: None,
         consistency: Eventual::default(),
         config: PhantomData,
@@ -173,16 +181,16 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_it_is_deleted() {
 
 #[test]
 fn an_auto_invalidating_engine_invalidates_a_cached_inode_once_another_client_changes_it() {
-    let (engine, invalidated) = auto_invalidating_engine();
+    let (volumes, engine, invalidated) = auto_invalidating_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     engine.cached(inode, &seen);
-    write(&another_client(&engine), inode, b"elsewhere");
+    write(&another_client(&volumes, &engine), inode, b"elsewhere");
     assert_eq!(invalidated.recv_timeout(Duration::from_secs(10)), Ok(inode));
 }
 
 #[test]
 fn an_auto_invalidating_engine_leaves_a_cached_inode_alone_when_it_writes_the_inode_itself() {
-    let (engine, invalidated) = auto_invalidating_engine();
+    let (_volumes, engine, invalidated) = auto_invalidating_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     engine.cached(inode, &seen);
     write(&engine, inode, b"here");
@@ -191,11 +199,11 @@ fn an_auto_invalidating_engine_leaves_a_cached_inode_alone_when_it_writes_the_in
 
 #[test]
 fn an_auto_invalidating_engine_leaves_a_forgotten_inode_alone() {
-    let (engine, invalidated) = auto_invalidating_engine();
+    let (volumes, engine, invalidated) = auto_invalidating_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     engine.cached(inode, &seen);
     engine.forget(inode);
-    write(&another_client(&engine), inode, b"elsewhere");
+    write(&another_client(&volumes, &engine), inode, b"elsewhere");
     assert!(invalidated.recv_timeout(NOTHING_YET).is_err());
 }
 
@@ -203,13 +211,14 @@ fn an_auto_invalidating_engine_leaves_a_forgotten_inode_alone() {
 fn an_eventual_engine_retries_a_read_begun_before_the_kernel_last_let_go_of_an_inode() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"cached");
-    let reading = || Cached::<InMemoryStore>::reading(&engine.consistency);
+    let reading =
+        || Cached::<InMemoryStore, MemoryClient<u64>>::reading(&engine.consistency, &engine.mount);
     let reads = [(inode, seen)];
     let handling = |ticket| {
         engine.consistency.result_handling(
             &engine.mount,
             &reads,
-            &(),
+            &Pending::new(),
             ticket,
             ticket,
             PurgeWaits::OfOwnInode,
@@ -224,10 +233,10 @@ fn an_eventual_engine_retries_a_read_begun_before_the_kernel_last_let_go_of_an_i
 
 #[test]
 fn a_dropped_engine_leaves_what_it_cached_alone() {
-    let (engine, invalidated) = auto_invalidating_engine();
+    let (volumes, engine, invalidated) = auto_invalidating_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     engine.cached(inode, &seen);
-    let other = another_client(&engine);
+    let other = another_client(&volumes, &engine);
     drop(engine);
     write(&other, inode, b"elsewhere");
     assert!(invalidated.recv_timeout(NOTHING_YET).is_err());
@@ -236,20 +245,20 @@ fn a_dropped_engine_leaves_what_it_cached_alone() {
 #[test]
 fn an_auto_invalidating_engine_keeps_watching_after_its_own_write_and_invalidates_on_another_clients()
  {
-    let (engine, invalidated) = auto_invalidating_engine();
+    let (volumes, engine, invalidated) = auto_invalidating_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     engine.cached(inode, &seen);
     write(&engine, inode, b"here");
     assert!(invalidated.recv_timeout(NOTHING_YET).is_err());
-    write(&another_client(&engine), inode, b"elsewhere");
+    write(&another_client(&volumes, &engine), inode, b"elsewhere");
     assert_eq!(invalidated.recv_timeout(Duration::from_secs(10)), Ok(inode));
 }
 
 #[test]
 fn an_older_read_cached_after_a_newer_one_is_invalidated_for_a_change_between_them() {
-    let (engine, invalidated) = auto_invalidating_engine();
+    let (volumes, engine, invalidated) = auto_invalidating_engine();
     let (inode, older) = new_file(&engine, b"cached");
-    write(&another_client(&engine), inode, b"elsewhere");
+    write(&another_client(&volumes, &engine), inode, b"elsewhere");
     let newer =
         block_on(engine.read_transact(|txn| Box::pin(async move { txn.getattr(inode).await })))
             .unwrap()

@@ -5,7 +5,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -31,16 +31,17 @@ const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 // stuck.
 const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(120);
 
-// Store is a store directory with one volume in it, and the flags a mount of it takes.
+// Store is a store directory with one volume in it, the coordinator its mounts share, and the flags a mount of it takes.
 struct Store {
     directory: TempDir,
     volume: String,
     flags: Vec<String>,
+    _coordinator: Coordinator,
 }
 
 impl Store {
-    // new makes a store of database with one volume, mounted with consistency through coordinator, if any.
-    fn new(database: &str, consistency: &str, coordinator: Option<&str>) -> Store {
+    // new makes a store of database with one volume.
+    fn new(database: &str) -> Store {
         let directory = tempfile::tempdir().unwrap();
         let created = Command::new(DAEMON)
             .arg("create")
@@ -54,30 +55,30 @@ impl Store {
             String::from_utf8_lossy(&created.stderr)
         );
         let volume = String::from_utf8(created.stdout).unwrap().trim().to_owned();
-        let mut flags = vec![
+        let coordinator = Coordinator::start();
+        let flags = vec![
             "--store".to_owned(),
             database.to_owned(),
-            "--consistency".to_owned(),
-            consistency.to_owned(),
+            "--coordinator".to_owned(),
+            coordinator.url.clone(),
         ];
-        if let Some(coordinator) = coordinator {
-            flags.extend(["--coordinator".to_owned(), coordinator.to_owned()]);
-        }
         Store {
             directory,
             volume,
             flags,
+            _coordinator: coordinator,
         }
     }
 
-    // mount mounts the volume on a new directory, and returns once the kernel has it mounted.
-    fn mount(&self) -> Mounted {
+    // mount mounts the volume with consistency on a new directory, and returns once the kernel has it mounted.
+    fn mount(&self, consistency: &str) -> Mounted {
         let mount_point = tempfile::tempdir().unwrap();
         let daemon = Command::new(DAEMON)
             .arg("mount")
             .arg(self.directory.path())
             .arg(mount_point.path())
             .args(["--volume", &self.volume])
+            .args(["--consistency", consistency])
             .args(&self.flags)
             .stdin(Stdio::null())
             // The daemon writes nothing to its output, so the pipe's one event is closing when the daemon exits.
@@ -209,9 +210,9 @@ fn names(directory: &Path) -> Vec<String> {
 
 // one_mount drives a single mount of a fresh volume of database with consistency through every operation the test
 // covers, then checks what it wrote survives unmounting, and an fsync survives the daemon being killed.
-fn one_mount(database: &str, consistency: &str, coordinator: Option<&str>) {
-    let store = Store::new(database, consistency, coordinator);
-    let mounted = store.mount();
+fn one_mount(database: &str, consistency: &str) {
+    let store = Store::new(database);
+    let mounted = store.mount(consistency);
 
     // create, write and read
     fs::write(mounted.path("a.txt"), b"hello").unwrap();
@@ -311,7 +312,7 @@ fn one_mount(database: &str, consistency: &str, coordinator: Option<&str>) {
     // An unmount keeps everything committed.
     fs::write(mounted.path("unsynced"), b"kept on unmount").unwrap();
     mounted.unmount();
-    let mounted = store.mount();
+    let mounted = store.mount(consistency);
     assert_eq!(
         fs::read_to_string(mounted.path("unsynced")).unwrap(),
         "kept on unmount"
@@ -327,7 +328,7 @@ fn one_mount(database: &str, consistency: &str, coordinator: Option<&str>) {
     synced.sync_all().unwrap();
     drop(synced);
     mounted.kill();
-    let mounted = store.mount();
+    let mounted = store.mount(consistency);
     assert_eq!(
         fs::read_to_string(mounted.path("synced")).unwrap(),
         "kept through a crash"
@@ -335,7 +336,7 @@ fn one_mount(database: &str, consistency: &str, coordinator: Option<&str>) {
     mounted.unmount();
 }
 
-// Coordinator is a coordinator strong mounts share, running on a Tokio runtime of its own.
+// Coordinator is a coordinator the mounts of a volume share, running on a Tokio runtime of its own.
 struct Coordinator {
     _runtime: tokio::runtime::Runtime,
     url: String,
@@ -362,44 +363,40 @@ impl Coordinator {
 
 #[test]
 fn an_eventual_mdbx_volume() {
-    one_mount("mdbx", "eventual", None);
+    one_mount("mdbx", "eventual");
 }
 
 #[test]
 fn an_eventual_redb_volume() {
-    one_mount("redb", "eventual", None);
+    one_mount("redb", "eventual");
 }
 
 #[test]
 fn an_eventual_sqlite_volume() {
-    one_mount("sqlite", "eventual", None);
+    one_mount("sqlite", "eventual");
 }
 
 #[test]
 fn a_strong_mdbx_volume() {
-    let coordinator = Coordinator::start();
-    one_mount("mdbx", "strong", Some(&coordinator.url));
+    one_mount("mdbx", "strong");
 }
 
 #[test]
 fn a_strong_redb_volume() {
-    let coordinator = Coordinator::start();
-    one_mount("redb", "strong", Some(&coordinator.url));
+    one_mount("redb", "strong");
 }
 
 #[test]
 fn a_strong_sqlite_volume() {
-    let coordinator = Coordinator::start();
-    one_mount("sqlite", "strong", Some(&coordinator.url));
+    one_mount("sqlite", "strong");
 }
 
 // An append through a file opened to append lands at the end another mount moved, which this mount's kernel still
 // takes for where the file ends.
 #[test]
 fn an_append_lands_at_the_end_another_mount_moved() {
-    let coordinator = Coordinator::start();
-    let store = Store::new("mdbx", "strong", Some(&coordinator.url));
-    let (first, second) = (store.mount(), store.mount());
+    let store = Store::new("mdbx");
+    let (first, second) = (store.mount("strong"), store.mount("strong"));
     let append = |mounted: &Mounted| {
         OpenOptions::new()
             .create(true)
@@ -424,8 +421,8 @@ const CONVERGES_WITHIN: Duration = Duration::from_secs(1);
 // two_eventual_mounts has two daemons mount one volume of database eventually consistent, and checks that each sees
 // the other's changes to what it caches.
 fn two_eventual_mounts(database: &str) {
-    let store = Store::new(database, "eventual", None);
-    let (first, second) = (store.mount(), store.mount());
+    let store = Store::new(database);
+    let (first, second) = (store.mount("eventual"), store.mount("eventual"));
     fs::write(first.path("file"), b"one").unwrap();
     fs::write(first.path("gone"), b"").unwrap();
     assert_eq!(fs::read(second.path("file")).unwrap(), b"one");
@@ -456,10 +453,39 @@ fn two_eventual_sqlite_mounts_see_each_others_changes() {
     two_eventual_mounts("sqlite");
 }
 
+// A strong mount sees each of an eventual mount's changes to what its kernel caches as soon as the change returns:
+// content of another length, a mode, and a name it resolved that the eventual mount unlinks. Every write waits until
+// each strong mount dropped its copy.
+#[test]
+fn a_strong_mount_sees_an_eventual_mounts_changes_as_soon_as_they_return() {
+    let store = Store::new("mdbx");
+    let (strong, eventual) = (store.mount("strong"), store.mount("eventual"));
+    fs::write(eventual.path("file"), b"one").unwrap();
+    assert_eq!(fs::read(strong.path("file")).unwrap(), b"one");
+    fs::write(eventual.path("file"), b"three").unwrap();
+    assert_eq!(fs::read(strong.path("file")).unwrap(), b"three");
+    assert_eq!(fs::metadata(strong.path("file")).unwrap().len(), 5);
+    assert_ne!(
+        fs::metadata(strong.path("file")).unwrap().mode() & 0o777,
+        0o600
+    );
+    fs::set_permissions(eventual.path("file"), fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        fs::metadata(strong.path("file")).unwrap().mode() & 0o777,
+        0o600
+    );
+    File::create(eventual.path("gone")).unwrap();
+    assert!(strong.path("gone").exists());
+    fs::remove_file(eventual.path("gone")).unwrap();
+    assert!(!strong.path("gone").exists());
+    strong.unmount();
+    eventual.unmount();
+}
+
 // A mount serves only the user who mounted it, unless it allows other users.
 #[test]
 fn only_a_mount_that_allows_other_users_serves_them() {
-    let mut store = Store::new("mdbx", "eventual", None);
+    let mut store = Store::new("mdbx");
     let read_as_nobody = |mounted: &Mounted| {
         Command::new("cat")
             .arg(mounted.path("file"))
@@ -468,14 +494,14 @@ fn only_a_mount_that_allows_other_users_serves_them() {
             .output()
             .unwrap()
     };
-    let mounted = store.mount();
+    let mounted = store.mount("eventual");
     fs::write(mounted.path("file"), b"shared").unwrap();
     let refused = read_as_nobody(&mounted);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("Permission denied"));
     mounted.unmount();
     store.flags.push("--allow-other".to_owned());
-    let mounted = store.mount();
+    let mounted = store.mount("eventual");
     let read = read_as_nobody(&mounted);
     assert!(
         read.status.success(),
@@ -488,15 +514,15 @@ fn only_a_mount_that_allows_other_users_serves_them() {
 
 #[test]
 fn sigterm_unmounts_the_volume() {
-    let store = Store::new("mdbx", "eventual", None);
-    let mut mounted = store.mount();
+    let store = Store::new("mdbx");
+    let mut mounted = store.mount("eventual");
     fs::write(mounted.path("file"), b"kept on SIGTERM").unwrap();
     let daemon = Pid::from_raw(i32::try_from(mounted.daemon.id()).unwrap());
     kill(daemon, Signal::SIGTERM).unwrap();
     let status = mounted.daemon.wait().unwrap();
     assert!(status.success(), "the daemon exited with {status}");
     assert!(!mounted.is_mounted());
-    let mounted = store.mount();
+    let mounted = store.mount("eventual");
     assert_eq!(
         fs::read_to_string(mounted.path("file")).unwrap(),
         "kept on SIGTERM"
@@ -507,8 +533,8 @@ fn sigterm_unmounts_the_volume() {
 // SIGTERM while a file on the volume is open detaches the mount, which the daemon serves until the file closes.
 #[test]
 fn sigterm_while_a_file_is_open_unmounts_once_it_closes() {
-    let store = Store::new("mdbx", "eventual", None);
-    let mut mounted = store.mount();
+    let store = Store::new("mdbx");
+    let mut mounted = store.mount("eventual");
     let mut open = File::create(mounted.path("file")).unwrap();
     open.write_all(b"kept").unwrap();
     let daemon = Pid::from_raw(i32::try_from(mounted.daemon.id()).unwrap());
@@ -519,7 +545,7 @@ fn sigterm_while_a_file_is_open_unmounts_once_it_closes() {
     drop(open);
     let status = mounted.daemon.wait().unwrap();
     assert!(status.success(), "the daemon exited with {status}");
-    let mounted = store.mount();
+    let mounted = store.mount("eventual");
     assert_eq!(
         fs::read_to_string(mounted.path("file")).unwrap(),
         "kept while detached"

@@ -479,23 +479,25 @@ fn hard_unlinking_the_last_name_keeps_the_inode_until_it_is_deleted_if_unlinked(
 fn deleting_an_inode_leaves_its_pending_change_version_for_may_commit() {
     let engine = new_test_engine();
     let a = file(&engine, Inode::ROOT, b"a");
+    hard_unlink(&engine, Inode::ROOT, b"a", None).unwrap();
     let pending = || Bytes::from(FsKey::new_pending_change_version(a));
-    block_on(engine.transact(PurgeWaits::No, |mut txn| {
+    // The attempt that commits runs once the one before announced the inode's next version.
+    let kept = block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
-            let result = txn.metadata.set(pending(), Bytes::from_static(b"1"));
-            result.map(|()| ((), txn))
+            txn.delete_if_unlinked(a).await.unwrap();
+            let kept = stored(&*txn.metadata, pending()).await;
+            kept.map(|kept| (kept, txn))
         })
     }))
     .unwrap();
-    hard_unlink(&engine, Inode::ROOT, b"a", None).unwrap();
-    delete_if_unlinked(&engine, a);
+    assert!(kept.is_some());
     assert_eq!(stored_keys_of(&engine, a), 0);
-    let kept = block_on(
+    let cleared = block_on(
         engine
             .read_transact(|txn| Box::pin(async move { stored(&*txn.metadata, pending()).await })),
     )
     .unwrap();
-    assert_eq!(kept.as_deref(), Some(&b"1"[..]));
+    assert_eq!(cleared, None);
 }
 
 #[test]
@@ -586,8 +588,9 @@ fn set_hard_link_count(engine: &InMemoryEngine, inode: Inode, hard_link_count: u
     let mut attributes = getattr(engine, inode).unwrap();
     attributes.hard_link_count = hard_link_count;
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
-        let attributes = attributes.clone();
+        let mut attributes = attributes.clone();
         Box::pin(async move {
+            txn.record_change(inode, &mut attributes, txn.now());
             let result = txn.write_attributes(inode, &attributes);
             result.map(|result| (result, txn))
         })

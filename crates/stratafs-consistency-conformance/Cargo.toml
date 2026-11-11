@@ -17,6 +17,7 @@ redb = "4.4.0"
 stratafs-fs-engine.workspace = true
 stratafs-lock-synchronized.workspace = true
 stratafs-object-store.workspace = true
+stratafs-pubsub.workspace = true
 stratafs-pubsub-conformance.workspace = true
 stratafs-redb.workspace = true
 stratafs-runtime = { workspace = true, features = ["replay"] }

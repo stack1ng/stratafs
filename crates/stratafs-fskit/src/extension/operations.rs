@@ -32,6 +32,7 @@ use stratafs_fs_engine::kernel_cache::KernelCache;
 use stratafs_fs_engine::{
     Cached, FsConfig, FsEngine, FsTransaction, Inode, PurgeWaits, ResultHandling, Timestamp,
 };
+use stratafs_pubsub::PubSub;
 use stratafs_runtime::Runtime;
 use stratafs_store::content::ContentStore;
 use stratafs_store::durability::DurableAgainst;
@@ -186,15 +187,16 @@ pub(crate) trait VolumeOperations: Send + Sync {
 
 // Volume is a mounted volume's engine. Each operation replies when it finishes, on FSKit's thread unless it
 // has to wait, and then on runtime.
-pub(crate) struct Volume<St, A, N, S, C>
+pub(crate) struct Volume<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
-    pub(crate) engine: FsEngine<St, A, N, S, C>,
+    pub(crate) engine: FsEngine<St, P, A, N, S, C>,
     pub(crate) runtime: Arc<dyn Runtime>,
     pub(crate) items: Items,
     pub(crate) kernel: FsKitCache,
@@ -204,16 +206,17 @@ where
 
 // make_durable_on_cadence makes the volume durable against a power failure every period, on a thread of its own,
 // until the volume is dropped.
-pub(crate) fn make_durable_on_cadence<St, A, N, S, C>(
-    volume: Weak<Volume<St, A, N, S, C>>,
+pub(crate) fn make_durable_on_cadence<St, P, A, N, S, C>(
+    volume: Weak<Volume<St, P, A, N, S, C>>,
     stopped: mpsc::Receiver<()>,
     period: Duration,
 ) where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
     std::thread::Builder::new()
         .name("durability cadence".to_owned())
@@ -234,13 +237,14 @@ pub(crate) fn make_durable_on_cadence<St, A, N, S, C>(
 
 // Dropping the volume, which happens after its last operation, makes every commit durable, up to the engine's
 // durability limit.
-impl<St, A, N, S, C> Drop for Volume<St, A, N, S, C>
+impl<St, P, A, N, S, C> Drop for Volume<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
     fn drop(&mut self) {
         // The cadence's thread has stopped when the send fails.
@@ -289,13 +293,14 @@ const LISTING_BATCH: usize = 64;
 // FSKit never needs to start it over.
 const VERIFIER: FSDirectoryVerifier = 1;
 
-impl<St, A, N, S, C> VolumeOperations for Volume<St, A, N, S, C>
+impl<St, P, A, N, S, C> VolumeOperations for Volume<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
     fn items(&self) -> &Items {
         &self.items
@@ -1247,13 +1252,14 @@ where
     }
 }
 
-impl<St, A, N, S, C> Volume<St, A, N, S, C>
+impl<St, P, A, N, S, C> Volume<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
     // run runs an operation, handing it the volume, on FSKit's thread until it finishes or has to wait, such
     // as while the store's thread pool runs its transaction. An operation that has to wait finishes on the runtime, so

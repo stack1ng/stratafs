@@ -15,6 +15,7 @@ use fuser::{
 use stratafs_fs_engine::annotations::SetAnnotationMode;
 use stratafs_fs_engine::directories::{NewItem, RenameMode};
 use stratafs_fs_engine::{Cached, FsConfig, LARGEST_NAME_LENGTH, Timestamp};
+use stratafs_pubsub::PubSub;
 use stratafs_store::store::Store;
 
 use super::changes::{Requested, made};
@@ -45,41 +46,44 @@ fn max_background() -> io::Result<u16> {
 
 // StrataFileSystem is the file system FUSE serves. It turns each request into the volume's own terms and forwards it
 // to the volume's operations.
-pub(crate) struct StrataFileSystem<St, A, N, S, C>
+pub(crate) struct StrataFileSystem<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
-    volume: Arc<Volume<St, A, N, S, C>>,
+    volume: Arc<Volume<St, P, A, N, S, C>>,
 }
 
-impl<St, A, N, S, C> StrataFileSystem<St, A, N, S, C>
+impl<St, P, A, N, S, C> StrataFileSystem<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
-    pub(crate) fn new(volume: Arc<Volume<St, A, N, S, C>>) -> Self {
+    pub(crate) fn new(volume: Arc<Volume<St, P, A, N, S, C>>) -> Self {
         StrataFileSystem { volume }
     }
 
-    fn volume(&self) -> Arc<Volume<St, A, N, S, C>> {
+    fn volume(&self) -> Arc<Volume<St, P, A, N, S, C>> {
         Arc::clone(&self.volume)
     }
 }
 
-impl<St, A, N, S, C> Filesystem for StrataFileSystem<St, A, N, S, C>
+impl<St, P, A, N, S, C> Filesystem for StrataFileSystem<St, P, A, N, S, C>
 where
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
 {
     // init asks the kernel to list directories with attributes when that saves it lookups, to drop cached pages only
     // when the volume says so, to look names up in one directory at once, and to share a mapping of a file opened to

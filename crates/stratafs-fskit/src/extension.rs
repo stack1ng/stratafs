@@ -27,6 +27,7 @@ use objc2_foundation::{
 };
 use stratafs_fs_engine::error::PosixError;
 use stratafs_fs_engine::{Cached, FsConfig, FsEngine, Timestamp};
+use stratafs_pubsub::PubSub;
 use stratafs_runtime::Runtime;
 use stratafs_store::store::Store;
 
@@ -87,14 +88,14 @@ static OPEN_VOLUME: OnceLock<OpenVolume> = OnceLock::new();
 // finishes on runtime, so FSKit can hand over the next one. Store work that blocks without yielding, such as
 // file IO on this machine's disk, holds up that thread. runtime must run on threads of its own:
 // NSExtensionMain keeps the main thread.
-pub fn run<V, St, A, N, S, C, F>(
+pub fn run<V, St, P, A, N, S, C, F>(
     runtime: impl Runtime,
     open_volume: impl AsyncFn(
         &Path,
         V,
         FsKitCache,
         Arc<dyn Runtime>,
-    ) -> Result<FsEngine<St, A, N, S, C>, F>
+    ) -> Result<FsEngine<St, P, A, N, S, C>, F>
     + Send
     + Sync
     + 'static,
@@ -102,10 +103,11 @@ pub fn run<V, St, A, N, S, C, F>(
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
     F: Error + Send + Sync + 'static,
     for<'e> PosixError: From<&'e F>,
 {
@@ -135,14 +137,14 @@ const DURABILITY_CADENCE: Duration = Duration::from_secs(30);
 
 // opener wraps open_volume so it takes the store directory and activate's options, and returns the volume
 // as FSKit's classes hold it, running its operations on runtime.
-fn opener<V, St, A, N, S, C, F>(
+fn opener<V, St, P, A, N, S, C, F>(
     runtime: impl Runtime,
     open_volume: impl AsyncFn(
         &Path,
         V,
         FsKitCache,
         Arc<dyn Runtime>,
-    ) -> Result<FsEngine<St, A, N, S, C>, F>
+    ) -> Result<FsEngine<St, P, A, N, S, C>, F>
     + Send
     + Sync
     + 'static,
@@ -150,10 +152,11 @@ fn opener<V, St, A, N, S, C, F>(
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
     St: Store,
+    P: PubSub<Message = u64>,
     A: Fn() -> u64 + Send + Sync + 'static,
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
-    C: Cached<St>,
+    C: Cached<St, P>,
     F: Error + Send + Sync + 'static,
     for<'e> PosixError: From<&'e F>,
 {

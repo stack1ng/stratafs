@@ -6,19 +6,20 @@ pub mod suite;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(consistency = "strong")]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_executor::ThreadPool as SpawnerPool;
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 #[cfg(consistency = "eventual")]
 use stratafs_fs_engine::Eventual;
 #[cfg(consistency = "strong")]
 use stratafs_fs_engine::StrongUntilDisconnectCached;
 use stratafs_fs_engine::error::{EngineFailure, PosixError};
+use stratafs_fs_engine::holds::{ConnectFailure, Failure};
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
 use stratafs_fs_engine::spillable::{ContentHash, referenced_content};
-use stratafs_fs_engine::{Cached, FsConfig, FsEngine, MountId, Timestamp};
+use stratafs_fs_engine::{FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_store::content::{ContentId, ContentReference};
 use stratafs_store::durability::DurableAgainst;
@@ -30,6 +31,7 @@ use stratafs_tree::header::TreeVolumeId;
 use stratafs_tree::tree::PinnedConfigError;
 use stratafs_tree::tree::{Tree, TreeConfig};
 use stratafs_tree::volume::TreeVolume;
+use stratafs_websocket_pubsub::client::Client;
 
 // The tuning constants come from the build's environment, so the benchmark builds once per configuration.
 // A store remembers the tree constants it was made with, and refuses to open with others.
@@ -141,18 +143,21 @@ pub type BenchVolume = TreeVolume<Database, fn() -> u128, BenchTreeConfig>;
 type VolumeRejection = <BenchVolume as KeyValueStore>::Rejection;
 type VolumeFailure = <BenchVolume as KeyValueStore>::Failure;
 
-// The consistency comes from the build's environment too, as STRATAFS_BENCH_CONSISTENCY: eventual, or strong, whose
-// mounts reach the coordinator whose URL is in the store directory's coordinator file.
+// The consistency comes from the build's environment too, as STRATAFS_BENCH_CONSISTENCY: eventual or strong. Every
+// mount reaches the coordinator whose URL is in the store directory's coordinator file.
 #[cfg(consistency = "eventual")]
 pub type BenchConsistency = Eventual;
 #[cfg(consistency = "strong")]
-pub type BenchConsistency =
-    StrongUntilDisconnectCached<stratafs_websocket_pubsub::client::Client<u64>>;
+pub type BenchConsistency = StrongUntilDisconnectCached;
 
-pub type BenchEngine =
-    FsEngine<BenchVolume, fn() -> u64, fn() -> Timestamp, BenchFsConfig, BenchConsistency>;
-
-type ConsistencyFailure = <BenchConsistency as Cached<BenchVolume>>::Failure;
+pub type BenchEngine = FsEngine<
+    BenchVolume,
+    Client<u64>,
+    fn() -> u64,
+    fn() -> Timestamp,
+    BenchFsConfig,
+    BenchConsistency,
+>;
 
 // Store is the store directory opened: the tree holding every volume.
 pub struct Store {
@@ -181,6 +186,7 @@ pub enum OpenStoreError {
     Content(#[source] stratafs_object_store::ObjectStoreError),
 }
 
+#[allow(clippy::type_complexity)]
 #[derive(Debug, thiserror::Error)]
 pub enum OpenVolumeError {
     #[error(transparent)]
@@ -194,11 +200,10 @@ pub enum OpenVolumeError {
         #[source]
         TransactError<
             VolumeRejection,
-            EngineFailure<VolumeFailure, ConsistencyFailure>,
+            EngineFailure<VolumeFailure, Failure<Client<u64>, BenchVolume>>,
             StoreError<VolumeRejection, VolumeFailure>,
         >,
     ),
-    #[cfg(consistency = "strong")]
     #[error("the runtime the coordinator's client runs on could not start")]
     Runtime(#[source] io::Error),
 }
@@ -220,11 +225,10 @@ impl From<&OpenVolumeError> for PosixError {
         match error {
             OpenVolumeError::Store(OpenStoreError::AlreadyOpen) => PosixError::EBUSY,
             OpenVolumeError::UnknownVolume => PosixError::ENOENT,
-            OpenVolumeError::Store(_) | OpenVolumeError::Volume(_) | OpenVolumeError::Root(_) => {
-                PosixError::EIO
-            }
-            #[cfg(consistency = "strong")]
-            OpenVolumeError::Runtime(_) => PosixError::EIO,
+            OpenVolumeError::Store(_)
+            | OpenVolumeError::Volume(_)
+            | OpenVolumeError::Root(_)
+            | OpenVolumeError::Runtime(_) => PosixError::EIO,
         }
     }
 }
@@ -330,7 +334,9 @@ async fn engine(
         now as fn() -> Timestamp,
         MountId(rand::random()),
         DURABILITY_LIMIT,
-        consistency(directory, volume)?,
+        connect(directory, volume)?,
+        PUBLISH_TIMEOUT,
+        consistency(),
         kernel,
         runtime,
     )
@@ -339,29 +345,30 @@ async fn engine(
 }
 
 #[cfg(consistency = "eventual")]
-fn consistency(
-    _directory: &Path,
-    _volume: TreeVolumeId,
-) -> Result<BenchConsistency, OpenVolumeError> {
-    Ok(Eventual::default())
+fn consistency() -> BenchConsistency {
+    Eventual::default()
+}
+
+#[cfg(consistency = "strong")]
+fn consistency() -> BenchConsistency {
+    StrongUntilDisconnectCached
 }
 
 // PUBLISH_TIMEOUT is how long a write waits for every other mount holding what it changes. It is longer than the
 // coordinator takes to drop a mount that went silent, so only a coordinator that stopped answering fails a write.
-#[cfg(consistency = "strong")]
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
-// consistency is the strong consistency of a mount of volume. Each connect reads the coordinator's URL from the
-// directory's coordinator file, so making a volume needs no coordinator, and joins /volume/<its id> there, as each
-// volume's inodes are its own keys. The client runs on a Tokio runtime of its own, which the consistency keeps.
-#[cfg(consistency = "strong")]
-fn consistency(
+// connect connects a mount of volume to the coordinator. Each connect reads the coordinator's URL from the directory's
+// coordinator file, so making a volume needs no coordinator, and joins /volume/<its id> there, as each volume's inodes
+// are its own keys. The client runs on a Tokio runtime of its own, which connect keeps.
+#[allow(clippy::type_complexity)]
+fn connect(
     directory: &Path,
     volume: TreeVolumeId,
-) -> Result<BenchConsistency, OpenVolumeError> {
-    use futures_util::FutureExt;
-    use stratafs_fs_engine::strong::ConnectFailure;
-
+) -> Result<
+    impl Fn() -> BoxFuture<'static, Result<Client<u64>, ConnectFailure>> + Send + Sync + 'static,
+    OpenVolumeError,
+> {
     let coordinator = directory.join("coordinator");
     let volume = hex::encode(bytes::Bytes::from(volume));
     let client_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -374,7 +381,7 @@ fn consistency(
         let connecting = Connecting(client_runtime.spawn(async move {
             let url = std::fs::read_to_string(coordinator)?;
             let url = format!("{}/volume/{volume}", url.trim().trim_end_matches('/'));
-            let client = stratafs_websocket_pubsub::client::Client::connect(&url).await?;
+            let client = Client::connect(&url).await?;
             Ok::<_, ConnectFailure>(client)
         }));
         async move {
@@ -383,15 +390,13 @@ fn consistency(
         }
         .boxed()
     };
-    Ok(StrongUntilDisconnectCached::new(connect, PUBLISH_TIMEOUT))
+    Ok(connect)
 }
 
 // Connecting is a connect running on the client's runtime, which stops when nothing waits for it any more, such as
-// once the consistency's connect time limit passes.
-#[cfg(consistency = "strong")]
+// once the engine's connect time limit passes.
 struct Connecting<T>(tokio::task::JoinHandle<T>);
 
-#[cfg(consistency = "strong")]
 impl<T> Drop for Connecting<T> {
     fn drop(&mut self) {
         self.0.abort();
