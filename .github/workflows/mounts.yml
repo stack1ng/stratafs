@@ -42,46 +42,21 @@ jobs:
           ! mountpoint -q "$mount_point"
 
   macos-probe:
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [xcode-27, macos-26]
-    runs-on: ${{ matrix.runner }}
+    runs-on: xcode-27
     steps:
+      - uses: actions/checkout@v4
       - name: System
         run: |
           sw_vers
-          uname -a
           csrutil status || true
-          id
-          stat -f '%Su owns the console' /dev/console
-          sysctl kern.hv_vmm_present
-          system_profiler SPHardwareDataType | grep -E "Model|Chip|UDID|Memory" || true
-      - name: FSKit on the image
-        run: |
-          ls /System/Library/Frameworks/FSKit.framework || true
-          ls /usr/libexec | grep -i fskit || true
-          ls /System/Library/ExtensionKit/Extensions | grep -i -E "fskit|FSKit" || true
-          pluginkit -m -v -p com.apple.fskit.fsmodule || true
-          pgrep -fl fskit || true
-      - name: Where FSKit keeps its enabled modules
-        run: |
-          ls -la ~/Library/Containers | grep -i fskit || true
-          ls -la ~/Library/Group\ Containers | grep -i fskit || true
-          for directory in ~/Library/Containers/com.apple.fskit.ModuleEnablement ~/Library/Group\ Containers/group.com.apple.fskit.settings; do
-            echo "== $directory"
-            sudo find "$directory" -maxdepth 6 -exec ls -lad {} \; 2>&1 | head -60 || true
-            sudo find "$directory" -type f -name "*.plist" -exec sh -c 'echo "-- $1"; plutil -p "$1"' _ {} \; 2>&1 | head -120 || true
-          done
-          sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" "select service, client, auth_value from access limit 5" || true
-      - name: Mount with a module the system ships
-        run: |
-          hdiutil create -size 20m -fs "MS-DOS FAT32" -volname PROBE "$RUNNER_TEMP/fat.dmg"
-          hdiutil attach -nomount "$RUNNER_TEMP/fat.dmg" | tee "$RUNNER_TEMP/attached"
-          device=$(awk '/DOS_FAT_32|Windows_FAT_32/ {print $1}' "$RUNNER_TEMP/attached" | tail -1)
-          echo "device $device"
-          mkdir -p "$RUNNER_TEMP/fat"
-          mount -F -t msdos "$device" "$RUNNER_TEMP/fat" || echo "mount -F failed with $?"
-          mount | tail -4
-          ls -la "$RUNNER_TEMP/fat" || true
-          log show --last 3m --style compact --predicate 'process == "fskitd" OR process == "fskit_agent" OR subsystem CONTAINS[c] "fskit"' 2>/dev/null | tail -40 || true
+          system_profiler SPHardwareDataType | grep -E "Model Identifier|UDID" || true
+          xcodebuild -version || true
+      - name: Install the toolchain rust-toolchain.toml names
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the benchmark module and its create command
+        env:
+          STRATAFS_BENCH_STORE: sqlite
+        run: cargo build --release --locked --package stratafs-bench --bins
+      - name: Enable the module and mount a volume through FSKit
+        run: .github/scripts/macos-mount-probe.sh
