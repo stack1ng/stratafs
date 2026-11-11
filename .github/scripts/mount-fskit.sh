@@ -18,12 +18,9 @@ keychain_password=$(uuidgen)
 security create-keychain -p "$keychain_password" "$keychain"
 security set-keychain-settings "$keychain"
 security unlock-keychain -p "$keychain_password" "$keychain"
-# The certificate was packaged with an encryption the keychain cannot read, so the system's openssl packages it again.
-base64 --decode <<< "$DEVELOPER_ID_CERTIFICATE" > "$RUNNER_TEMP/packaged.p12"
-/usr/bin/openssl pkcs12 -in "$RUNNER_TEMP/packaged.p12" -passin env:DEVELOPER_ID_CERTIFICATE_PASSWORD -nodes -out "$RUNNER_TEMP/identity.pem"
-/usr/bin/openssl pkcs12 -export -in "$RUNNER_TEMP/identity.pem" -passout env:DEVELOPER_ID_CERTIFICATE_PASSWORD -out "$RUNNER_TEMP/certificate.p12"
+base64 --decode <<< "$DEVELOPER_ID_CERTIFICATE" > "$RUNNER_TEMP/certificate.p12"
 security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$DEVELOPER_ID_CERTIFICATE_PASSWORD" -T /usr/bin/codesign > /dev/null
-rm "$RUNNER_TEMP/packaged.p12" "$RUNNER_TEMP/identity.pem" "$RUNNER_TEMP/certificate.p12"
+rm "$RUNNER_TEMP/certificate.p12"
 security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
 security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
 identity=$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ {print $2; exit}')
