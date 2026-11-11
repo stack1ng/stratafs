@@ -13,6 +13,9 @@ use crate::snapshot::{Snapshot, difference, snapshot};
 use crate::{ConsistencyKind, Mount, Progress};
 
 // SHARED is the directory every thread changes when more than one runs.
+// TODO: check it against the native file system too, by logging when each call starts and returns and replaying the
+// calls there in an order that fits. Currently the upstream kernels have bugs that prevent this test from being possible...
+// if they ever get in a working state, we can make this test a thing.
 pub const SHARED: &str = "shared";
 
 // SHARED_ERRORS are the errors an operation on the shared directory may fail with, as another thread may have changed
