@@ -7,7 +7,12 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(target_os = "macos")]
 fn main() {
+    use std::path::Path;
+
     use futures_executor::ThreadPool;
+    use stratafs_bench::{OpenVolumeError, open_volume};
+    use stratafs_fs_engine::{Eventual, StrongUntilDisconnectCached};
+    use stratafs_fskit::mount_options::ConsistencyKind;
     use stratafs_runtime::ThreadPoolRuntime;
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::layer::SubscriberExt;
@@ -30,7 +35,25 @@ fn main() {
     }));
     // Operations that have to wait, such as while commits are made durable, finish on the pool's threads.
     let pool = ThreadPool::new().expect("the operating system starts the pool's threads");
-    stratafs_fskit::extension::run(ThreadPoolRuntime(pool), stratafs_bench::open_volume)
+    stratafs_fskit::extension::run(
+        ThreadPoolRuntime(pool),
+        async |directory: &Path, volume, consistency, kernel, runtime| {
+            Ok::<_, OpenVolumeError>(match consistency {
+                ConsistencyKind::Strong => {
+                    let consistency = StrongUntilDisconnectCached;
+                    open_volume(directory, volume, consistency, kernel, runtime)
+                        .await?
+                        .into()
+                }
+                ConsistencyKind::Eventual => {
+                    let consistency = Eventual::default();
+                    open_volume(directory, volume, consistency, kernel, runtime)
+                        .await?
+                        .into()
+                }
+            })
+        },
+    )
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -47,6 +47,9 @@ pub enum TargetConfig {
         name: String,
         store: PathBuf,
         mount_point: PathBuf,
+        // consistency is what the mount's reads promise about other mounts' writes: strong or eventual.
+        #[serde(default = "eventual")]
+        consistency: String,
     },
     // Juicefs is a JuiceFS volume kept in a store directory, with SQLite metadata and its blobs in the same
     // directory, mounted with the juicefs binary.
@@ -68,6 +71,10 @@ fn one() -> u32 {
 
 fn large() -> String {
     "large".to_owned()
+}
+
+fn eventual() -> String {
+    "eventual".to_owned()
 }
 
 fn hundred_thousand() -> u32 {

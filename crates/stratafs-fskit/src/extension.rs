@@ -31,7 +31,7 @@ use stratafs_pubsub::PubSub;
 use stratafs_runtime::Runtime;
 use stratafs_store::store::Store;
 
-use crate::mount_options::MountOptions;
+use crate::mount_options::{ConsistencyKind, MountOptions};
 use file_system::StrataFileSystem;
 use items::Items;
 use operations::{Volume, VolumeOperations, make_durable_on_cadence};
@@ -42,6 +42,42 @@ use volume::StrataVolume;
 pub(crate) struct OpenedVolume {
     id: Bytes,
     operations: Arc<dyn VolumeOperations>,
+}
+
+// OpenedEngine is the engine run's open_volume opened, of whichever consistency the mount named. It becomes the
+// volume's operations once it has the runtime, the kernel cache and the durability cadence.
+#[allow(clippy::type_complexity)]
+pub struct OpenedEngine(
+    Box<dyn FnOnce(Arc<dyn Runtime>, FsKitCache, Duration) -> Arc<dyn VolumeOperations>>,
+);
+
+impl<St, P, A, N, S, C> From<FsEngine<St, P, A, N, S, C>> for OpenedEngine
+where
+    St: Store,
+    P: PubSub<Message = u64>,
+    A: Fn() -> u64 + Send + Sync + 'static,
+    N: Fn() -> Timestamp + Send + Sync + 'static,
+    S: FsConfig,
+    C: Cached<St, P>,
+{
+    fn from(engine: FsEngine<St, P, A, N, S, C>) -> Self {
+        OpenedEngine(Box::new(move |runtime, kernel, durability_cadence| {
+            let (stops_durability_cadence, durability_cadence_stopped) = mpsc::channel();
+            let volume = Arc::new(Volume {
+                engine,
+                runtime,
+                items: Items::default(),
+                kernel,
+                stops_durability_cadence,
+            });
+            make_durable_on_cadence(
+                Arc::downgrade(&volume),
+                durability_cadence_stopped,
+                durability_cadence,
+            );
+            volume
+        }))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,33 +117,29 @@ static OPEN_VOLUME: OnceLock<OpenVolume> = OnceLock::new();
 
 // run starts the FSKit extension and never returns. The extension binary's main calls it.
 // When FSKit activates a mounted volume, run's open_volume opens it from the store directory mount was
-// given and the volume its -o volume option names, as an engine that keeps the kernel cache it is handed in line,
-// running its tasks on the runtime it is handed. Its errors reach mount as the POSIX errors they stand for.
+// given, the volume its -o volume option names and the consistency its -o consistency option names, as an engine that
+// keeps the kernel cache it is handed in line, running its tasks on the runtime it is handed. Its errors reach mount as
+// the POSIX errors they stand for.
 // FSKit hands every operation over on one thread and does not wait for the reply. Each operation runs on
 // that thread until it finishes or yields, as a store does while it waits for the disk to make commits durable, and then
 // finishes on runtime, so FSKit can hand over the next one. Store work that blocks without yielding, such as
 // file IO on this machine's disk, holds up that thread. runtime must run on threads of its own:
 // NSExtensionMain keeps the main thread.
-pub fn run<V, St, P, A, N, S, C, F>(
+pub fn run<V, F>(
     runtime: impl Runtime,
     open_volume: impl AsyncFn(
         &Path,
         V,
+        ConsistencyKind,
         FsKitCache,
         Arc<dyn Runtime>,
-    ) -> Result<FsEngine<St, P, A, N, S, C>, F>
+    ) -> Result<OpenedEngine, F>
     + Send
     + Sync
     + 'static,
 ) -> !
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
-    St: Store,
-    P: PubSub<Message = u64>,
-    A: Fn() -> u64 + Send + Sync + 'static,
-    N: Fn() -> Timestamp + Send + Sync + 'static,
-    S: FsConfig,
-    C: Cached<St, P>,
     F: Error + Send + Sync + 'static,
     for<'e> PosixError: From<&'e F>,
 {
@@ -137,26 +169,21 @@ const DURABILITY_CADENCE: Duration = Duration::from_secs(30);
 
 // opener wraps open_volume so it takes the store directory and activate's options, and returns the volume
 // as FSKit's classes hold it, running its operations on runtime.
-fn opener<V, St, P, A, N, S, C, F>(
+fn opener<V, F>(
     runtime: impl Runtime,
     open_volume: impl AsyncFn(
         &Path,
         V,
+        ConsistencyKind,
         FsKitCache,
         Arc<dyn Runtime>,
-    ) -> Result<FsEngine<St, P, A, N, S, C>, F>
+    ) -> Result<OpenedEngine, F>
     + Send
     + Sync
     + 'static,
 ) -> OpenVolume
 where
     V: Clone + Into<Bytes> + TryFrom<Bytes, Error: Error + Send + Sync + 'static>,
-    St: Store,
-    P: PubSub<Message = u64>,
-    A: Fn() -> u64 + Send + Sync + 'static,
-    N: Fn() -> Timestamp + Send + Sync + 'static,
-    S: FsConfig,
-    C: Cached<St, P>,
     F: Error + Send + Sync + 'static,
     for<'e> PosixError: From<&'e F>,
 {
@@ -173,6 +200,7 @@ where
         let engine = block_on(open_volume(
             store,
             options.volume,
+            options.consistency,
             kernel.clone(),
             runtime.clone(),
         ))
@@ -180,23 +208,12 @@ where
             posix: PosixError::from(&error),
             source: Box::new(error),
         })?;
-        let (stops_durability_cadence, durability_cadence_stopped) = mpsc::channel();
-        let volume = Arc::new(Volume {
-            engine,
-            runtime: runtime.clone(),
-            items: Items::default(),
+        let operations = (engine.0)(
+            runtime.clone(),
             kernel,
-            stops_durability_cadence,
-        });
-        make_durable_on_cadence(
-            Arc::downgrade(&volume),
-            durability_cadence_stopped,
             options.durability_cadence.unwrap_or(DURABILITY_CADENCE),
         );
-        Ok(OpenedVolume {
-            id,
-            operations: volume,
-        })
+        Ok(OpenedVolume { id, operations })
     })
 }
 

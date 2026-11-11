@@ -2060,6 +2060,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-e2e"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "hex",
+ "nix",
+ "rand 0.10.3",
+ "stratafs-fskit",
+ "stratafs-websocket-pubsub-native",
+ "tokio",
+]
+
+[[package]]
 name = "stratafs-fs-engine"
 version = "0.1.0"
 dependencies = [

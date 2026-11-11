@@ -32,6 +32,13 @@ enum Task {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
+    #[command(
+        about = "Build stratafs-fuse and stratafs-e2e on Linux, in the Docker container stratafs-fuse's tests use, and run stratafs-e2e there with the arguments"
+    )]
+    E2e {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
 }
 
 // Configuration is the build's tuning constants. Each one left out keeps stratafs-bench's default.
@@ -57,11 +64,6 @@ struct Configuration {
         help = "The most the engine makes commits durable against: none, software or power"
     )]
     durability: Option<String>,
-    #[arg(
-        long,
-        help = "What a mount's reads promise about other mounts' writes: eventual or strong"
-    )]
-    consistency: Option<String>,
 }
 
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister";
@@ -108,6 +110,7 @@ fn main() -> ExitCode {
         Task::Bundle(configuration) => bundle(&configuration),
         Task::Juicefs => juicefs(),
         Task::FuseTest { arguments } => fuse_test(&arguments),
+        Task::E2e { arguments } => e2e(&arguments),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -166,10 +169,6 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
         (
             "STRATAFS_BENCH_MDBX_SYNC_BYTES",
             configuration.mdbx_sync_bytes.map(|value| value.to_string()),
-        ),
-        (
-            "STRATAFS_BENCH_CONSISTENCY",
-            configuration.consistency.clone(),
         ),
     ] {
         match value {
@@ -294,10 +293,26 @@ const FUSE_TARGET: &str = "stratafs-fuse-target";
 // FUSE_LEFT_OUT are the workspace's paths the container has no use for, by tar's exclude patterns.
 const FUSE_LEFT_OUT: [&str; 4] = ["./target", "./.git", "./.direnv", "node_modules"];
 
-// fuse_test builds the test image, copies the workspace's sources into a volume, and runs stratafs-fuse's tests in a
+// fuse_test runs stratafs-fuse's tests in the Linux container.
+fn fuse_test(arguments: &[String]) -> Result<(), String> {
+    let mut command = vec!["cargo", "test", "--locked", "--package", "stratafs-fuse"];
+    command.extend(arguments.iter().map(String::as_str));
+    in_linux_container(&command)
+}
+
+// e2e builds stratafs-fuse and stratafs-e2e in the Linux container, and runs stratafs-e2e there with arguments.
+fn e2e(arguments: &[String]) -> Result<(), String> {
+    let build = "cargo build --release --locked --package stratafs-fuse --package stratafs-e2e";
+    let run = format!("{build} && exec /target/release/stratafs-e2e \"$@\"");
+    let mut command = vec!["sh", "-c", &run, "stratafs-e2e"];
+    command.extend(arguments.iter().map(String::as_str));
+    in_linux_container(&command)
+}
+
+// in_linux_container builds the test image, copies the workspace's sources into a volume, and runs command in a
 // container with /dev/fuse and the right to mount. The copy writes only files whose contents changed, so cargo rebuilds
 // only those, and it needs nothing of Docker's file sharing.
-fn fuse_test(arguments: &[String]) -> Result<(), String> {
+fn in_linux_container(command: &[&str]) -> Result<(), String> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask sits in the workspace root");
@@ -358,8 +373,7 @@ fn fuse_test(arguments: &[String]) -> Result<(), String> {
         .arg("--volume")
         .arg(format!("{FUSE_TARGET}:/target"))
         .arg(FUSE_IMAGE)
-        .args(["cargo", "test", "--locked", "--package", "stratafs-fuse"])
-        .args(arguments))
+        .args(command))
 }
 
 // signing finds Xcode's provisioning profile for the module on this Mac and a signing identity in the keychain
