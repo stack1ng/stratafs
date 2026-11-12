@@ -2248,6 +2248,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratafs-merkle-radix-tree"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "digest",
+ "stratafs-store",
+ "thiserror",
+]
+
+[[package]]
 name = "stratafs-object-store"
 version = "0.1.0"
 dependencies = [
