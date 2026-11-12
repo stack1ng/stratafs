@@ -8,8 +8,15 @@ license.workspace = true
 [dependencies]
 bytes.workspace = true
 digest.workspace = true
+futures-util.workspace = true
 stratafs-store.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+hex.workspace = true
+proptest.workspace = true
+sha2 = "0.11"
 
 [lints]
 workspace = true
