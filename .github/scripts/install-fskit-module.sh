@@ -1,10 +1,10 @@
 #!/bin/bash
-# Assembles the benchmark FSKit module, signs it with the Developer ID identity and provisioning profile the
+# Assembles the stratafs-local FSKit module, signs it with the Developer ID identity and provisioning profile the
 # environment carries, and enables it in FSKit's list of enabled modules.
 set -euo pipefail
 
 workspace=$(pwd)
-sources=$workspace/crates/stratafs-bench/bundle
+sources=$workspace/crates/stratafs-local/bundle
 built=$workspace/target/release
 app=$workspace/target/bench/StrataBench.app
 appex=$app/Contents/Extensions/StrataBench.appex
@@ -26,9 +26,9 @@ security list-keychains -d user -s "$keychain" $(security list-keychains -d user
 identity=$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ {print $2; exit}')
 
 mkdir -p "$appex/Contents/MacOS" "$app/Contents/MacOS"
-cp "$built/stratafs-bench-extension" "$appex/Contents/MacOS/"
+cp "$built/stratafs-local-module" "$appex/Contents/MacOS/"
 cp "$sources/extension/Info.plist" "$appex/Contents/Info.plist"
-cp "$built/stratafs-bench-host" "$app/Contents/MacOS/"
+cp "$built/stratafs-local-host" "$app/Contents/MacOS/"
 cp "$sources/host/Info.plist" "$app/Contents/Info.plist"
 base64 --decode <<< "$FSKIT_PROVISIONING_PROFILE" > "$appex/Contents/embedded.provisionprofile"
 

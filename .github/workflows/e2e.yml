@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   e2e:
-    name: ${{ matrix.system }}, ${{ matrix.mounts }}, ${{ matrix.threads }} threads
+    name: ${{ matrix.system }}, ${{ matrix.mounts }}, ${{ matrix.threads }} threads ${{ matrix.signing }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -21,6 +21,8 @@ jobs:
         system: [linux, macos]
         mounts: ["--strong 1", "--eventual 1", "--strong 2 --eventual 2"]
         threads: [1, 4]
+        # A signed volume's mounts sign what they write and verify what they read.
+        signing: ["", "--signed"]
         include:
           # A new volume's root belongs to root, and only the user who mounted a volume reaches it, so root runs it.
           - system: linux
@@ -46,15 +48,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.system }}
-      - name: Build stratafs-e2e and the FUSE daemon
+      - name: Build stratafs-e2e and stratafs-local
         if: matrix.system == 'linux'
-        run: cargo build --release --locked --package stratafs-e2e --package stratafs-fuse
-      # More than one mount of a volume needs a store several processes can open, which sqlite is.
-      - name: Build stratafs-e2e and the benchmark FSKit module
+        run: cargo build --release --locked --package stratafs-e2e --package stratafs-local
+      - name: Build stratafs-e2e and the stratafs-local FSKit module
         if: matrix.system == 'macos'
-        env:
-          STRATAFS_BENCH_STORE: sqlite
-        run: cargo build --release --locked --package stratafs-e2e --package stratafs-bench --bins
+        run: cargo build --release --locked --package stratafs-e2e --package stratafs-local --bins
       - name: Sign the FSKit module and enable it
         if: matrix.system == 'macos'
         env:
@@ -68,9 +67,10 @@ jobs:
         shell: bash
         run: >-
           ${{ matrix.sudo }} target/release/stratafs-e2e ${{ matrix.mounts }} --threads ${{ matrix.threads }}
+          ${{ matrix.signing }}
           --directory "$RUNNER_TEMP/e2e"
       - name: Show the FSKit module's errors
         if: failure() && matrix.system == 'macos'
         run: >-
           log show --last 30m --style compact
-          --predicate 'process == "stratafs-bench-extension" AND messageType >= 16' | tail -200
+          --predicate 'process == "stratafs-local-module" AND messageType >= 16' | tail -200

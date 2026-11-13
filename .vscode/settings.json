@@ -6,6 +6,7 @@
   "rust-analyzer.server.path": "rust-analyzer",
   "rust-analyzer.check.command": "clippy",
   "rust-analyzer.cargo.features": "all",
+  "rust-analyzer.diagnostics.disabled": ["unlinked-file"],
   "rust-analyzer.testExplorer": true,
   "[toml]": {
     "editor.defaultFormatter": "tamasfe.even-better-toml"
@@ -17,7 +18,11 @@
   "nix.serverPath": "nixd",
   "nix.serverSettings": {
     "nixd": {
-      "formatting": { "command": ["nixfmt"] }
+      "formatting": {
+        "command": [
+          "nixfmt"
+        ]
+      }
     }
   },
   "[json]": {
@@ -27,6 +32,8 @@
     "editor.defaultFormatter": "vscode.json-language-features"
   },
   "direnv.restart.automatic": true,
-  "direnv.extraEnv": { "XPC_SERVICE_NAME": "0" },
+  "direnv.extraEnv": {
+    "XPC_SERVICE_NAME": "0"
+  },
   "nixEnvSelector.suggestion": false
 }
