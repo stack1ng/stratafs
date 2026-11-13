@@ -317,9 +317,9 @@ fn without_attributes(
         .map(|file| file.as_ref().map(|(inode, _, content)| (*inode, content)))
 }
 
-// settled_own_write says whether the file served differs from the one stored only in a change version one older, where
+// settled_own_write says whether the file served differs from the one stored only in an older change version, where
 // the stored one is mount's. A settle of mount's own write moves the change version and nothing else, which mount's auto
-// invalidator takes for its own change, so it keeps its copy.
+// invalidator takes for its own change, so it keeps its copy, through as many settles in a row as mount's writes fail.
 fn settled_own_write(
     served: &Option<Option<(Inode, Attributes, Bytes)>>,
     stored: &Option<Option<(Inode, Attributes, Bytes)>>,
@@ -336,7 +336,7 @@ fn settled_own_write(
     };
     served_inode == inode
         && served_content == content
-        && served.change_version.number + 1 == stored.change_version.number
+        && served.change_version.number < stored.change_version.number
         && stored.change_version.mount == mount
         && with_stored_version(served) == *stored
 }
