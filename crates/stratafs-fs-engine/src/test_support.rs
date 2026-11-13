@@ -18,6 +18,7 @@ use stratafs_object_store::{ObjectStoreContentStore, ObjectStoreError};
 use stratafs_pubsub::PubSub;
 use stratafs_pubsub_conformance::{MemoryClient, MemoryVolume};
 use stratafs_redb::{RedbFailure, RedbStore};
+use stratafs_round_trips::CountedStore;
 use stratafs_runtime::{TaskDroppingRuntime, ThreadPoolRuntime};
 use stratafs_store::content::{ContentId, ContentReference, ContentStore, GetRejection};
 use stratafs_store::durability::DurableAgainst;
@@ -103,10 +104,13 @@ impl TreeConfig for TestTreeConfig {
     }
 }
 
-pub(crate) type InMemoryStore = TreeVolume<
-    LockSynchronizedStore<RedbStore<Inline>, ListedContent>,
-    fn() -> u128,
-    TestTreeConfig,
+// InMemoryStore is a test engine's store: a volume in memory, with the round trips its reads take counted.
+pub(crate) type InMemoryStore = CountedStore<
+    TreeVolume<
+        LockSynchronizedStore<RedbStore<Inline>, ListedContent>,
+        fn() -> u128,
+        TestTreeConfig,
+    >,
 >;
 
 // ListedContent keeps content in memory, and lists the id of every blob it keeps and every get made of it.
@@ -364,7 +368,7 @@ impl TestVolumes {
             let volume = self.tree.open(volume).await.unwrap();
             FsEngine::new(
                 EngineSpecification::new(
-                    volume,
+                    CountedStore::new(volume),
                     allocate_inode,
                     next_content_id,
                     now,
@@ -382,6 +386,18 @@ impl TestVolumes {
             .unwrap()
         })
     }
+}
+
+// round_trips is how many round trips to the store engine's reads take while operation runs. Reads sent together
+// count as one.
+pub(crate) fn round_trips<P: PubSub, C, T>(
+    engine: &TestEngine<C, P>,
+    operation: impl FnOnce() -> T,
+) -> usize {
+    let store = &engine.specification.mount.store;
+    store.round_trips().during(|| {
+        operation();
+    })
 }
 
 pub(crate) fn aborted<R: Debug, F: Debug, E>(error: TransactError<R, F, E>) -> E {

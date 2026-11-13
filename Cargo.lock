@@ -2317,6 +2317,7 @@ dependencies = [
  "stratafs-pubsub",
  "stratafs-pubsub-conformance",
  "stratafs-redb",
+ "stratafs-round-trips",
  "stratafs-runtime",
  "stratafs-serialized",
  "stratafs-store",
@@ -2572,6 +2573,17 @@ dependencies = [
  "stratafs-store",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "stratafs-round-trips"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-lite",
+ "futures-util",
+ "stratafs-store",
 ]
 
 [[package]]

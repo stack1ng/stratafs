@@ -37,6 +37,7 @@ stratafs-lock-synchronized.workspace = true
 stratafs-object-store.workspace = true
 stratafs-pubsub-conformance.workspace = true
 stratafs-redb.workspace = true
+stratafs-round-trips.workspace = true
 stratafs-tree.workspace = true
 
 [lints]

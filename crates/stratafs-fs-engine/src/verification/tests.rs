@@ -11,7 +11,7 @@ use crate::PurgeWaits;
 use crate::annotations::{AnnotationKey, AnnotationScope, SetAnnotationMode};
 use crate::directories::{NewItem, RenameMode};
 use crate::key::every_key_of;
-use crate::test_support::{InMemoryEngine, new_test_engine};
+use crate::test_support::{InMemoryEngine, new_test_engine, round_trips};
 
 // done is the result of an operation whose transaction ran.
 fn done<T, R: Debug, F: Debug, E>(result: Result<T, TransactError<R, F, E>>) -> Result<T, E> {
@@ -502,4 +502,183 @@ fn a_position_is_its_kind_then_its_number_in_order() {
     let hashed = RecordKind::Annotation.of::<sha2::Sha256>(b"key");
     assert_eq!(hashed[0], 1);
     assert_eq!(hashed[1..], sha2::Sha256::digest(b"key")[..8]);
+}
+
+fn hard_link(engine: &InMemoryEngine, inode: Inode, dir: Inode, name: &'static [u8]) {
+    let linked = block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        Box::pin(async move {
+            let result = txn.hard_link(inode, dir, name).await;
+            result.map(|result| (result, txn))
+        })
+    }));
+    done(linked).unwrap();
+}
+
+fn rename(
+    engine: &InMemoryEngine,
+    dir: Inode,
+    name: &'static [u8],
+    new_dir: Inode,
+    new_name: &'static [u8],
+    mode: RenameMode,
+) {
+    let renamed = block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        Box::pin(async move {
+            let result = txn.rename(dir, name, new_dir, new_name, mode, None).await;
+            result.map(|result| (result, txn))
+        })
+    }));
+    done(renamed).unwrap();
+}
+
+fn hard_unlink(engine: &InMemoryEngine, dir: Inode, name: &'static [u8]) {
+    let unlinked = block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        Box::pin(async move {
+            let result = txn.hard_unlink(dir, name, None).await;
+            result.map(|result| (result, txn))
+        })
+    }));
+    done(unlinked).unwrap();
+}
+
+fn rmdir(engine: &InMemoryEngine, dir: Inode, name: &'static [u8]) {
+    let removed = block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        Box::pin(async move {
+            let result = txn.rmdir(dir, name, None).await;
+            result.map(|result| (result, txn))
+        })
+    }));
+    done(removed).unwrap();
+}
+
+fn truncate(engine: &InMemoryEngine, inode: Inode, size: u64) {
+    let truncated = block_on(engine.transact(PurgeWaits::No, |mut txn| {
+        Box::pin(async move {
+            let result = txn.setattr(inode, |settable| settable.size = size).await;
+            result.map(|result| (result, txn))
+        })
+    }));
+    done(truncated).unwrap();
+}
+
+// The round trips below are the store reads an operation waits for one after another, on a signed volume. Each is what
+// the same operation takes on a volume that is not signed, but for the four the comments name.
+#[test]
+fn reads_take_no_round_trip_more_for_being_verified() {
+    let engine = new_test_engine();
+    let dir = create(&engine, Inode::ROOT, b"dir", NewItem::Directory);
+    let file = create(&engine, dir, b"file", NewItem::File);
+    let to_file = Bytes::from_static(b"file");
+    let link = create(&engine, dir, b"link", NewItem::SymbolicLink(to_file));
+    assert!(write(&engine, file, 0, &[1; 3000]));
+    assert!(write(&engine, file, 3000, &[2; 3000]));
+    set_annotation(&engine, file, b"one", b"1");
+
+    assert_eq!(round_trips(&engine, || attributes(&engine, file)), 1);
+    // A lookup reads the entry, then the attributes of the inode it names.
+    assert_eq!(round_trips(&engine, || named(&engine, dir, b"file")), 2);
+    assert_eq!(round_trips(&engine, || named(&engine, dir, b"missing")), 1);
+    assert_eq!(
+        round_trips(&engine, || annotation(&engine, file, b"one")),
+        1
+    );
+    assert_eq!(
+        round_trips(&engine, || annotation(&engine, file, b"two")),
+        1
+    );
+    assert_eq!(round_trips(&engine, || annotations(&engine, file)), 1);
+    assert_eq!(round_trips(&engine, || target(&engine, link)), 1);
+    // A read that ends where an extent does, at the end of the file, or past it.
+    assert_eq!(round_trips(&engine, || content(&engine, file, 3000)), 1);
+    assert_eq!(round_trips(&engine, || content(&engine, file, 6000)), 1);
+    assert_eq!(round_trips(&engine, || content(&engine, file, 9000)), 1);
+    // One more than unsigned: a read that ends inside an extent needs the nodes up to where that extent ends.
+    assert_eq!(round_trips(&engine, || content(&engine, file, 100)), 2);
+    // One more than unsigned: a listing does not know where it ends before it is read.
+    assert_eq!(round_trips(&engine, || names(&engine, dir, usize::MAX)), 2);
+}
+
+#[test]
+fn writes_take_no_round_trip_more_for_being_verified() {
+    let engine = new_test_engine();
+    let dir = create(&engine, Inode::ROOT, b"dir", NewItem::Directory);
+    create(&engine, Inode::ROOT, b"other", NewItem::File);
+
+    assert_eq!(
+        round_trips(&engine, || create(&engine, dir, b"file", NewItem::File)),
+        8
+    );
+    assert_eq!(
+        round_trips(&engine, || create(&engine, dir, b"sub", NewItem::Directory)),
+        8
+    );
+    let to_file = || NewItem::SymbolicLink(Bytes::from_static(b"file"));
+    assert_eq!(
+        round_trips(&engine, || create(&engine, dir, b"link", to_file())),
+        8
+    );
+    let file = named(&engine, dir, b"file").unwrap().unwrap();
+
+    // A write at the end of the file, and one over a whole extent.
+    assert_eq!(
+        round_trips(&engine, || assert!(write(&engine, file, 0, &[1; 3000]))),
+        5
+    );
+    assert_eq!(
+        round_trips(&engine, || assert!(write(&engine, file, 3000, &[2; 3000]))),
+        5
+    );
+    assert_eq!(
+        round_trips(&engine, || assert!(write(&engine, file, 0, &[3; 3000]))),
+        5
+    );
+    // Two more than unsigned: the engine runs a write's work twice, once before it announces the change and once to
+    // commit it, and each run needs the nodes up to where the extent it writes into ends.
+    assert_eq!(
+        round_trips(&engine, || assert!(write(&engine, file, 100, &[4; 10]))),
+        7
+    );
+
+    assert_eq!(
+        round_trips(&engine, || set_annotation(&engine, file, b"one", b"1")),
+        5
+    );
+    assert_eq!(
+        round_trips(&engine, || set_annotation(&engine, file, b"one", b"2")),
+        5
+    );
+    assert_eq!(
+        round_trips(&engine, || hard_link(&engine, file, dir, b"linked")),
+        8
+    );
+    let moved = || {
+        rename(
+            &engine,
+            dir,
+            b"file",
+            Inode::ROOT,
+            b"moved",
+            RenameMode::NoReplace,
+        )
+    };
+    assert_eq!(round_trips(&engine, moved), 13);
+    let replaced = || {
+        rename(
+            &engine,
+            Inode::ROOT,
+            b"moved",
+            Inode::ROOT,
+            b"other",
+            RenameMode::Replace,
+        )
+    };
+    assert_eq!(round_trips(&engine, replaced), 15);
+    assert_eq!(round_trips(&engine, || truncate(&engine, file, 50)), 7);
+    assert_eq!(
+        round_trips(&engine, || hard_unlink(&engine, Inode::ROOT, b"other")),
+        12
+    );
+    // Two more than unsigned: removing a directory checks that it has no entries, which no read brings the nodes for,
+    // in each of its runs.
+    assert_eq!(round_trips(&engine, || rmdir(&engine, dir, b"sub")), 12);
 }
