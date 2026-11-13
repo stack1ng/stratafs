@@ -1,3 +1,4 @@
+use noncrypto_digests::Xxh3_128;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,7 +10,6 @@ use object_store::memory::InMemory;
 use redb::Database;
 use redb::backends::InMemoryBackend;
 use stratafs_fs_engine::kernel_cache::NoKernel;
-use stratafs_fs_engine::spillable::ContentHash;
 use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_lock_synchronized::{LockSynchronizedMetadata, LockSynchronizedStore};
 use stratafs_object_store::ObjectStoreContentStore;
@@ -52,10 +52,9 @@ struct TestConfig;
 
 impl FsConfig for TestConfig {
     const LARGEST_INLINE_ENTRY: usize = 1024;
+    const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
-    fn content_hash(content: &[u8]) -> ContentHash {
-        ContentHash::xxh3(content)
-    }
+    type HashFunction = Xxh3_128;
 }
 
 // durable_against is what the store makes commits durable against when an engine with durability_limit makes them

@@ -13,6 +13,7 @@ futures-executor.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+noncrypto-digests.workspace = true
 mdbx-sys = "=14.4.0"
 rand.workspace = true
 redb = "4.4.0"

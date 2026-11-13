@@ -1,3 +1,4 @@
+use noncrypto_digests::Xxh3_128;
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -45,9 +46,15 @@ pub(crate) struct OneKibInline;
 
 impl FsConfig for OneKibInline {
     const LARGEST_INLINE_ENTRY: usize = 1024;
+    const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
-    fn content_hash(content: &[u8]) -> ContentHash {
-        ContentHash::xxh3(content)
+    type HashFunction = Xxh3_128;
+}
+
+impl ContentHash {
+    // xxh3 is content's hash by OneKibInline's hash function.
+    pub(crate) fn xxh3(content: &[u8]) -> Self {
+        Self::of::<Xxh3_128>(content)
     }
 }
 
@@ -70,11 +77,12 @@ pub(crate) type InMemoryStore = TreeVolume<
     TestTreeConfig,
 >;
 
-// ListedContent keeps content in memory, and lists the id of every blob it keeps.
+// ListedContent keeps content in memory, and lists the id of every blob it keeps and every get made of it.
 #[derive(Clone)]
 pub(crate) struct ListedContent {
     store: ObjectStoreContentStore,
     ids: Arc<Mutex<BTreeSet<ContentId>>>,
+    gets: Arc<Mutex<Vec<(ContentId, u64, u64)>>>,
 }
 
 impl ListedContent {
@@ -82,7 +90,16 @@ impl ListedContent {
         Self {
             store: ObjectStoreContentStore::new(InMemory::new()),
             ids: Arc::default(),
+            gets: Arc::default(),
         }
+    }
+
+    // gets is the id, offset and size of every get made so far, in order.
+    pub(crate) fn gets(&self) -> Vec<(ContentId, u64, u64)> {
+        self.gets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     // ids is the id of every blob the store keeps.
@@ -113,6 +130,10 @@ impl ContentStore for ListedContent {
         offset: u64,
         size: u64,
     ) -> impl Future<Output = Result<Bytes, StoreError<GetRejection, Self::Failure>>> + Send {
+        self.gets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((*id, offset, size));
         self.store.get(id, offset, size)
     }
 

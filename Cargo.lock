@@ -1186,6 +1186,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "noncrypto-digests"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dff2c6107ce0dc4e97c195ab1197c90bc1badf76d0d772bbe167df8cb6f7cf7d"
+dependencies = [
+ "digest",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1490,6 +1500,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "quick_cache"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "403c1a912fec895cafb223201e368234842acb9220aaf08ab042ae89ba5f135c"
+dependencies = [
+ "equivalent",
+ "foldhash",
+ "hashbrown 0.17.1",
+ "parking_lot",
 ]
 
 [[package]]
@@ -2013,6 +2035,7 @@ dependencies = [
  "hex",
  "mdbx-sys",
  "mimalloc",
+ "noncrypto-digests",
  "rand 0.10.3",
  "redb",
  "serde",
@@ -2045,6 +2068,7 @@ dependencies = [
  "futures-channel",
  "futures-lite",
  "futures-util",
+ "noncrypto-digests",
  "object_store",
  "proptest",
  "redb",
@@ -2090,12 +2114,15 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "bytes",
+ "digest",
  "event-listener",
  "futures-core",
  "futures-executor",
  "futures-lite",
  "futures-util",
+ "noncrypto-digests",
  "object_store",
+ "quick_cache",
  "redb",
  "smallvec",
  "storekey",
@@ -2127,6 +2154,7 @@ dependencies = [
  "futures-util",
  "hex",
  "libc",
+ "noncrypto-digests",
  "objc2",
  "objc2-foundation",
  "objc2-fs-kit",
@@ -2160,6 +2188,7 @@ dependencies = [
  "libc",
  "mdbx-sys",
  "nix",
+ "noncrypto-digests",
  "rand 0.10.3",
  "redb",
  "stratafs-fs-engine",

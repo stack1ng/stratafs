@@ -6,6 +6,7 @@ use stratafs_object_store::ObjectStoreError;
 use super::*;
 use crate::PurgeWaits;
 use crate::attributes::{Attributes, Restrictions};
+use crate::error::ContentReadError;
 use crate::test_support::{
     InMemoryEngine, MetadataFailure, aborted, new_test_engine, restrict, set_clock,
 };
@@ -165,15 +166,38 @@ fn a_large_annotation_spills_to_the_content_store_and_reads_back() {
         get_annotation(&engine, Inode::ROOT, macos(b"large")).unwrap(),
         Some(Bytes::from(value.clone()))
     );
-    let ids = engine.content().ids();
+    let ids = engine.content().store().ids();
     assert_eq!(ids.len(), 1);
-    let mut stored = block_on(
-        engine
-            .content()
-            .get(ids.first().unwrap(), 0, value.len() as u64),
-    )
+    let mut stored = block_on(engine.content().store().get(
+        ids.first().unwrap(),
+        0,
+        value.len() as u64,
+    ))
     .unwrap();
     assert_eq!(stored.copy_to_bytes(stored.remaining()), value);
+}
+
+#[test]
+fn a_large_annotation_whose_blob_has_other_content_is_refused() {
+    let engine = new_test_engine();
+    let value: Vec<u8> = (0..4000).map(|index| index as u8).collect();
+    set_annotation(
+        &engine,
+        Inode::ROOT,
+        macos(b"large"),
+        &value,
+        SetAnnotationMode::Create,
+    )
+    .unwrap();
+    let ids = engine.content().store().ids();
+    let other = Bytes::from(vec![0; 4000]);
+    block_on(engine.content().store().put(ids.first().unwrap(), other)).unwrap();
+    assert!(matches!(
+        get_annotation(&engine, Inode::ROOT, macos(b"large")),
+        Err(GetAnnotationError::InputOutputError(
+            IoFailure::ContentRead(ContentReadError::Mismatched)
+        ))
+    ));
 }
 
 #[test]

@@ -15,7 +15,7 @@ use crate::annotations::error::{
 use crate::attributes::Attributes;
 use crate::error::{IoFailure, refused_or_failed};
 use crate::key::{FsKey, annotation_name, annotations_in};
-use crate::spillable::{SpillableContent, SpillableValue};
+use crate::spillable::SpillableValue;
 use crate::{FsConfig, FsTransaction, Inode, LARGEST_NAME_LENGTH, Timestamp};
 
 // An annotation is a named value on an inode. A portable annotation means the same on every platform. A platform
@@ -47,19 +47,15 @@ impl<'a> AnnotationKey<'a> {
     }
 }
 
-impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
+impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
     pub fn get_annotation(
         &self,
         inode: Inode,
         key: AnnotationKey<'_>,
-    ) -> impl Future<
-        Output = Result<
-            Option<SpillableContent<C::Content>>,
-            GetAnnotationError<T::Failure, C::Failure>,
-        >,
-    > + Send {
+    ) -> impl Future<Output = Result<Option<Bytes>, GetAnnotationError<T::Failure, C::Failure>>> + Send
+    {
         async move {
             if key.name().is_empty() {
                 return Err(GetAnnotationError::InvalidInput);

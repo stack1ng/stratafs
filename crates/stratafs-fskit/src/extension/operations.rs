@@ -30,7 +30,8 @@ use stratafs_fs_engine::directories::{EntryChange, NewItem, RenameMode};
 use stratafs_fs_engine::error::{CorruptValue, EngineFailure, IoFailure, PosixError};
 use stratafs_fs_engine::kernel_cache::KernelCache;
 use stratafs_fs_engine::{
-    Cached, FsConfig, FsEngine, FsTransaction, Inode, PurgeWaits, ResultHandling, Timestamp,
+    Cached, CheckedContent, FsConfig, FsEngine, FsTransaction, Inode, PurgeWaits, ResultHandling,
+    Timestamp,
 };
 use stratafs_pubsub::PubSub;
 use stratafs_runtime::Runtime;
@@ -1310,9 +1311,9 @@ fn item_type(kind: FileType) -> FSItemType {
 // of its page, so an append comes with the file's stored bytes before its end, which must be what it stores. Like the
 // engine's, it returns `impl Future + Send` rather than being `async fn`, so Send is proven here for every store.
 #[allow(clippy::manual_async_fn, clippy::type_complexity)]
-pub(super) fn past_end<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>(
+pub(super) fn past_end<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>(
     transaction: &FsTransaction<'_, '_, T, C, A, N, S>,
-    content: &C,
+    content: CheckedContent<'_, C, S>,
     inode: Inode,
     offset: u64,
     mut contents: Bytes,

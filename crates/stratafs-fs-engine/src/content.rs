@@ -9,17 +9,16 @@ use std::ops::{Bound, Range};
 use bytes::{Buf, Bytes};
 use futures_util::FutureExt;
 use futures_util::future::join;
-use stratafs_store::content::{ContentId, ContentReference, ContentStore, GetRejection};
-use stratafs_store::error::StoreError;
+use stratafs_store::content::{ContentId, ContentReference, ContentStore};
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
 use crate::attributes::error::SetattrError;
 use crate::attributes::{Attributes, FileType};
 use crate::content::error::{ReadError, ReadSymbolicLinkError, WriteError};
-use crate::error::{CorruptValue, IoFailure, refused_or_failed};
+use crate::error::{ContentReadError, CorruptValue, IoFailure, refused_or_failed};
 use crate::key::{FsKey, content_extent_end};
-use crate::spillable::{SpillableContent, SpillableValue};
-use crate::{FsConfig, FsTransaction, Inode, Timestamp};
+use crate::spillable::{ContentHash, SpillableValue};
+use crate::{CheckedContent, FsConfig, FsTransaction, Inode, Timestamp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExtentValue {
@@ -105,6 +104,8 @@ enum ContentPiece {
     Stored {
         start: u64,
         id: ContentId,
+        blob_length: u64,
+        hash: ContentHash,
         offset: u64,
         length: u64,
     },
@@ -113,13 +114,11 @@ enum ContentPiece {
 impl ContentLoadPlan {
     // load returns one future per piece of the read, in file order, each resolving to that piece's bytes.
     // Holes resolve to zeros straight away. The caller decides how many of them to run at once.
-    pub fn load<C: ContentStore>(
+    pub fn load<C: ContentStore, S: FsConfig>(
         self,
-        content: &C,
-    ) -> impl Iterator<
-        Item = impl Future<Output = Result<impl Buf + Send, StoreError<GetRejection, C::Failure>>>
-               + Send,
-    > {
+        content: CheckedContent<'_, C, S>,
+    ) -> impl Iterator<Item = impl Future<Output = Result<Bytes, ContentReadError<C::Failure>>> + Send>
+    {
         let read_end = self.offset + self.size;
         let mut covered_until = self.offset;
         self.pieces
@@ -139,13 +138,19 @@ impl ContentLoadPlan {
             })
             .map(move |piece| async move {
                 match piece {
-                    ContentPiece::Inline { content, .. } => Ok(SpillableContent::Inline(content)),
+                    ContentPiece::Inline { content, .. } => Ok(content),
                     ContentPiece::Stored {
-                        id, offset, length, ..
-                    } => content
-                        .get(&id, offset, length)
-                        .await
-                        .map(SpillableContent::Overflow),
+                        id,
+                        blob_length,
+                        hash,
+                        offset,
+                        length,
+                        ..
+                    } => {
+                        let blob = content.get(id, blob_length, hash).await?;
+                        // read checked that the piece lies within the blob's length.
+                        Ok(blob.slice(offset as usize..(offset + length) as usize))
+                    }
                 }
             })
     }
@@ -166,7 +171,7 @@ where
     C: ContentStore,
     A: Sync,
     N: Sync,
-    S: Sync,
+    S: FsConfig,
 {
     // overlapping_extents returns all extents that overlap at all with the range: [start, end)
     fn overlapping_extents(
@@ -266,7 +271,9 @@ where
                                 }
                             }
                             SpillableValue::Overflow {
-                                reference, length, ..
+                                reference,
+                                length,
+                                hash,
                             } => {
                                 if view_end_in_content > length {
                                     return Err(IoFailure::Corrupt(CorruptValue::InvalidExtent));
@@ -274,6 +281,8 @@ where
                                 ContentPiece::Stored {
                                     start: view_start,
                                     id: reference.id(),
+                                    blob_length: length,
+                                    hash,
                                     offset: view_offset,
                                     length: view_size,
                                 }
@@ -294,12 +303,8 @@ where
     pub fn read_symbolic_link(
         &self,
         inode: Inode,
-    ) -> impl Future<
-        Output = Result<
-            SpillableContent<C::Content>,
-            ReadSymbolicLinkError<T::Failure, C::Failure>,
-        >,
-    > + Send {
+    ) -> impl Future<Output = Result<Bytes, ReadSymbolicLinkError<T::Failure, C::Failure>>> + Send
+    {
         async move {
             let (attributes, target) = join(self.getattr(inode), async {
                 let Some(stored) = self

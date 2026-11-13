@@ -9,12 +9,13 @@ use stratafs_pubsub_conformance::MemoryClient;
 
 use super::*;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
+use crate::checked_content::CheckedBlobs;
 use crate::directories::NewItem;
 use crate::kernel_cache::{Answered, Asked, KernelCache, NoKernel, Uninvalidated};
 use crate::test_support::{
-    InMemoryEngine, InMemoryStore, PUBLISH_TIMEOUT, TestVolumes, new_test_engine,
+    InMemoryEngine, InMemoryStore, OneKibInline, PUBLISH_TIMEOUT, TestVolumes, new_test_engine,
 };
-use crate::{FsEngine, MountId, PurgeWaits, ResultHandling};
+use crate::{FsConfig, FsEngine, MountId, PurgeWaits, ResultHandling};
 
 // ChannelKernel is a kernel cache that sends each inode it is asked to invalidate.
 struct ChannelKernel(mpsc::Sender<Inode>);
@@ -80,6 +81,7 @@ fn another_client(volumes: &TestVolumes, engine: &InMemoryEngine) -> InMemoryEng
         ),
         durability_limit: None,
         consistency: Eventual::default(),
+        checked: CheckedBlobs::new(OneKibInline::CHECKED_CONTENT_BYTES),
         config: PhantomData,
     }
 }

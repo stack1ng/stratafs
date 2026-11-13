@@ -1,3 +1,4 @@
+use noncrypto_digests::Xxh3_128;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,7 +30,6 @@ use stratafs_fs_engine::attributes::{
 use stratafs_fs_engine::content::error::WriteError;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
-use stratafs_fs_engine::spillable::ContentHash;
 use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
@@ -50,10 +50,9 @@ struct TestConfig;
 
 impl FsConfig for TestConfig {
     const LARGEST_INLINE_ENTRY: usize = 1024;
+    const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
-    fn content_hash(content: &[u8]) -> ContentHash {
-        ContentHash::xxh3(content)
-    }
+    type HashFunction = Xxh3_128;
 }
 
 type TestStore = LockSynchronizedStore<RedbStore<SimulatedThreadPool>, ObjectStoreContentStore>;

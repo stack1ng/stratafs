@@ -7,22 +7,22 @@ use std::sync::PoisonError;
 
 use bytes::buf::Chain;
 use bytes::{Buf, Bytes};
-use stratafs_store::content::{ContentId, ContentReference, ContentStore, GetRejection};
-use stratafs_store::error::StoreError;
+use digest::Digest;
+use digest::typenum::Unsigned;
+use stratafs_store::content::{ContentId, ContentReference, ContentStore};
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
-use xxhash_rust::xxh3::xxh3_128;
 use zerocopy::little_endian::{U64, U128};
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, TryReadError, Unaligned,
 };
 
 use crate::content::ExtentValue;
-use crate::error::CorruptValue;
+use crate::error::{ContentReadError, CorruptValue};
 use crate::key::{FsKey, KeyKind};
 use crate::{FsConfig, FsTransaction, WrittenBlob};
 
 // ContentHash is the hash of a blob's content, as long as the file system's configuration makes it, up to LONGEST.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentHash {
     bytes: [u8; Self::LONGEST],
     length: u8,
@@ -31,10 +31,17 @@ pub struct ContentHash {
 impl ContentHash {
     pub const LONGEST: usize = 32;
 
-    // xxh3 is content's 128 bit xxh3 hash, which anyone can make other content match.
+    // of is content's hash by the hash function D, whose hashes are at most LONGEST bytes.
     #[must_use]
-    pub fn xxh3(content: &[u8]) -> Self {
-        Self::from(xxh3_128(content).to_le_bytes())
+    pub fn of<D: Digest>(mut content: impl Buf) -> Self {
+        const { assert!(D::OutputSize::USIZE <= Self::LONGEST) };
+        let mut hasher = D::new();
+        while content.has_remaining() {
+            let chunk = content.chunk();
+            hasher.update(chunk);
+            content.advance(chunk.len());
+        }
+        Self::from_stored(&hasher.finalize()).expect("the hash is within the longest hash")
     }
 
     #[must_use]
@@ -75,41 +82,6 @@ pub(crate) enum SpillableValue {
         length: u64,
         hash: ContentHash,
     },
-}
-
-pub enum SpillableContent<B> {
-    Inline(Bytes),
-    Overflow(B),
-}
-
-impl<B: Buf> Buf for SpillableContent<B> {
-    fn remaining(&self) -> usize {
-        match self {
-            SpillableContent::Inline(content) => content.remaining(),
-            SpillableContent::Overflow(content) => content.remaining(),
-        }
-    }
-
-    fn chunk(&self) -> &[u8] {
-        match self {
-            SpillableContent::Inline(content) => content.chunk(),
-            SpillableContent::Overflow(content) => content.chunk(),
-        }
-    }
-
-    fn advance(&mut self, count: usize) {
-        match self {
-            SpillableContent::Inline(content) => content.advance(count),
-            SpillableContent::Overflow(content) => content.advance(count),
-        }
-    }
-
-    fn copy_to_bytes(&mut self, length: usize) -> Bytes {
-        match self {
-            SpillableContent::Inline(content) => content.copy_to_bytes(length),
-            SpillableContent::Overflow(content) => content.copy_to_bytes(length),
-        }
-    }
 }
 
 #[derive(TryFromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -216,13 +188,13 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
                 return Ok(SpillableValue::Inline(content.copy_to_bytes(length)));
             }
             let content = content.copy_to_bytes(length);
-            let hash = S::content_hash(&content);
+            let hash = ContentHash::of::<S::HashFunction>(&content[..]);
             let length = length as u64;
             let id = match self.take_written(hash, length) {
                 Some(id) => id,
                 None => {
                     let id = (self.allocate_content_id)();
-                    self.content.put(&id, content).await?;
+                    self.content.store.put(&id, content).await?;
                     self.record_written(hash, length, id);
                     id
                 }
@@ -264,25 +236,22 @@ impl<T, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     }
 }
 
-impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
+impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
+    // read_spillable is value's content, read whole and checked when it spilled into a blob.
     pub(crate) fn read_spillable(
         &self,
         value: SpillableValue,
-    ) -> impl Future<
-        Output = Result<SpillableContent<C::Content>, StoreError<GetRejection, C::Failure>>,
-    > + Send {
+    ) -> impl Future<Output = Result<Bytes, ContentReadError<C::Failure>>> + Send {
         async move {
             match value {
-                SpillableValue::Inline(content) => Ok(SpillableContent::Inline(content)),
+                SpillableValue::Inline(content) => Ok(content),
                 SpillableValue::Overflow {
-                    reference, length, ..
-                } => self
-                    .content
-                    .get(&reference.id(), 0, length)
-                    .await
-                    .map(SpillableContent::Overflow),
+                    reference,
+                    length,
+                    hash,
+                } => self.content.get(reference.id(), length, hash).await,
             }
         }
     }

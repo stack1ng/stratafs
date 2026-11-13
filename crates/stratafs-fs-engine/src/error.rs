@@ -58,12 +58,21 @@ pub enum EngineFailure<F, X> {
     Consistency(X),
 }
 
+// ContentReadError is why a blob could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum ContentReadError<C> {
+    #[error(transparent)]
+    Store(StoreError<GetRejection, C>),
+    #[error("a blob does not have the length and hash its reference holds")]
+    Mismatched,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IoFailure<M, C> {
     #[error(transparent)]
     Metadata(M),
     #[error(transparent)]
-    ContentRead(StoreError<GetRejection, C>),
+    ContentRead(ContentReadError<C>),
     #[error(transparent)]
     ContentWrite(C),
     #[error(transparent)]

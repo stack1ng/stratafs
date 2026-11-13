@@ -277,7 +277,10 @@ fn a_write_refused_once_puts_its_blob_once() {
     // A write to a file that exists commits only once it announced the file's next version, so it runs twice.
     assert_eq!(write_spilling(&engine, inode, &[], || vec![7; 2000]), 2);
     // the second attempt took the first one's blob, so no second id was allocated
-    assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(1)]));
+    assert_eq!(
+        engine.content().store().ids(),
+        BTreeSet::from([ContentId(1)])
+    );
 }
 
 #[test]
@@ -290,7 +293,10 @@ fn a_write_refused_twice_puts_its_blob_once() {
         write_spilling(&engine, inode, &[other], || vec![7; 2000]),
         3
     );
-    assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(1)]));
+    assert_eq!(
+        engine.content().store().ids(),
+        BTreeSet::from([ContentId(1)])
+    );
 }
 
 #[test]
@@ -302,7 +308,10 @@ fn an_attempt_that_spills_other_content_than_the_one_before_keeps_only_its_own_b
         vec![attempts.fetch_add(1, Ordering::SeqCst) as u8; 2000]
     });
     assert_eq!(ran, 2);
-    assert_eq!(engine.content().ids(), BTreeSet::from([ContentId(2)]));
+    assert_eq!(
+        engine.content().store().ids(),
+        BTreeSet::from([ContentId(2)])
+    );
 }
 
 #[test]
@@ -318,7 +327,7 @@ fn a_transaction_that_gives_up_after_spilling_keeps_no_blob() {
         })
     }));
     assert!(given_up.is_err());
-    assert!(engine.content().ids().is_empty());
+    assert!(engine.content().store().ids().is_empty());
 }
 
 #[test]
@@ -339,7 +348,7 @@ fn the_same_content_spilled_twice_by_one_attempt_is_two_blobs() {
     assert_eq!(attempts.into_inner(), 2);
     // each attempt references two blobs, and the second attempt took both of the first one's
     assert_eq!(
-        engine.content().ids(),
+        engine.content().store().ids(),
         BTreeSet::from([ContentId(1), ContentId(2)])
     );
 }

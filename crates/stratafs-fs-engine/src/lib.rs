@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use digest::Digest;
 use futures_core::future::BoxFuture;
 use futures_util::future::join_all;
 use smallvec::SmallVec;
@@ -24,6 +25,8 @@ use stratafs_store::kv::{
 use stratafs_store::store::Store;
 
 use crate::attributes::Attributes;
+use crate::checked_content::CheckedBlobs;
+pub use crate::checked_content::CheckedContent;
 use crate::error::{EngineFailure, IoFailure};
 pub use crate::eventual::Eventual;
 use crate::holds::{ConnectFailure, ConsistencyFailure, Failure, State};
@@ -34,6 +37,7 @@ use crate::writes::{Pending, Prepared, read_pending};
 
 pub mod annotations;
 pub mod attributes;
+mod checked_content;
 pub mod content;
 pub mod directories;
 pub mod error;
@@ -50,9 +54,12 @@ pub mod writes;
 pub trait FsConfig: Send + Sync + 'static {
     const LARGEST_INLINE_ENTRY: usize;
 
-    // content_hash is the hash kept with the reference to a blob of content. A transaction's attempts take content
-    // with the same hash and length for the same content.
-    fn content_hash(content: &[u8]) -> ContentHash;
+    // CHECKED_CONTENT_BYTES is how many bytes of the blobs it checked last an engine keeps.
+    const CHECKED_CONTENT_BYTES: u64;
+
+    // HashFunction makes the hash kept with the reference to a blob of content, which every read of the blob checks it
+    // against. A transaction's attempts take content with the same hash and length for the same content.
+    type HashFunction: Digest;
 }
 
 // WrittenBlob is a blob one of a transaction's attempts wrote. A later attempt that spills the same content takes it
@@ -112,6 +119,8 @@ pub struct FsEngine<St: Store, P: PubSub, A, N, S, C> {
     durability_limit: Option<DurableAgainst>,
     // consistency keeps the kernel's cache in line with what its reads promise. Dropping it stops its work.
     consistency: C,
+    // checked is the blobs the engine checked last.
+    checked: CheckedBlobs,
     config: PhantomData<S>,
 }
 
@@ -263,7 +272,7 @@ pub struct FsTransaction<'txn, 'engine, T, C, A, N, S> {
     written: Option<&'txn Mutex<WrittenBlobs>>,
     attempt: u32,
     mount: MountId,
-    content: &'engine C,
+    content: CheckedContent<'engine, C, S>,
     allocate_inode: &'engine A,
     allocate_content_id: fn() -> ContentId,
     now: &'engine N,
@@ -344,6 +353,7 @@ where
                 ),
                 durability_limit,
                 consistency,
+                checked: CheckedBlobs::new(S::CHECKED_CONTENT_BYTES),
                 config: PhantomData,
             };
             engine
@@ -379,8 +389,12 @@ impl<St: Store, P: PubSub, A: Sync, N: Sync, S: Sync, C: Send + Sync> FsEngine<S
 
 impl<St: Store, P: PubSub, A, N, S, C> FsEngine<St, P, A, N, S, C> {
     // content is the content store, which loads a read's ContentLoadPlan once the read's transaction ends.
-    pub fn content(&self) -> &St::Content {
-        self.mount.store.content()
+    pub fn content(&self) -> CheckedContent<'_, St::Content, S> {
+        CheckedContent {
+            store: self.mount.store.content(),
+            checked: &self.checked,
+            _config: PhantomData,
+        }
     }
 
     // consistency is what the engine's reads promise about other clients' writes.
@@ -617,7 +631,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
             .iter()
             .filter(|blob| !(may_have_committed && blob.taken_by == attempts));
         join_all(unreferenced.map(|blob| async move {
-            if let Err(error) = self.content().delete(&blob.id).await {
+            if let Err(error) = self.mount.store.content().delete(&blob.id).await {
                 tracing::warn!(id = blob.id.0, %error, "deleting a blob no commit references failed, so it stays");
             }
         }))
@@ -930,7 +944,7 @@ impl<St: Store, P: PubSub, A: Sync, N: Sync, S: FsConfig, C: Send + Sync>
             written: None,
             attempt: 0,
             mount: self.mount.id,
-            content: self.mount.store.content(),
+            content: self.content(),
             allocate_inode: &self.allocate_inode,
             allocate_content_id: self.allocate_content_id,
             now: &self.now,

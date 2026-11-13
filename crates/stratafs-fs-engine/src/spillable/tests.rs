@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 
 use futures_lite::future::block_on;
+use noncrypto_digests::Xxh3_128;
 use stratafs_store::content::GetRejection;
 use stratafs_store::error::StoreError;
 
@@ -26,7 +27,7 @@ fn make_spillable(engine: &InMemoryEngine, prefix_length: usize, content: Bytes)
 }
 
 fn stored_content(engine: &InMemoryEngine, id: &ContentId, length: usize) -> Option<Bytes> {
-    match block_on(engine.content().get(id, 0, length as u64)) {
+    match block_on(engine.content().store().get(id, 0, length as u64)) {
         Ok(mut content) => Some(content.copy_to_bytes(content.remaining())),
         Err(StoreError::Rejected(GetRejection::UnknownContent(_))) => None,
         Err(error) => panic!("reading the content store failed: {error}"),
@@ -45,7 +46,7 @@ fn small_content_stays_inline() {
         make_spillable(&engine, 0, content.clone()),
         SpillableValue::Inline(content.clone())
     );
-    assert_eq!(engine.content().ids(), BTreeSet::new());
+    assert_eq!(engine.content().store().ids(), BTreeSet::new());
 }
 
 #[test]
@@ -58,7 +59,7 @@ fn content_filling_the_largest_inline_entry_exactly_stays_inline() {
         make_spillable(&engine, 0, content.clone()),
         SpillableValue::Inline(content.clone())
     );
-    assert_eq!(engine.content().ids(), BTreeSet::new());
+    assert_eq!(engine.content().store().ids(), BTreeSet::new());
 }
 
 #[test]
@@ -77,7 +78,7 @@ fn content_one_byte_over_the_largest_inline_entry_spills_to_the_content_store() 
     };
     assert_eq!(length, content.len() as u64);
     assert_eq!(hash, ContentHash::xxh3(&content));
-    assert_eq!(engine.content().ids(), BTreeSet::from([id]));
+    assert_eq!(engine.content().store().ids(), BTreeSet::from([id]));
     assert_eq!(stored_content(&engine, &id, content.len()), Some(content));
 }
 
@@ -88,7 +89,7 @@ fn each_spill_is_kept_under_an_id_of_its_own() {
     let first = make_spillable(&engine, 0, content.clone());
     let second = make_spillable(&engine, 0, content.clone());
     assert_ne!(first, second);
-    assert_eq!(engine.content().ids().len(), 2);
+    assert_eq!(engine.content().store().ids().len(), 2);
 }
 
 fn stored(value: &SpillableValue) -> Bytes {
@@ -335,7 +336,12 @@ fn every_blob_the_engine_spills_is_referenced_by_each_entry_naming_it() {
     distinct.dedup();
     assert_eq!(
         distinct,
-        engine.content().ids().into_iter().collect::<Vec<_>>()
+        engine
+            .content()
+            .store()
+            .ids()
+            .into_iter()
+            .collect::<Vec<_>>()
     );
 }
 
@@ -448,5 +454,23 @@ fn a_read_planned_before_an_overwrite_still_loads_after_garbage_is_collected() {
         loaded.is_ok(),
         "the planned read failed: {:?}",
         loaded.err()
+    );
+}
+
+#[test]
+fn a_hash_of_content_in_pieces_is_the_hash_of_the_content() {
+    let content = content_of_length(3000);
+    let pieces = content
+        .slice(..1)
+        .chain(content.slice(1..1500))
+        .chain(Bytes::new())
+        .chain(content.slice(1500..));
+    assert_eq!(
+        ContentHash::of::<Xxh3_128>(pieces),
+        ContentHash::xxh3(&content)
+    );
+    assert_ne!(
+        ContentHash::xxh3(&content),
+        ContentHash::xxh3(&content[1..])
     );
 }

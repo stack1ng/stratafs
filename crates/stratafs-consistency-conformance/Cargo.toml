@@ -11,6 +11,7 @@ event-listener.workspace = true
 futures-channel.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
+noncrypto-digests.workspace = true
 object_store.workspace = true
 proptest.workspace = true
 redb = "4.4.0"

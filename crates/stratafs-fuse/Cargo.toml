@@ -15,6 +15,7 @@ futures-lite.workspace = true
 futures-util.workspace = true
 fuser.workspace = true
 hex.workspace = true
+noncrypto-digests.workspace = true
 libc.workspace = true
 mdbx-sys = "=14.4.0"
 nix = { workspace = true, features = ["mount", "signal"] }

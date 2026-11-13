@@ -1,6 +1,7 @@
 // A mount of a test volume: a real engine over the volume's shared store with a model of its kernel, whose operations
 // call the engine as that kernel's integration does. What every kernel's mount shares is here.
 
+use noncrypto_digests::Xxh3_128;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -15,7 +16,6 @@ use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::error::{EngineFailure, Posix, PosixError};
 use stratafs_fs_engine::holds::{ConsistencyFailure, Failure as MountFailure};
 use stratafs_fs_engine::kernel_cache::KernelCache;
-use stratafs_fs_engine::spillable::ContentHash;
 use stratafs_fs_engine::writes::Pending;
 use stratafs_fs_engine::{
     Cached, Eventual, FsConfig, FsEngine, Inode, Mount as EngineMount, MountId, PurgeWaits,
@@ -43,10 +43,9 @@ pub(crate) struct OneKibInline;
 
 impl FsConfig for OneKibInline {
     const LARGEST_INLINE_ENTRY: usize = 1024;
+    const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
-    fn content_hash(content: &[u8]) -> ContentHash {
-        ContentHash::xxh3(content)
-    }
+    type HashFunction = Xxh3_128;
 }
 
 type AllocateInode = Box<dyn Fn() -> u64 + Send + Sync>;

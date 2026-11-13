@@ -47,6 +47,7 @@ uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-executor.workspace = true
+noncrypto-digests.workspace = true
 object_store.workspace = true
 redb = "4.4.0"
 stratafs-lock-synchronized.workspace = true

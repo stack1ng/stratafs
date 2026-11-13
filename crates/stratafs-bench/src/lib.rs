@@ -3,6 +3,7 @@
 
 pub mod suite;
 
+use noncrypto_digests::Xxh3_128;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use futures_util::future::BoxFuture;
 use stratafs_fs_engine::error::{EngineFailure, PosixError};
 use stratafs_fs_engine::holds::{ConnectFailure, Failure};
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
-use stratafs_fs_engine::spillable::{ContentHash, referenced_content};
+use stratafs_fs_engine::spillable::referenced_content;
 use stratafs_fs_engine::{Cached, Eventual, FsConfig, FsEngine, MountId, Timestamp};
 use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_store::content::{ContentId, ContentReference};
@@ -49,10 +50,9 @@ pub struct BenchFsConfig;
 impl FsConfig for BenchFsConfig {
     const LARGEST_INLINE_ENTRY: usize =
         number(option_env!("STRATAFS_BENCH_LARGEST_INLINE_ENTRY"), 4 * 1024);
+    const CHECKED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 
-    fn content_hash(content: &[u8]) -> ContentHash {
-        ContentHash::xxh3(content)
-    }
+    type HashFunction = Xxh3_128;
 }
 
 // The durability limit comes from the build's environment too, as STRATAFS_BENCH_DURABILITY: none, software or power.

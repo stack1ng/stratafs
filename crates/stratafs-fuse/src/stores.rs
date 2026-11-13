@@ -1,6 +1,7 @@
 // stores opens a volume from the store and with the consistency a mount names, and makes new volumes. Each choice is
 // its own instance of the engine's types, and the matches below are the one place a choice picks its instance.
 
+use noncrypto_digests::Xxh3_128;
 use std::error::Error;
 use std::io;
 use std::num::NonZeroU64;
@@ -16,7 +17,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use stratafs_fs_engine::holds::ConnectFailure;
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
-use stratafs_fs_engine::spillable::{ContentHash, referenced_content};
+use stratafs_fs_engine::spillable::referenced_content;
 use stratafs_fs_engine::{
     Cached, Eventual, FsConfig, FsEngine, MountId, StrongUntilDisconnectCached, Timestamp,
 };
@@ -59,10 +60,9 @@ pub struct FuseFsConfig;
 
 impl FsConfig for FuseFsConfig {
     const LARGEST_INLINE_ENTRY: usize = 4 * 1024;
+    const CHECKED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 
-    fn content_hash(content: &[u8]) -> ContentHash {
-        ContentHash::xxh3(content)
-    }
+    type HashFunction = Xxh3_128;
 }
 
 // MDBX_CONFIGURATION opens the libmdbx store in 4 KiB pages, committing without a sync of its own, but making a

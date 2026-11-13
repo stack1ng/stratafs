@@ -13,7 +13,7 @@ use crate::test_support::{
     InMemoryEngine, MetadataFailure, OneKibInline, TEST_MOUNT, aborted, new_test_engine, restrict,
     set_clock,
 };
-use crate::{PurgeWaits, Timestamp};
+use crate::{FsConfig, PurgeWaits, Timestamp};
 
 fn stored(extent: &ExtentValue) -> Bytes {
     let mut stored = extent.to_stored();
@@ -192,6 +192,8 @@ fn read_plans_the_visible_part_of_each_overlapping_extent() {
                 ContentPiece::Stored {
                     start: 10,
                     id: blob,
+                    blob_length: 100,
+                    hash: ContentHash::xxh3(b"content"),
                     offset: 5,
                     length: 5
                 },
@@ -206,6 +208,8 @@ fn read_plans_the_visible_part_of_each_overlapping_extent() {
                 ContentPiece::Stored {
                     start: 12,
                     id: blob,
+                    blob_length: 100,
+                    hash: ContentHash::xxh3(b"content"),
                     offset: 7,
                     length: 18
                 },
@@ -457,7 +461,7 @@ fn stored_extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(u64, ExtentValu
 
 // the_only_stored_id is the id of the one blob the engine's content store keeps.
 fn the_only_stored_id(engine: &InMemoryEngine) -> ContentId {
-    let ids = engine.content().ids();
+    let ids = engine.content().store().ids();
     assert_eq!(ids.len(), 1, "the content store keeps {ids:?}");
     *ids.first().unwrap()
 }
@@ -473,7 +477,7 @@ fn extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(Range<u64>, Bytes)> {
                         ..usize::try_from(extent.content_offset + length).unwrap(),
                 ),
                 SpillableValue::Overflow { reference, .. } => {
-                    let mut content = block_on(engine.content().get(
+                    let mut content = block_on(engine.content().store().get(
                         &reference.id(),
                         extent.content_offset,
                         length,
@@ -1080,4 +1084,124 @@ fn load_of_an_empty_read_returns_nothing() {
     let inode = Inode(7);
     file_of_size(&engine, inode, 10);
     assert_eq!(loaded(&engine, inode, 10, 5), Vec::<Bytes>::new());
+}
+
+// read_bytes reads a file as an integration does: it plans the read in a transaction, then loads the plan.
+fn read_bytes(
+    engine: &InMemoryEngine,
+    inode: Inode,
+    offset: u64,
+    size: u64,
+) -> Result<Bytes, ContentReadError<ObjectStoreError>> {
+    let plan = plan(engine, inode, offset, size).unwrap();
+    let pieces = block_on(try_join_all(plan.load(engine.content())))?;
+    Ok(Bytes::from(pieces.concat()))
+}
+
+// replace_blob puts content in the content store under the id of a blob it already keeps.
+fn replace_blob(engine: &InMemoryEngine, id: ContentId, content: Bytes) {
+    block_on(engine.content().store().put(&id, content)).unwrap();
+}
+
+#[test]
+fn a_read_of_part_of_a_blob_gets_the_whole_blob_once() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let content = content_of_length(2000);
+    write(&engine, inode, 0, &content).unwrap();
+    let id = the_only_stored_id(&engine);
+
+    assert_eq!(
+        read_bytes(&engine, inode, 100, 10).unwrap(),
+        content.slice(100..110)
+    );
+    assert_eq!(engine.content().store().gets(), vec![(id, 0, 2000)]);
+    assert_eq!(
+        read_bytes(&engine, inode, 1500, 500).unwrap(),
+        content.slice(1500..)
+    );
+    assert_eq!(read_bytes(&engine, inode, 0, 2000).unwrap(), content);
+    assert_eq!(engine.content().store().gets(), vec![(id, 0, 2000)]);
+}
+
+#[test]
+fn reads_of_both_pieces_of_a_cut_extent_get_its_blob_once() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let content = content_of_length(2000);
+    write(&engine, inode, 0, &content).unwrap();
+    let id = the_only_stored_id(&engine);
+    write(&engine, inode, 500, b"cut").unwrap();
+
+    assert_eq!(
+        read_bytes(&engine, inode, 400, 100).unwrap(),
+        content.slice(400..500)
+    );
+    assert_eq!(
+        read_bytes(&engine, inode, 503, 1497).unwrap(),
+        content.slice(503..)
+    );
+    assert_eq!(engine.content().store().gets(), vec![(id, 0, 2000)]);
+}
+
+#[test]
+fn a_read_refuses_a_blob_with_other_content() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let content = content_of_length(2000);
+    write(&engine, inode, 0, &content).unwrap();
+    let id = the_only_stored_id(&engine);
+
+    let mut altered = content.to_vec();
+    altered[1999] ^= 1;
+    replace_blob(&engine, id, Bytes::from(altered));
+    // The altered byte lies outside the bytes read.
+    assert!(matches!(
+        read_bytes(&engine, inode, 0, 10),
+        Err(ContentReadError::Mismatched)
+    ));
+    replace_blob(&engine, id, content.slice(..1999));
+    assert!(read_bytes(&engine, inode, 0, 10).is_err());
+}
+
+#[test]
+fn a_refused_blob_is_not_kept() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    let content = content_of_length(2000);
+    write(&engine, inode, 0, &content).unwrap();
+    let id = the_only_stored_id(&engine);
+
+    replace_blob(&engine, id, content_of_length(2001).slice(1..));
+    assert!(read_bytes(&engine, inode, 0, 10).is_err());
+    replace_blob(&engine, id, content.clone());
+    assert_eq!(read_bytes(&engine, inode, 0, 2000).unwrap(), content);
+}
+
+#[test]
+fn a_checked_blob_is_read_again_once_it_no_longer_fits_the_kept_bytes() {
+    let engine = new_test_engine();
+    let inode = Inode(7);
+    file_of_size(&engine, inode, 0);
+    // Each blob is over half of what the engine keeps, so it keeps one of them at most.
+    let length = OneKibInline::CHECKED_CONTENT_BYTES as usize / 2 + 1;
+    let blobs = 4;
+    for blob in 0..blobs {
+        let content = vec![blob as u8; length];
+        write(&engine, inode, (blob * length) as u64, &content).unwrap();
+    }
+    let read_every_blob = || {
+        for blob in 0..blobs {
+            let read = read_bytes(&engine, inode, (blob * length) as u64, 10).unwrap();
+            assert_eq!(read, vec![blob as u8; 10]);
+        }
+    };
+    read_every_blob();
+    assert_eq!(engine.content().store().gets().len(), blobs);
+    read_every_blob();
+    assert!(engine.content().store().gets().len() >= 2 * blobs - 1);
 }
