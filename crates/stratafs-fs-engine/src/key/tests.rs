@@ -249,7 +249,7 @@ fn every_key_of_an_inode_holds_all_its_kinds_but_its_pending_change_version_and_
 fn pending_change_version_keys_are_the_inode_then_the_last_tag() {
     assert_eq!(
         Bytes::from(FsKey::new_pending_change_version(Inode(0x0102)))[..],
-        [0, 0, 0, 0, 0, 0, 0x01, 0x02, 8]
+        [0, 0, 0, 0, 0, 0, 0x01, 0x02, 10]
     );
 }
 

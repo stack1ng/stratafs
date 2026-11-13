@@ -2,6 +2,7 @@ use noncrypto_digests::Xxh3_128;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use stratafs_fs_engine::verification::Unsigned;
 
 use futures_executor::ThreadPool;
 use futures_lite::future::block_on;
@@ -55,6 +56,7 @@ impl FsConfig for TestConfig {
     const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
     type HashFunction = Xxh3_128;
+    type Signer = Unsigned;
 }
 
 // durable_against is what the store makes commits durable against when an engine with durability_limit makes them
@@ -89,6 +91,7 @@ fn durable_against(durability_limit: Option<DurableAgainst>) -> Vec<DurableAgain
         },
         Duration::from_secs(1),
         Eventual::default(),
+        Unsigned,
         NoKernel,
         runtime,
     ))

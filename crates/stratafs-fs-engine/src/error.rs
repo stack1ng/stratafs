@@ -77,6 +77,11 @@ pub enum IoFailure<M, C> {
     ContentWrite(C),
     #[error(transparent)]
     Corrupt(CorruptValue),
+    // Unverified is something the store returned that no signer the volume trusts vouches for.
+    #[error("the store returned what no trusted signer vouches for")]
+    Unverified,
+    #[error("signing or verifying an inode failed")]
+    Verification(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 // A store failure is an I/O error; a consistency's failure stands for its own.
@@ -121,6 +126,8 @@ pub enum CorruptValue {
     InvalidExtent,
     #[error("a hard link exists that its inode's stored hard link count does not count")]
     UncountedHardLink,
+    #[error("a stored node of an inode's hash tree is not a key of digits with a hash")]
+    InvalidVerificationNode,
 }
 
 impl From<ViewError> for CorruptValue {
@@ -132,6 +139,30 @@ impl From<ViewError> for CorruptValue {
         }
     }
 }
+
+// ChangeFailure is why an inode's records could not be changed: the store refused an entry, or the change failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ChangeFailure<R, M, C> {
+    #[error(transparent)]
+    Refused(R),
+    #[error(transparent)]
+    Failed(#[from] IoFailure<M, C>),
+}
+
+// from_change_failure makes a failure to change records an operation's error, for each of the operations' errors.
+macro_rules! from_change_failure {
+    ($($error:ident),*) => {$(
+        impl<M, R, C> From<$crate::error::ChangeFailure<R, M, C>> for $error<M, R, C> {
+            fn from(failure: $crate::error::ChangeFailure<R, M, C>) -> Self {
+                match failure {
+                    $crate::error::ChangeFailure::Refused(rejection) => Self::Refused(rejection),
+                    $crate::error::ChangeFailure::Failed(failure) => Self::InputOutputError(failure),
+                }
+            }
+        }
+    )*};
+}
+pub(crate) use from_change_failure;
 
 pub(crate) fn refused_or_failed<R: std::error::Error, M>(
     error: StoreError<SetRejection<R>, M>,

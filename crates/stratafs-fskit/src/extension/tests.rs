@@ -6,6 +6,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
+use stratafs_fs_engine::verification::Unsigned;
 
 use block2::RcBlock;
 use bytes::Bytes;
@@ -53,6 +54,7 @@ impl FsConfig for TestConfig {
     const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
     type HashFunction = Xxh3_128;
+    type Signer = Unsigned;
 }
 
 type TestStore = LockSynchronizedStore<RedbStore<SimulatedThreadPool>, ObjectStoreContentStore>;
@@ -104,6 +106,7 @@ async fn new_engine(
         },
         Duration::from_secs(1),
         Eventual::default(),
+        Unsigned,
         kernel,
         runtime,
     )

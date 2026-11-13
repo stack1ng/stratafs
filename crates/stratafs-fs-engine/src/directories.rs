@@ -19,11 +19,12 @@ use crate::attributes::{
 use crate::directories::error::{
     CreateError, HardLinkError, HardUnlinkError, LookupError, ReaddirError, RenameError, RmdirError,
 };
-use crate::error::{CorruptValue, IoFailure, refused_or_failed};
+use crate::error::{ChangeFailure, CorruptValue, IoFailure};
 use crate::key::{
     FsKey, directory_entries_after, directory_entries_between, directory_entry_position,
     every_key_of, hard_link_directory, hard_links_of,
 };
+use crate::verification::{Record, RecordChange, RecordKind};
 use crate::{Change, FsConfig, FsTransaction, Inode, LARGEST_NAME_LENGTH, Timestamp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,9 +139,21 @@ fn require_directory<E>(
     }
 }
 
-impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
+impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
+    // vouched_entries checks that entries are every entry of dir at the positions from first to last.
+    fn vouched_entries<'a>(
+        &'a self,
+        dir: Inode,
+        first: u64,
+        last: u64,
+        entries: &'a [Record],
+    ) -> impl Future<Output = Result<(), IoFailure<T::Failure, C::Failure>>> + Send + 'a {
+        let (first, last) = (RecordKind::Content.at(first), RecordKind::Content.at(last));
+        self.vouched(dir, first, last, entries)
+    }
+
     fn find_name(
         &self,
         dir: Inode,
@@ -148,13 +161,16 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
     ) -> impl Future<Output = Result<NameSearch, IoFailure<T::Failure, C::Failure>>> + Send {
         async move {
             let (first, last) = positions_of(name);
-            let entries = self
+            let entries: Vec<Record> = self
                 .metadata
                 .get_range(directory_entries_between(dir, first, last), usize::MAX)
                 .await
-                .map_err(IoFailure::Metadata)?;
+                .map_err(IoFailure::Metadata)?
+                .map(Record::from)
+                .collect();
+            self.vouched_entries(dir, first, last, &entries).await?;
             let mut free = first.max(FIRST_POSITION);
-            for (key, value) in entries {
+            for Record { key, value } in entries {
                 let entry = decode_entry(&key, value).map_err(IoFailure::Corrupt)?;
                 if entry.name == name {
                     return Ok(NameSearch::Found(entry));
@@ -197,12 +213,24 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
         dir: Inode,
     ) -> impl Future<Output = Result<bool, IoFailure<T::Failure, C::Failure>>> + Send {
         async move {
-            let mut entries = self
+            let first: Vec<Record> = self
                 .metadata
                 .get_range(directory_entries_after(dir, 0), 1)
                 .await
-                .map_err(IoFailure::Metadata)?;
-            Ok(entries.next().is_none())
+                .map_err(IoFailure::Metadata)?
+                .map(Record::from)
+                .collect();
+            // An entry there is shows the directory has one, and only every position without one shows it has none.
+            let (from, to) = match first.first() {
+                Some(entry) => {
+                    let position =
+                        directory_entry_position(&entry.key).map_err(IoFailure::Corrupt)?;
+                    (position, position)
+                }
+                None => (1, u64::MAX),
+            };
+            self.vouched_entries(dir, from, to, &first).await?;
+            Ok(first.is_empty())
         }
     }
 
@@ -259,11 +287,23 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
                 ReaddirError::StaleFileHandle,
                 ReaddirError::NotADirectory,
             )?;
-            let entries = entries
+            let stored: Vec<Record> = entries
                 .map_err(IoFailure::Metadata)?
-                .map(|(key, value)| decode_entry(&key, value))
+                .map(Record::from)
+                .collect();
+            let entries = stored
+                .iter()
+                .map(|entry| decode_entry(&entry.key, entry.value.clone()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(IoFailure::Corrupt)?;
+            // A listing cut short at its limit holds every entry up to its last, and any other every entry there is.
+            let last = match entries.last() {
+                Some(last) if entries.len() == limit => last.position,
+                _ => u64::MAX,
+            };
+            if let Some(first) = after.checked_add(1).filter(|first| *first <= last) {
+                self.vouched_entries(dir, first, last, &stored).await?;
+            }
             Ok(entries)
         }
     }
@@ -301,33 +341,45 @@ where
         }
     }
 
-    fn add_name(
-        &mut self,
+    fn add_name<'a>(
+        &'a mut self,
         dir: Inode,
         position: u64,
-        name: &[u8],
+        name: &'a [u8],
         inode: Inode,
         kind: FileType,
-    ) -> Result<(), StoreError<T::Rejection, T::Failure>> {
-        let header = StoredEntryHeader {
-            inode: U64::new(inode.0),
-            kind: kind as u8,
-        };
-        self.metadata
-            .set(
-                FsKey::new_directory_entry(dir, position).into(),
-                header.as_bytes().chain(name),
-            )
-            .map_err(refused_or_failed)?;
-        match kind {
-            FileType::Directory => Ok(()),
-            FileType::File | FileType::SymbolicLink => self
-                .metadata
-                .set(
-                    FsKey::new_hard_link(inode, dir, position).into(),
-                    Bytes::new(),
-                )
-                .map_err(refused_or_failed),
+    ) -> impl Future<Output = Result<(), ChangeFailure<T::Rejection, T::Failure, C::Failure>>> + Send + 'a
+    {
+        async move {
+            let header = StoredEntryHeader {
+                inode: U64::new(inode.0),
+                kind: kind as u8,
+            };
+            let entry = RecordChange {
+                key: Bytes::from(FsKey::new_directory_entry(dir, position)),
+                value: Some(header.as_bytes().chain(name)),
+            };
+            self.change_records(dir, vec![entry]).await?;
+            match kind {
+                FileType::Directory => Ok(()),
+                FileType::File | FileType::SymbolicLink => {
+                    let key = Bytes::from(FsKey::new_hard_link(inode, dir, position));
+                    // An inode the transaction made has no other name yet. Any other may have one whose key starts
+                    // the same hash, which this name would replace in its hash tree.
+                    let made = matches!(
+                        self.changes.get(&inode),
+                        Some(Change::Written(made)) if made.change_version.number == 0
+                    );
+                    if !made {
+                        self.vouched_record(inode, &key, None).await?;
+                    }
+                    let name = RecordChange {
+                        key,
+                        value: Some(Bytes::new()),
+                    };
+                    self.change_records(inode, vec![name]).await
+                }
+            }
         }
     }
 
@@ -337,14 +389,22 @@ where
         position: u64,
         inode: Inode,
         kind: FileType,
-    ) -> Result<(), T::Failure> {
-        self.metadata
-            .clear(FsKey::new_directory_entry(dir, position).into())?;
-        match kind {
-            FileType::Directory => Ok(()),
-            FileType::File | FileType::SymbolicLink => self
-                .metadata
-                .clear(FsKey::new_hard_link(inode, dir, position).into()),
+    ) -> impl Future<Output = Result<(), ChangeFailure<T::Rejection, T::Failure, C::Failure>>> + Send
+    {
+        async move {
+            let entry = RecordChange::<Bytes> {
+                key: Bytes::from(FsKey::new_directory_entry(dir, position)),
+                value: None,
+            };
+            self.change_records(dir, vec![entry]).await?;
+            match kind {
+                FileType::Directory => Ok(()),
+                FileType::File | FileType::SymbolicLink => {
+                    let key = Bytes::from(FsKey::new_hard_link(inode, dir, position));
+                    let name = RecordChange::<Bytes> { key, value: None };
+                    self.change_records(inode, vec![name]).await
+                }
+            }
         }
     }
 
@@ -375,6 +435,7 @@ where
             for (key, _) in keys {
                 self.metadata.clear(key)?;
             }
+            self.unmade(inode);
             Ok(())
         }
     }
@@ -388,10 +449,10 @@ where
         inode: Inode,
         item: &mut Attributes,
         now: Timestamp,
-    ) -> impl Future<Output = Result<(), IoFailure<T::Failure, C::Failure>>> + Send {
+    ) -> impl Future<Output = Result<(), ChangeFailure<T::Rejection, T::Failure, C::Failure>>> + Send
+    {
         async move {
-            self.remove_name(dir, position, inode, item.kind)
-                .map_err(IoFailure::Metadata)?;
+            self.remove_name(dir, position, inode, item.kind).await?;
             self.record_change(inode, item, now);
             match item.kind {
                 FileType::Directory => item.hard_link_count = 0,
@@ -403,13 +464,18 @@ where
                 }
             }
             if item.hard_link_count > 0 && item.parent == dir {
-                let mut remaining = self
+                // Its names are in no order in its hash tree, so only all of them are vouched for.
+                let names: Vec<Record> = self
                     .metadata
-                    .get_range(hard_links_of(inode), 1)
+                    .get_range(hard_links_of(inode), usize::MAX)
                     .await
-                    .map_err(IoFailure::Metadata)?;
-                if let Some((key, _)) = remaining.next() {
-                    item.parent = hard_link_directory(&key).map_err(IoFailure::Corrupt)?;
+                    .map_err(IoFailure::Metadata)?
+                    .map(Record::from)
+                    .collect();
+                let (first, last) = (RecordKind::Name.at(u64::MIN), RecordKind::Name.at(u64::MAX));
+                self.vouched(inode, first, last, &names).await?;
+                if let Some(name) = names.first() {
+                    item.parent = hard_link_directory(&name.key).map_err(IoFailure::Corrupt)?;
                 }
             }
             Ok(())
@@ -502,18 +568,21 @@ where
                 },
             };
             update(&mut attributes.settable);
+            self.made(inode);
+            self.write_attributes(inode, &attributes)?;
             if let NewItem::SymbolicLink(target) = item {
                 let key = Bytes::from(FsKey::new_symbolic_link_target(inode));
                 let value = self
                     .make_spillable(&key, 0, target)
                     .await
                     .map_err(IoFailure::ContentWrite)?;
-                self.metadata
-                    .set(key, value.to_stored())
-                    .map_err(refused_or_failed)?;
+                let target = RecordChange {
+                    key,
+                    value: Some(value.to_stored()),
+                };
+                self.change_records(inode, vec![target]).await?;
             }
-            self.write_attributes(inode, &attributes)?;
-            self.add_name(dir, position, name, inode, kind)?;
+            self.add_name(dir, position, name, inode, kind).await?;
             self.write_entry_change(dir, &mut directory, now)?;
             Ok(EntryChange {
                 inode,
@@ -573,7 +642,7 @@ where
             let now = self.now();
             self.record_change(inode, &mut item, now);
             self.write_attributes(inode, &item)?;
-            self.add_name(dir, position, name, inode, item.kind)?;
+            self.add_name(dir, position, name, inode, item.kind).await?;
             self.write_entry_change(dir, &mut directory, now)?;
             Ok(EntryChange {
                 inode,
@@ -807,8 +876,9 @@ where
                 RenameTarget::Full => return Err(RenameError::StorageFull),
                 RenameTarget::Free(position) => {
                     self.remove_name(dir, source.position, source.inode, item.kind)
-                        .map_err(IoFailure::Metadata)?;
-                    self.add_name(new_dir, position, new_name, source.inode, item.kind)?;
+                        .await?;
+                    self.add_name(new_dir, position, new_name, source.inode, item.kind)
+                        .await?;
                     None
                 }
                 RenameTarget::Exchanged(target) => {
@@ -824,10 +894,11 @@ where
                         from_hard_links += 1;
                     }
                     self.remove_name(dir, source.position, source.inode, item.kind)
-                        .map_err(IoFailure::Metadata)?;
+                        .await?;
                     self.remove_name(new_dir, target.position, target.inode, other.kind)
-                        .map_err(IoFailure::Metadata)?;
-                    self.add_name(dir, source.position, name, target.inode, other.kind)?;
+                        .await?;
+                    self.add_name(dir, source.position, name, target.inode, other.kind)
+                        .await?;
                     if other.parent == new_dir {
                         other.parent = dir;
                     }
@@ -862,7 +933,7 @@ where
                         return Err(RenameError::OperationNotPermitted);
                     }
                     self.remove_name(dir, source.position, source.inode, item.kind)
-                        .map_err(IoFailure::Metadata)?;
+                        .await?;
                     self.release_name(new_dir, target.position, target.inode, &mut replaced, now)
                         .await?;
                     self.write_attributes(target.inode, &replaced)?;
@@ -871,7 +942,8 @@ where
             };
             let replaced = match replaced {
                 Some((inode, attributes, position)) => {
-                    self.add_name(new_dir, position, new_name, source.inode, item.kind)?;
+                    self.add_name(new_dir, position, new_name, source.inode, item.kind)
+                        .await?;
                     Some((inode, attributes))
                 }
                 None => None,

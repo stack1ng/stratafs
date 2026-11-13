@@ -49,7 +49,7 @@ fn stored_extents_decode_to_the_extent_that_was_stored() {
             content: SpillableValue::Overflow {
                 reference: ContentReference::New(ContentId(7)),
                 length: 1 << 20,
-                hash: ContentHash::xxh3(b"content"),
+                hash: ContentHash::of_test(b"content"),
             },
         },
     ] {
@@ -74,9 +74,15 @@ fn decoding_rejects_a_header_that_is_too_short_or_a_corrupt_spillable_value() {
 fn write_extent(engine: &InMemoryEngine, inode: Inode, end: u64, extent: &ExtentValue) {
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
-            let result = txn
-                .metadata
-                .set(FsKey::new_extent(inode, end).into(), extent.to_stored());
+            // The extent goes in as a write's would, so the inode's hash tree holds it and its attributes are signed.
+            let attributes = txn.getattr(inode).await.unwrap().expect("the file exists");
+            let key = Bytes::from(FsKey::new_extent(inode, end));
+            let extent = RecordChange {
+                key,
+                value: Some(extent.to_stored()),
+            };
+            txn.change_records(inode, vec![extent]).await.unwrap();
+            let result = txn.write_attributes(inode, &attributes);
             result.map(|result| (result, txn))
         })
     }))
@@ -139,7 +145,7 @@ fn three_extents(engine: &InMemoryEngine, inode: Inode) -> ContentId {
             content: SpillableValue::Overflow {
                 reference: ContentReference::New(blob),
                 length: 100,
-                hash: ContentHash::xxh3(b"content"),
+                hash: ContentHash::of_test(b"content"),
             },
         },
     );
@@ -193,7 +199,7 @@ fn read_plans_the_visible_part_of_each_overlapping_extent() {
                     start: 10,
                     id: blob,
                     blob_length: 100,
-                    hash: ContentHash::xxh3(b"content"),
+                    hash: ContentHash::of_test(b"content"),
                     offset: 5,
                     length: 5
                 },
@@ -209,7 +215,7 @@ fn read_plans_the_visible_part_of_each_overlapping_extent() {
                     start: 12,
                     id: blob,
                     blob_length: 100,
-                    hash: ContentHash::xxh3(b"content"),
+                    hash: ContentHash::of_test(b"content"),
                     offset: 7,
                     length: 18
                 },
@@ -331,6 +337,7 @@ fn overlapping(engine: &InMemoryEngine, inode: Inode, start: u64, end: u64) -> V
 fn overlapping_extents_returns_whole_extents_touching_the_range() {
     let engine = new_test_engine();
     let inode = Inode(7);
+    file_of_size(&engine, inode, 40);
     three_extents(&engine, inode);
     assert_eq!(overlapping(&engine, inode, 12, 20), vec![(10, 30)]);
     assert_eq!(
@@ -345,6 +352,7 @@ fn overlapping_extents_returns_whole_extents_touching_the_range() {
 fn overlapping_extents_skips_an_extent_that_starts_after_a_hole() {
     let engine = new_test_engine();
     let inode = Inode(7);
+    file_of_size(&engine, inode, 40);
     write_extent(
         &engine,
         inode,
@@ -392,7 +400,7 @@ fn slicing_an_overflow_extent_moves_its_offset_into_the_same_blob() {
     let content = SpillableValue::Overflow {
         reference: ContentReference::New(ContentId(7)),
         length: 100,
-        hash: ContentHash::xxh3(b"content"),
+        hash: ContentHash::of_test(b"content"),
     };
     let extent = ExtentValue {
         start: 100,
@@ -407,7 +415,7 @@ fn slicing_an_overflow_extent_moves_its_offset_into_the_same_blob() {
             content: SpillableValue::Overflow {
                 reference: ContentReference::Existing(ContentId(7)),
                 length: 100,
-                hash: ContentHash::xxh3(b"content"),
+                hash: ContentHash::of_test(b"content"),
             },
         }
     );
@@ -756,7 +764,7 @@ fn a_write_stays_inline_while_its_extent_fits_the_largest_inline_entry() {
                 content: SpillableValue::Overflow {
                     reference: ContentReference::New(the_only_stored_id(&engine)),
                     length: spills.len() as u64,
-                    hash: ContentHash::xxh3(&spills),
+                    hash: ContentHash::of_test(&spills),
                 },
             }
         )]
@@ -774,7 +782,7 @@ fn overwriting_part_of_a_spilled_extent_keeps_pointing_into_its_blob() {
     let blob = SpillableValue::Overflow {
         reference: ContentReference::Existing(the_only_stored_id(&engine)),
         length: 2000,
-        hash: ContentHash::xxh3(&content),
+        hash: ContentHash::of_test(&content),
     };
     assert_eq!(
         stored_extents(&engine, inode),
@@ -974,7 +982,7 @@ fn shrinking_a_spilled_extent_keeps_pointing_into_its_blob() {
                 content: SpillableValue::Overflow {
                     reference: ContentReference::Existing(the_only_stored_id(&engine)),
                     length: 2000,
-                    hash: ContentHash::xxh3(&content),
+                    hash: ContentHash::of_test(&content),
                 },
             }
         )]

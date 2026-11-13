@@ -134,6 +134,22 @@ pub(crate) async fn read_pending<T: ReadKeyValueTransaction>(
 }
 
 impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
+    // attributes is inode's stored attributes as metadata reads them, once their signature is verified on a signed
+    // volume, or None when the inode does not exist.
+    async fn attributes<T: ReadKeyValueTransaction>(
+        &self,
+        metadata: &T,
+        inode: Inode,
+    ) -> Result<Option<Attributes>, IoFailure<T::Failure, Infallible>> {
+        match &self.verifier {
+            Some(verifier) => {
+                let read = verifier.read(metadata, inode).await?;
+                Ok(read.map(|(attributes, _)| attributes))
+            }
+            None => read_attributes(metadata, inode).await,
+        }
+    }
+
     // replied lets the holds a write's reply held up go on: it has replied, or will not.
     fn replied(&self, prepared: &Prepared) {
         if prepared.0.replying.is_empty() {
@@ -170,7 +186,8 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                     let mut read = Vec::new();
                     for inode in inodes {
                         // An inode that vanished fails the write when it runs again.
-                        if let Some(attributes) = read_attributes(&*metadata, inode)
+                        if let Some(attributes) = self
+                            .attributes(&*metadata, inode)
                             .await
                             .map_err(StoreWork::Read)?
                         {
@@ -261,7 +278,7 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                     let mut stored = Vec::new();
                     for inode in inodes {
                         stored.push(
-                            read_attributes(&*metadata, *inode)
+                            self.attributes(&*metadata, *inode)
                                 .await
                                 .map_err(StoreWork::Read)?,
                         );
@@ -414,10 +431,15 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                 let announced = announced.clone();
                 Box::pin(async move {
                     for (inode, version) in announced {
-                        let Some(mut attributes) = read_attributes(&*metadata, inode)
-                            .await
-                            .map_err(StoreWork::Read)?
-                        else {
+                        let read = match &self.verifier {
+                            Some(verifier) => verifier.read(&*metadata, inode).await.map(|read| {
+                                read.map(|(attributes, root)| (attributes, Some(root)))
+                            }),
+                            None => read_attributes(&*metadata, inode)
+                                .await
+                                .map(|read| read.map(|attributes| (attributes, None))),
+                        };
+                        let Some((mut attributes, root)) = read.map_err(StoreWork::Read)? else {
                             continue;
                         };
                         let pending = read_pending(&*metadata, &[inode])
@@ -432,6 +454,16 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                                     Bytes::from(&attributes),
                                 )
                                 .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
+                            // The attributes moved, so a signed volume signs them again with the root they had.
+                            if let (Some(verifier), Some(root)) = (&self.verifier, root) {
+                                let signed =
+                                    verifier.signed(inode, &attributes, &root).await.map_err(
+                                        |failure| StoreWork::Read(IoFailure::Verification(failure)),
+                                    )?;
+                                metadata
+                                    .set(FsKey::new_signature(inode).into(), signed)
+                                    .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
+                            }
                             metadata
                                 .clear(FsKey::new_pending_change_version(inode).into())
                                 .map_err(|failure| StoreWork::Write(StoreError::Failed(failure)))?;

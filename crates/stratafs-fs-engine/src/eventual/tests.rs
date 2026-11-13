@@ -76,6 +76,7 @@ fn another_client(volumes: &TestVolumes, engine: &InMemoryEngine) -> InMemoryEng
             Arc::new(NoKernel),
             Arc::clone(&engine.mount.runtime),
             MountId(2),
+            engine.mount.verifier.clone(),
             volumes.connect(),
             PUBLISH_TIMEOUT,
         ),

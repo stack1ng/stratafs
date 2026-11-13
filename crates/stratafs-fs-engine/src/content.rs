@@ -15,9 +15,10 @@ use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 use crate::attributes::error::SetattrError;
 use crate::attributes::{Attributes, FileType};
 use crate::content::error::{ReadError, ReadSymbolicLinkError, WriteError};
-use crate::error::{ContentReadError, CorruptValue, IoFailure, refused_or_failed};
+use crate::error::{ContentReadError, CorruptValue, IoFailure};
 use crate::key::{FsKey, content_extent_end};
 use crate::spillable::{ContentHash, SpillableValue};
+use crate::verification::{Record, RecordChange, RecordKind};
 use crate::{CheckedContent, FsConfig, FsTransaction, Inode, Timestamp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +43,7 @@ impl ExtentValue {
         })
     }
 
-    fn to_stored(&self) -> impl Buf + Send {
+    fn to_stored(&self) -> impl Buf + Send + use<> {
         Bytes::from([self.start.to_le_bytes(), self.content_offset.to_le_bytes()].concat())
             .chain(self.content.to_stored())
     }
@@ -203,10 +204,23 @@ where
                 join(directly_in_bounds_future, indirectly_in_bounds_future).await;
             let directly_in_bounds = directly_in_bounds.map_err(IoFailure::Metadata)?;
             let indirectly_in_bounds = indirectly_in_bounds.map_err(IoFailure::Metadata)?;
-            let mut extents = Vec::with_capacity(
-                directly_in_bounds.size_hint().0 + usize::from(indirectly_in_bounds.is_some()),
-            );
-            for (key, value) in directly_in_bounds.chain(indirectly_in_bounds) {
+            let stored: Vec<Record> = directly_in_bounds
+                .chain(indirectly_in_bounds)
+                .map(Record::from)
+                .collect();
+            // The extents read are every extent that ends after start, up to the last of them, or up to the end of
+            // the file when none ends after end.
+            let last = match stored.last() {
+                Some(last) => content_extent_end(&last.key).map_err(IoFailure::Corrupt)?,
+                None => u64::MAX,
+            };
+            let last = if last > end { last } else { u64::MAX };
+            if let Some(first) = start.checked_add(1) {
+                let (first, last) = (RecordKind::Content.at(first), RecordKind::Content.at(last));
+                self.vouched(inode, first, last, &stored).await?;
+            }
+            let mut extents = Vec::with_capacity(stored.len());
+            for Record { key, value } in stored {
                 let extent_end = content_extent_end(&key).map_err(IoFailure::Corrupt)?;
                 let extent = ExtentValue::from_stored(value).map_err(IoFailure::Corrupt)?;
                 if extent.start >= extent_end {
@@ -315,6 +329,8 @@ where
                 else {
                     return Ok(None);
                 };
+                let key = Bytes::from(FsKey::new_symbolic_link_target(inode));
+                self.vouched_record(inode, &key, Some(&stored)).await?;
                 let value = SpillableValue::from_stored(stored).map_err(IoFailure::Corrupt)?;
                 let target = self
                     .read_spillable(value)
@@ -357,29 +373,41 @@ where
                 Bound::Excluded(Bytes::from(FsKey::new_extent(inode, size))),
                 Bound::Included(Bytes::from(FsKey::new_extent(inode, old_size))),
             );
-            let crossing = self
+            let removed: Vec<Record> = self
                 .metadata
-                .get_range(removed.clone(), 1)
+                .get_range(removed, usize::MAX)
                 .await
                 .map_err(IoFailure::Metadata)?
-                .next();
-            self.metadata
-                .clear_range(removed)
-                .map_err(IoFailure::Metadata)?;
-            if let Some((_, crossing)) = crossing {
-                let crossing = ExtentValue::from_stored(crossing).map_err(IoFailure::Corrupt)?;
+                .map(Record::from)
+                .collect();
+            if let Some(first) = size.checked_add(1).filter(|first| *first <= old_size) {
+                let (first, last) = (
+                    RecordKind::Content.at(first),
+                    RecordKind::Content.at(old_size),
+                );
+                self.vouched(inode, first, last, &removed).await?;
+            }
+            let mut changes = Vec::with_capacity(removed.len() + 1);
+            for extent in &removed {
+                changes.push(RecordChange {
+                    key: extent.key.clone(),
+                    value: None,
+                });
+            }
+            if let Some(crossing) = removed.into_iter().next() {
+                let crossing =
+                    ExtentValue::from_stored(crossing.value).map_err(IoFailure::Corrupt)?;
                 if crossing.start < size {
-                    self.metadata
-                        .set(
-                            Bytes::from(FsKey::new_extent(inode, size)),
-                            crossing
-                                .slice(crossing.start..size)
-                                .map_err(IoFailure::Corrupt)?
-                                .to_stored(),
-                        )
-                        .map_err(refused_or_failed)?;
+                    let kept = crossing
+                        .slice(crossing.start..size)
+                        .map_err(IoFailure::Corrupt)?;
+                    changes.push(RecordChange {
+                        key: Bytes::from(FsKey::new_extent(inode, size)),
+                        value: Some(kept.to_stored()),
+                    });
                 }
             }
+            self.change_records(inode, changes).await?;
             Ok(())
         }
     }
@@ -418,40 +446,33 @@ where
                 return Ok(attributes);
             }
             // clear out any overlaps before we write
+            let mut changes = Vec::new();
             for (end, extent) in overlap? {
                 let kept_before = (extent.start < write_start).then_some(extent.start..write_start);
                 let kept_after = (write_end < end).then_some(write_end..end);
 
                 // handle preserving any part of the extent that extends out to the left of what we are writing
                 if let Some(kept_before) = kept_before {
-                    self.metadata
-                        .set(
-                            Bytes::from(FsKey::new_extent(inode, kept_before.end)),
-                            extent
-                                .slice(kept_before)
-                                .map_err(IoFailure::Corrupt)?
-                                .to_stored(),
-                        )
-                        .map_err(refused_or_failed)?
+                    let key = Bytes::from(FsKey::new_extent(inode, kept_before.end));
+                    let kept = extent.slice(kept_before).map_err(IoFailure::Corrupt)?;
+                    changes.push(RecordChange {
+                        key,
+                        value: Some(kept.to_stored()),
+                    });
                 }
 
                 // handle preserving any part of the extent that extends out to the right of what we are writing
-                match kept_after {
-                    Some(kept_after) => self
-                        .metadata
-                        .set(
-                            Bytes::from(FsKey::new_extent(inode, end)),
-                            extent
-                                .slice(kept_after)
-                                .map_err(IoFailure::Corrupt)?
-                                .to_stored(),
-                        )
-                        .map_err(refused_or_failed)?,
-                    None => self
-                        .metadata
-                        .clear(Bytes::from(FsKey::new_extent(inode, end)))
-                        .map_err(IoFailure::Metadata)?,
-                }
+                let value = match kept_after {
+                    Some(kept_after) => {
+                        let kept = extent.slice(kept_after).map_err(IoFailure::Corrupt)?;
+                        Some(kept.to_stored())
+                    }
+                    None => None,
+                };
+                changes.push(RecordChange {
+                    key: Bytes::from(FsKey::new_extent(inode, end)),
+                    value,
+                });
             }
 
             // write the range
@@ -460,17 +481,16 @@ where
                 .make_spillable(&key, ExtentValue::STORED_PREFIX_LENGTH, data)
                 .await
                 .map_err(IoFailure::ContentWrite)?;
-            self.metadata
-                .set(
-                    key,
-                    ExtentValue {
-                        start: write_start,
-                        content_offset: 0,
-                        content,
-                    }
-                    .to_stored(),
-                )
-                .map_err(refused_or_failed)?;
+            let written = ExtentValue {
+                start: write_start,
+                content_offset: 0,
+                content,
+            };
+            changes.push(RecordChange {
+                key,
+                value: Some(written.to_stored()),
+            });
+            self.change_records(inode, changes).await?;
 
             let now = self.now();
             attributes.settable.size = attributes.settable.size.max(write_end);

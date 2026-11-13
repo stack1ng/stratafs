@@ -8,6 +8,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use stratafs_fs_engine::verification::Unsigned;
 
 use bytes::Bytes;
 use clap::{Args, ValueEnum};
@@ -63,6 +64,7 @@ impl FsConfig for FuseFsConfig {
     const CHECKED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 
     type HashFunction = Xxh3_128;
+    type Signer = Unsigned;
 }
 
 // MDBX_CONFIGURATION opens the libmdbx store in 4 KiB pages, committing without a sync of its own, but making a
@@ -419,6 +421,7 @@ async fn engine<D: Database, C: Cached<Volume<D>, Client<u64>>>(
         connect,
         PUBLISH_TIMEOUT,
         consistency,
+        Unsigned,
         kernel,
         runtime,
     )

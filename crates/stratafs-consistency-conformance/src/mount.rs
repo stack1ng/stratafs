@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use stratafs_fs_engine::verification::Unsigned;
 
 use bytes::{Buf, Bytes};
 use futures_util::FutureExt;
@@ -46,6 +47,7 @@ impl FsConfig for OneKibInline {
     const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
     type HashFunction = Xxh3_128;
+    type Signer = Unsigned;
 }
 
 type AllocateInode = Box<dyn Fn() -> u64 + Send + Sync>;
@@ -403,6 +405,7 @@ impl Volume {
             },
             PUBLISH_TIMEOUT,
             C::new(index),
+            Unsigned,
             kernel.cache(),
             Arc::clone(&self.runtime),
         )

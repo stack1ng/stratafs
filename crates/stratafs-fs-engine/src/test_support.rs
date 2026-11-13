@@ -1,4 +1,4 @@
-use noncrypto_digests::Xxh3_128;
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -34,6 +34,7 @@ use crate::attributes::Restrictions;
 use crate::holds::ConnectFailure;
 use crate::kernel_cache::{KernelCache, NoKernel};
 use crate::spillable::{ContentHash, referenced_content};
+use crate::verification::Signer;
 use crate::{Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
 
 // TEST_MOUNT is the mount test engines are.
@@ -48,13 +49,41 @@ impl FsConfig for OneKibInline {
     const LARGEST_INLINE_ENTRY: usize = 1024;
     const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
-    type HashFunction = Xxh3_128;
+    type HashFunction = Sha256;
+    type Signer = TestSigner;
 }
 
 impl ContentHash {
-    // xxh3 is content's hash by OneKibInline's hash function.
-    pub(crate) fn xxh3(content: &[u8]) -> Self {
-        Self::of::<Xxh3_128>(content)
+    // of_test is content's hash by OneKibInline's hash function.
+    pub(crate) fn of_test(content: &[u8]) -> Self {
+        Self::of::<Sha256>(content)
+    }
+}
+
+// TestSigner signs a statement with the hash of a secret and the statement, and trusts only itself.
+pub(crate) struct TestSigner;
+
+impl TestSigner {
+    fn signature(statement: &[u8]) -> Bytes {
+        let signature = Sha256::new()
+            .chain_update(b"the test signer's secret")
+            .chain_update(statement)
+            .finalize();
+        Bytes::copy_from_slice(&signature)
+    }
+}
+
+impl Signer for TestSigner {
+    const VERIFIES: bool = true;
+
+    type Failure = Infallible;
+
+    async fn sign(&self, statement: &[u8]) -> Result<Bytes, Infallible> {
+        Ok(Self::signature(statement))
+    }
+
+    async fn verify(&self, statement: &[u8], signature: &[u8]) -> Result<bool, Infallible> {
+        Ok(Self::signature(statement) == signature)
     }
 }
 
@@ -340,6 +369,7 @@ impl TestVolumes {
                 connect,
                 timeout,
                 consistency,
+                TestSigner,
                 kernel,
                 Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
             )

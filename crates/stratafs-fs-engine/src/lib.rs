@@ -33,6 +33,7 @@ use crate::holds::{ConnectFailure, ConsistencyFailure, Failure, State};
 use crate::kernel_cache::KernelCache;
 use crate::spillable::ContentHash;
 pub use crate::strong::StrongUntilDisconnectCached;
+use crate::verification::{Roots, Signer, Verifier};
 use crate::writes::{Pending, Prepared, read_pending};
 
 pub mod annotations;
@@ -49,6 +50,7 @@ pub mod spillable;
 pub mod strong;
 #[cfg(test)]
 mod test_support;
+pub mod verification;
 pub mod writes;
 
 pub trait FsConfig: Send + Sync + 'static {
@@ -59,7 +61,11 @@ pub trait FsConfig: Send + Sync + 'static {
 
     // HashFunction makes the hash kept with the reference to a blob of content, which every read of the blob checks it
     // against. A transaction's attempts take content with the same hash and length for the same content.
-    type HashFunction: Digest;
+    type HashFunction: Digest + Send + Sync;
+
+    // Signer signs what an engine writes and verifies what it reads. A signed volume's hash function is one nobody can
+    // make two contents with the same hash for.
+    type Signer: Signer;
 }
 
 // WrittenBlob is a blob one of a transaction's attempts wrote. A later attempt that spills the same content takes it
@@ -131,6 +137,8 @@ pub struct Mount<St, P: PubSub> {
     pub(crate) kernel: Arc<dyn KernelCache>,
     pub(crate) runtime: Arc<dyn Runtime>,
     pub(crate) id: MountId,
+    // verifier is the volume's verifier, or None when it is not signed.
+    pub(crate) verifier: Option<Arc<Verifier>>,
     // connect connects a client of the volume's pub/sub, first and again after the last one failed.
     connect: Box<dyn Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync>,
     // timeout is how long a publish waits for every other holder to handle it.
@@ -259,7 +267,7 @@ little_endian_newtypes! {
     Timestamp(i64),
 }
 
-pub struct FsTransaction<'txn, 'engine, T, C, A, N, S> {
+pub struct FsTransaction<'txn, 'engine, T, C, A, N, S: FsConfig> {
     metadata: TransactionHandle<'txn, 'engine, T>,
     // changes is what the transaction did to each inode it changed.
     changes: HashMap<Inode, Change>,
@@ -273,6 +281,10 @@ pub struct FsTransaction<'txn, 'engine, T, C, A, N, S> {
     attempt: u32,
     mount: MountId,
     content: CheckedContent<'engine, C, S>,
+    // verifier is the volume's verifier, or None when it is not signed, and roots is the root of the hash
+    // tree of each inode the transaction read or changed.
+    verifier: Option<&'engine Verifier>,
+    roots: Roots<S::HashFunction>,
     allocate_inode: &'engine A,
     allocate_content_id: fn() -> ContentId,
     now: &'engine N,
@@ -287,7 +299,7 @@ pub enum Change {
     Deleted(Attributes),
 }
 
-impl<T, C, A, N: Fn() -> Timestamp, S> FsTransaction<'_, '_, T, C, A, N, S> {
+impl<T, C, A, N: Fn() -> Timestamp, S: FsConfig> FsTransaction<'_, '_, T, C, A, N, S> {
     pub fn now(&self) -> Timestamp {
         (self.now)()
     }
@@ -320,6 +332,7 @@ where
         connect: impl Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync + 'static,
         timeout: Duration,
         consistency: C,
+        signer: S::Signer,
         kernel: impl KernelCache,
         runtime: Arc<dyn Runtime>,
     ) -> impl Future<
@@ -348,6 +361,7 @@ where
                     Arc::new(kernel),
                     runtime,
                     mount,
+                    Verifier::of(signer),
                     connect,
                     timeout,
                 ),
@@ -577,6 +591,9 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                                 transaction.allocated,
                             ));
                         }
+                        transaction.sign().await.map_err(|failure| {
+                            Attempt::Consistency(ConsistencyFailure::Signing(failure))
+                        })?;
                         let read = reads(&result);
                         let pending = self
                             .pending_of(&*transaction.metadata, &read)
@@ -945,6 +962,8 @@ impl<St: Store, P: PubSub, A: Sync, N: Sync, S: FsConfig, C: Send + Sync>
             attempt: 0,
             mount: self.mount.id,
             content: self.content(),
+            verifier: self.mount.verifier.as_deref(),
+            roots: Mutex::default(),
             allocate_inode: &self.allocate_inode,
             allocate_content_id: self.allocate_content_id,
             now: &self.now,

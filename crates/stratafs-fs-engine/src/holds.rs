@@ -19,6 +19,7 @@ use stratafs_store::store::Store;
 
 use crate::error::{IoFailure, PosixError};
 use crate::kernel_cache::{Answered, Asked, KernelCache, Uninvalidated};
+use crate::verification::Verifier;
 use crate::writes::StoreWork;
 use crate::{Inode, MetadataFailure, MetadataRejection, Mount, MountId, PurgeWaits};
 
@@ -52,6 +53,8 @@ pub enum ConsistencyFailure<F, R, M> {
     Store(#[source] TransactError<R, M, StoreWork<R, M>>),
     #[error("reading or clearing pending change versions in the engine's transaction failed")]
     Pending(#[source] IoFailure<M, Infallible>),
+    #[error("signing what a write changed failed")]
+    Signing(#[source] IoFailure<M, Infallible>),
     #[error("another write changed what a write committed before its reply could hand it over")]
     Overtaken,
     #[error("the mount is dropping the kernel's cache after its pub/sub connection failed")]
@@ -78,6 +81,7 @@ impl<F, R, M> From<&ConsistencyFailure<F, R, M>> for PosixError {
             | ConsistencyFailure::Publish(_)
             | ConsistencyFailure::Store(_)
             | ConsistencyFailure::Pending(_)
+            | ConsistencyFailure::Signing(_)
             | ConsistencyFailure::Overtaken
             | ConsistencyFailure::Purging
             | ConsistencyFailure::Uninvalidated(_)
@@ -245,6 +249,7 @@ impl<St, P: PubSub> Mount<St, P> {
         kernel: Arc<dyn KernelCache>,
         runtime: Arc<dyn Runtime>,
         id: MountId,
+        verifier: Option<Arc<Verifier>>,
         connect: impl Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync + 'static,
         timeout: Duration,
     ) -> Self {
@@ -253,6 +258,7 @@ impl<St, P: PubSub> Mount<St, P> {
             kernel,
             runtime,
             id,
+            verifier,
             connect: Box::new(connect),
             timeout,
             state: Arc::new(State {

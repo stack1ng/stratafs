@@ -590,6 +590,8 @@ fn set_hard_link_count(engine: &InMemoryEngine, inode: Inode, hard_link_count: u
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
         let mut attributes = attributes.clone();
         Box::pin(async move {
+            // A transaction reads the attributes it writes, which is where it learns their inode's hash tree.
+            txn.getattr(inode).await.unwrap();
             txn.record_change(inode, &mut attributes, txn.now());
             let result = txn.write_attributes(inode, &attributes);
             result.map(|result| (result, txn))
@@ -904,6 +906,8 @@ fn colliding_names_take_the_next_free_position() {
     let occupant = file(&engine, Inode::ROOT, b"occupant");
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
+            let mut root = txn.getattr(Inode::ROOT).await.unwrap().unwrap();
+            let mut item = txn.getattr(occupant).await.unwrap().unwrap();
             let result = txn.add_name(
                 Inode::ROOT,
                 first.max(FIRST_POSITION),
@@ -911,6 +915,12 @@ fn colliding_names_take_the_next_free_position() {
                 occupant,
                 FileType::File,
             );
+            let result = result.await;
+            // Each inode whose records changed records the change, as a link's would.
+            let now = txn.now();
+            txn.record_change(occupant, &mut item, now);
+            txn.write_attributes(occupant, &item).unwrap();
+            txn.write_entry_change(Inode::ROOT, &mut root, now).unwrap();
             result.map(|result| (result, txn))
         })
     }))
@@ -936,16 +946,26 @@ fn a_full_collision_range_is_storage_full() {
     let occupant = directory(&engine, Inode::ROOT, b"occupant");
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
-            for position in first.max(FIRST_POSITION)..=last {
-                txn.add_name(
-                    Inode::ROOT,
-                    position,
-                    b"collides with x",
-                    occupant,
-                    FileType::Directory,
-                )?;
-            }
-            Ok::<_, StoreError<Infallible, MetadataFailure>>(((), txn))
+            let mut root = txn.getattr(Inode::ROOT).await.unwrap().unwrap();
+            // Every position goes in as one change, which a name at a time would make 65536 of.
+            let header = StoredEntryHeader {
+                inode: U64::new(occupant.0),
+                kind: FileType::Directory as u8,
+            };
+            let value = Bytes::from([header.as_bytes(), b"collides with x"].concat());
+            let entries = (first.max(FIRST_POSITION)..=last)
+                .map(|position| {
+                    let key = Bytes::from(FsKey::new_directory_entry(Inode::ROOT, position));
+                    RecordChange {
+                        key,
+                        value: Some(value.clone()),
+                    }
+                })
+                .collect();
+            txn.change_records(Inode::ROOT, entries).await?;
+            let now = txn.now();
+            txn.write_entry_change(Inode::ROOT, &mut root, now).unwrap();
+            Ok::<_, ChangeFailure<Infallible, MetadataFailure, ObjectStoreError>>(((), txn))
         })
     }))
     .unwrap();

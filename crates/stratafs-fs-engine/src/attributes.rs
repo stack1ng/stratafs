@@ -171,7 +171,7 @@ serialized_shape! {
     }
 }
 
-impl<T, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
+impl<T, C, A, N, S: FsConfig> FsTransaction<'_, '_, T, C, A, N, S> {
     // record_change records a change at now to inode, whose attributes are attributes. The change version moves once
     // per transaction, so an inode the transaction changed or made already keeps the version it has.
     pub(crate) fn record_change(&self, inode: Inode, attributes: &mut Attributes, now: Timestamp) {
@@ -182,7 +182,7 @@ impl<T, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
     }
 }
 
-impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
+impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
     pub fn getattr(
@@ -190,7 +190,12 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: Sync>
         inode: Inode,
     ) -> impl Future<Output = Result<Option<Attributes>, IoFailure<T::Failure, C::Failure>>> + Send
     {
-        read_attributes(&*self.metadata, inode)
+        async move {
+            match self.verifier() {
+                Some(verifier) => self.verified_attributes(verifier, inode).await,
+                None => read_attributes(&*self.metadata, inode).await,
+            }
+        }
     }
 }
 

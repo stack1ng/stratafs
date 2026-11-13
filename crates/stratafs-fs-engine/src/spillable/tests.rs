@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::convert::Infallible;
 
 use futures_lite::future::block_on;
-use noncrypto_digests::Xxh3_128;
+use sha2::Sha256;
 use stratafs_store::content::GetRejection;
 use stratafs_store::error::StoreError;
 
@@ -11,7 +11,7 @@ use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::directories::NewItem;
 use crate::key::FsKey;
 use crate::test_support::{InMemoryEngine, OneKibInline, TestVolumes, aborted, new_test_engine};
-use crate::{Inode, PurgeWaits};
+use crate::{FsConfig, Inode, PurgeWaits};
 
 const KEY: &[u8] = b"key";
 
@@ -77,7 +77,7 @@ fn content_one_byte_over_the_largest_inline_entry_spills_to_the_content_store() 
         panic!("content over the largest inline entry stayed inline");
     };
     assert_eq!(length, content.len() as u64);
-    assert_eq!(hash, ContentHash::xxh3(&content));
+    assert_eq!(hash, ContentHash::of_test(&content));
     assert_eq!(engine.content().store().ids(), BTreeSet::from([id]));
     assert_eq!(stored_content(&engine, &id, content.len()), Some(content));
 }
@@ -127,7 +127,7 @@ fn stored_values_decode_to_the_value_that_was_stored() {
         SpillableValue::Overflow {
             reference: ContentReference::New(ContentId(7)),
             length: 7,
-            hash: ContentHash::xxh3(b"content"),
+            hash: ContentHash::of_test(b"content"),
         },
         SpillableValue::Overflow {
             reference: ContentReference::Existing(ContentId(7)),
@@ -212,7 +212,7 @@ fn the_referenced_content_is_that_of_a_spilled_extent_annotation_or_symbolic_lin
     let spilled = SpillableValue::Overflow {
         reference: ContentReference::New(ContentId(7)),
         length: 2000,
-        hash: ContentHash::xxh3(b"content"),
+        hash: ContentHash::of_test(b"content"),
     };
     let inline = SpillableValue::Inline(Bytes::from_static(b"inline"));
     let extent = Bytes::from(FsKey::new_extent(Inode(9), 2000));
@@ -236,7 +236,7 @@ fn the_referenced_content_is_that_of_a_spilled_extent_annotation_or_symbolic_lin
     let piece = SpillableValue::Overflow {
         reference: ContentReference::Existing(ContentId(7)),
         length: 2000,
-        hash: ContentHash::xxh3(b"content"),
+        hash: ContentHash::of_test(b"content"),
     };
     assert_eq!(
         referenced_content(&extent, &extent_value(&piece)),
@@ -252,7 +252,7 @@ fn other_keys_and_values_it_cannot_read_reference_no_content() {
     let spilled = stored(&SpillableValue::Overflow {
         reference: ContentReference::New(ContentId(7)),
         length: 2000,
-        hash: ContentHash::xxh3(b"content"),
+        hash: ContentHash::of_test(b"content"),
     });
     let attributes = Bytes::from(FsKey::new_attributes(Inode(9)));
     let extent = Bytes::from(FsKey::new_extent(Inode(9), 2000));
@@ -276,7 +276,7 @@ fn other_keys_and_values_it_cannot_read_reference_no_content() {
     );
 }
 
-impl<T: ReadKeyValueTransaction, C: Sync, A: Sync, N: Sync, S: Sync>
+impl<T: ReadKeyValueTransaction, C: Sync, A: Sync, N: Sync, S: FsConfig>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
     // referenced_ids is the content id each stored entry of the volume references, in key order. It returns `impl
@@ -466,11 +466,11 @@ fn a_hash_of_content_in_pieces_is_the_hash_of_the_content() {
         .chain(Bytes::new())
         .chain(content.slice(1500..));
     assert_eq!(
-        ContentHash::of::<Xxh3_128>(pieces),
-        ContentHash::xxh3(&content)
+        ContentHash::of::<Sha256>(pieces),
+        ContentHash::of_test(&content)
     );
     assert_ne!(
-        ContentHash::xxh3(&content),
-        ContentHash::xxh3(&content[1..])
+        ContentHash::of_test(&content),
+        ContentHash::of_test(&content[1..])
     );
 }

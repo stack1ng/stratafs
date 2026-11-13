@@ -181,7 +181,10 @@ fn end_other_mounts_write<C: Cached<InMemoryStore, P>, P: PubSub<Message = u64>>
     let committed: Result<(), Settled> =
         block_on(engine.mount.store.metadata().transact(|mut metadata| {
             Box::pin(async move {
-                let mut attributes = read_attributes(&*metadata, inode)
+                // The other mount signs what it commits, as every mount of a signed volume does.
+                let verifier = engine.mount.verifier.as_ref().expect("signed");
+                let (mut attributes, root) = verifier
+                    .read(&*metadata, inode)
                     .await
                     .map_err(StoreWork::Read)?
                     .expect("the file exists");
@@ -191,6 +194,10 @@ fn end_other_mounts_write<C: Cached<InMemoryStore, P>, P: PubSub<Message = u64>>
                         FsKey::new_attributes(inode).into(),
                         Bytes::from(&attributes),
                     )
+                    .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
+                let signed = verifier.signed(inode, &attributes, &root).await;
+                metadata
+                    .set(FsKey::new_signature(inode).into(), signed.unwrap())
                     .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
                 metadata
                     .clear(FsKey::new_pending_change_version(inode).into())

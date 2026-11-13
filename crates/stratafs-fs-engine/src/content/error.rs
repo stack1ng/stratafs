@@ -84,3 +84,5 @@ impl<M, C> From<&ReadSymbolicLinkError<M, C>> for PosixError {
         }
     }
 }
+
+crate::error::from_change_failure!(WriteError);

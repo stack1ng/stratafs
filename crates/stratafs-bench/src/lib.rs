@@ -8,6 +8,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use stratafs_fs_engine::verification::Unsigned;
 
 use futures_executor::ThreadPool as SpawnerPool;
 use futures_util::FutureExt;
@@ -53,6 +54,7 @@ impl FsConfig for BenchFsConfig {
     const CHECKED_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
 
     type HashFunction = Xxh3_128;
+    type Signer = Unsigned;
 }
 
 // The durability limit comes from the build's environment too, as STRATAFS_BENCH_DURABILITY: none, software or power.
@@ -332,6 +334,7 @@ async fn engine<C: Cached<BenchVolume, Client<u64>>>(
         connect(directory, volume)?,
         PUBLISH_TIMEOUT,
         consistency,
+        Unsigned,
         kernel,
         runtime,
     )

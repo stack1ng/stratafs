@@ -301,3 +301,11 @@ impl<M, R, C> From<&RenameError<M, R, C>> for PosixError {
         }
     }
 }
+
+crate::error::from_change_failure!(
+    CreateError,
+    HardLinkError,
+    HardUnlinkError,
+    RmdirError,
+    RenameError
+);

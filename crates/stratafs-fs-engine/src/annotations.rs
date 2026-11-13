@@ -4,6 +4,8 @@
 // The long return types come from that form.
 #![allow(clippy::manual_async_fn, clippy::type_complexity)]
 
+use std::ops::RangeBounds;
+
 use bytes::{Buf, Bytes};
 use futures_util::future::join;
 use stratafs_store::content::ContentStore;
@@ -13,9 +15,10 @@ use crate::annotations::error::{
     GetAnnotationError, ListAnnotationsError, RemoveAnnotationError, SetAnnotationError,
 };
 use crate::attributes::Attributes;
-use crate::error::{IoFailure, refused_or_failed};
-use crate::key::{FsKey, annotation_name, annotations_in};
+use crate::error::IoFailure;
+use crate::key::{FsKey, annotation_name, annotations_in, annotations_of};
 use crate::spillable::SpillableValue;
+use crate::verification::{Record, RecordChange, RecordKind};
 use crate::{FsConfig, FsTransaction, Inode, LARGEST_NAME_LENGTH, Timestamp};
 
 // An annotation is a named value on an inode. A portable annotation means the same on every platform. A platform
@@ -64,12 +67,14 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
                 return Err(GetAnnotationError::FileNameTooLong);
             }
             let (attributes, content) = join(self.getattr(inode), async {
-                let Some(stored) = self
+                let key = Bytes::from(FsKey::new_annotation(inode, key));
+                let stored = self
                     .metadata
-                    .get(FsKey::new_annotation(inode, key).into())
+                    .get(key.clone())
                     .await
-                    .map_err(IoFailure::Metadata)?
-                else {
+                    .map_err(IoFailure::Metadata)?;
+                self.vouched_record(inode, &key, stored.as_ref()).await?;
+                let Some(stored) = stored else {
                     return Ok(None);
                 };
                 let value = SpillableValue::from_stored(stored).map_err(IoFailure::Corrupt)?;
@@ -94,18 +99,34 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     ) -> impl Future<Output = Result<Vec<Bytes>, ListAnnotationsError<T::Failure, C::Failure>>> + Send
     {
         async move {
+            // Annotations are in no order in the inode's hash tree, so a signed volume reads all of them, which is
+            // what the tree vouches for, and keeps those of the scope.
+            let read = match self.verifier() {
+                Some(_) => annotations_of(inode),
+                None => annotations_in(inode, scope),
+            };
             let (attributes, stored) = join(
                 self.getattr(inode),
-                self.metadata
-                    .get_range(annotations_in(inode, scope), usize::MAX),
+                self.metadata.get_range(read, usize::MAX),
             )
             .await;
             if attributes?.is_none() {
                 return Err(ListAnnotationsError::StaleFileHandle);
             }
-            let names = stored
+            let stored: Vec<Record> = stored
                 .map_err(IoFailure::Metadata)?
-                .map(|(key, _)| annotation_name(&key))
+                .map(Record::from)
+                .collect();
+            let (first, last) = (
+                RecordKind::Annotation.at(u64::MIN),
+                RecordKind::Annotation.at(u64::MAX),
+            );
+            self.vouched(inode, first, last, &stored).await?;
+            let in_scope = annotations_in(inode, scope);
+            let names = stored
+                .iter()
+                .filter(|annotation| in_scope.contains(&annotation.key))
+                .map(|annotation| annotation_name(&annotation.key))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(IoFailure::Corrupt)?;
             Ok(names)
@@ -140,7 +161,9 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             if !attributes.settable.restrictions.is_empty() {
                 return Err(SetAnnotationError::OperationNotPermitted);
             }
-            let exists = existing.map_err(IoFailure::Metadata)?.is_some();
+            let existing = existing.map_err(IoFailure::Metadata)?;
+            self.vouched_record(inode, &key, existing.as_ref()).await?;
+            let exists = existing.is_some();
             match (mode, exists) {
                 (SetAnnotationMode::Create, true) => return Err(SetAnnotationError::AlreadyExists),
                 (SetAnnotationMode::Replace, false) => {
@@ -154,9 +177,11 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
                 .make_spillable(&key, 0, value)
                 .await
                 .map_err(IoFailure::ContentWrite)?;
-            self.metadata
-                .set(key, value.to_stored())
-                .map_err(refused_or_failed)?;
+            let set = RecordChange {
+                key,
+                value: Some(value.to_stored()),
+            };
+            self.change_records(inode, vec![set]).await?;
             self.record_change(inode, &mut attributes, self.now());
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)
@@ -185,10 +210,13 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             if !attributes.settable.restrictions.is_empty() {
                 return Err(RemoveAnnotationError::OperationNotPermitted);
             }
-            if existing.map_err(IoFailure::Metadata)?.is_none() {
+            let existing = existing.map_err(IoFailure::Metadata)?;
+            self.vouched_record(inode, &key, existing.as_ref()).await?;
+            if existing.is_none() {
                 return Err(RemoveAnnotationError::AttributeNotFound);
             }
-            self.metadata.clear(key).map_err(IoFailure::Metadata)?;
+            let removed = RecordChange::<Bytes> { key, value: None };
+            self.change_records(inode, vec![removed]).await?;
             self.record_change(inode, &mut attributes, self.now());
             self.write_attributes(inode, &attributes)?;
             Ok(attributes)

@@ -23,6 +23,10 @@ pub(crate) enum KeyKind<'a> {
     HardLink { dir: Inode, position: u64 },
     SymbolicLinkTarget,
     ContentExtent { end: u64 },
+    // Signature is the root of the inode's hash tree, then the signature of its attributes and that root.
+    Signature,
+    // VerificationNode starts the key of every node of the inode's hash tree.
+    VerificationNode,
     PendingChangeVersion,
 }
 
@@ -92,6 +96,20 @@ impl<'a> FsKey<'a> {
         }
     }
 
+    pub(crate) fn new_signature(inode: Inode) -> Self {
+        FsKey {
+            inode,
+            kind: KeyKind::Signature,
+        }
+    }
+
+    pub(crate) fn new_verification_node(inode: Inode) -> Self {
+        FsKey {
+            inode,
+            kind: KeyKind::VerificationNode,
+        }
+    }
+
     pub(crate) fn new_pending_change_version(inode: Inode) -> Self {
         FsKey {
             inode,
@@ -139,6 +157,16 @@ pub(crate) fn annotations_in(
     // every key in the scope starts with the scope's empty name key, less that name's terminator
     let after_every_name = after_every_key_starting_with(&first[..first.len() - 1]);
     (Bound::Included(first), Bound::Excluded(after_every_name))
+}
+
+// annotations_of is every annotation of inode, of every scope.
+pub(crate) fn annotations_of(inode: Inode) -> (Bound<Bytes>, Bound<Bytes>) {
+    let first = Bytes::from(FsKey::new_annotation(inode, AnnotationKey::Portable(&[])));
+    let after_every_annotation = after_every_key_of_kind(&first);
+    (
+        Bound::Included(first),
+        Bound::Excluded(after_every_annotation),
+    )
 }
 
 pub(crate) fn directory_entries_after(dir: Inode, after: u64) -> (Bound<Bytes>, Bound<Bytes>) {

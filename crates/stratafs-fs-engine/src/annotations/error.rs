@@ -128,3 +128,5 @@ impl<M, R, C> From<&RemoveAnnotationError<M, R, C>> for PosixError {
         }
     }
 }
+
+crate::error::from_change_failure!(SetAnnotationError, RemoveAnnotationError);

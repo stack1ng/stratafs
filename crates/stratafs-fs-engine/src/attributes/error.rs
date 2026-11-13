@@ -32,3 +32,5 @@ impl<M, R, C> From<&SetattrError<M, R, C>> for PosixError {
         }
     }
 }
+
+crate::error::from_change_failure!(SetattrError);

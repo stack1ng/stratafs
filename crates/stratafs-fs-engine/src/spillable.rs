@@ -158,6 +158,8 @@ pub fn referenced_content(key: &[u8], value: &[u8]) -> Option<ContentReference> 
         KeyKind::Attributes
         | KeyKind::DirectoryEntry(_)
         | KeyKind::HardLink { .. }
+        | KeyKind::Signature
+        | KeyKind::VerificationNode
         | KeyKind::PendingChangeVersion => return None,
     };
     let (kind, rest) = SpillableKind::try_read_from_prefix(stored).ok()?;
@@ -208,7 +210,7 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     }
 }
 
-impl<T, C, A, N, S> FsTransaction<'_, '_, T, C, A, N, S> {
+impl<T, C, A, N, S: FsConfig> FsTransaction<'_, '_, T, C, A, N, S> {
     // take_written is the id of a blob of this content that an earlier attempt wrote, and this attempt has not
     // referenced yet.
     fn take_written(&self, hash: ContentHash, length: u64) -> Option<ContentId> {
