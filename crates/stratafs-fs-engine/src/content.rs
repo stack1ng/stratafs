@@ -7,8 +7,8 @@
 use std::ops::{Bound, Range};
 
 use bytes::{Buf, Bytes};
-use futures_util::FutureExt;
-use futures_util::future::join;
+use futures_util::future::{try_join, try_join3};
+use futures_util::{FutureExt, TryFutureExt};
 use stratafs_store::content::{ContentId, ContentReference, ContentStore};
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
@@ -174,14 +174,14 @@ where
     N: Sync,
     S: FsConfig,
 {
-    // overlapping_extents returns all extents that overlap at all with the range: [start, end)
-    fn overlapping_extents(
+    // stored_extents reads the extents of inode that end after start and at or before end, and the first that ends
+    // after end. It reads ahead the nodes of the inode's hash tree for them.
+    fn stored_extents(
         &self,
         inode: Inode,
         start: u64,
         end: u64,
-    ) -> impl Future<Output = Result<Vec<(u64, ExtentValue)>, IoFailure<T::Failure, C::Failure>>> + Send
-    {
+    ) -> impl Future<Output = Result<Vec<Record>, IoFailure<T::Failure, C::Failure>>> + Send {
         async move {
             let directly_in_bounds_future = self.metadata.get_range(
                 (
@@ -200,22 +200,55 @@ where
                     1,
                 )
                 .map(|found| found.map(|mut extents| extents.next()));
-            let (directly_in_bounds, indirectly_in_bounds) =
-                join(directly_in_bounds_future, indirectly_in_bounds_future).await;
-            let directly_in_bounds = directly_in_bounds.map_err(IoFailure::Metadata)?;
-            let indirectly_in_bounds = indirectly_in_bounds.map_err(IoFailure::Metadata)?;
-            let stored: Vec<Record> = directly_in_bounds
+            // A write changes the extent that ends at start too, so its node is read ahead with the others.
+            let (directly_in_bounds, indirectly_in_bounds, ()) = try_join3(
+                directly_in_bounds_future.map_err(IoFailure::Metadata),
+                indirectly_in_bounds_future.map_err(IoFailure::Metadata),
+                self.prefetch(
+                    inode,
+                    RecordKind::Content.at(start),
+                    RecordKind::Content.at(end),
+                ),
+            )
+            .await?;
+            Ok(directly_in_bounds
                 .chain(indirectly_in_bounds)
                 .map(Record::from)
-                .collect();
-            // The extents read are every extent that ends after start, up to the last of them, or up to the end of
-            // the file when none ends after end.
-            let last = match stored.last() {
-                Some(last) => content_extent_end(&last.key).map_err(IoFailure::Corrupt)?,
-                None => u64::MAX,
+                .collect())
+        }
+    }
+
+    // overlapping_extents returns all extents that overlap at all with the range: [start, end), from stored, which
+    // is what stored_extents read for the range of a file of size.
+    fn overlapping_extents(
+        &self,
+        inode: Inode,
+        start: u64,
+        end: u64,
+        size: u64,
+        mut stored: Vec<Record>,
+    ) -> impl Future<Output = Result<Vec<(u64, ExtentValue)>, IoFailure<T::Failure, C::Failure>>> + Send
+    {
+        async move {
+            let ends = stored
+                .iter()
+                .map(|extent| content_extent_end(&extent.key))
+                .collect::<Result<Vec<u64>, _>>()
+                .map_err(IoFailure::Corrupt)?;
+            let after = ends.last().is_some_and(|last| *last > end);
+            let within = &ends[..ends.len() - usize::from(after)];
+            let last = match (within.last(), ends.last()) {
+                // Extents never overlap, so none crosses the end of one that ends where the range does.
+                (Some(last), _) if *last == end => {
+                    stored.truncate(within.len());
+                    end
+                }
+                // The first extent that ends after the range is the only one that can cross its end.
+                (_, Some(last)) if after => *last,
+                // No extent ends after the range, and none ends past the file's size.
+                _ => end.max(size),
             };
-            let last = if last > end { last } else { u64::MAX };
-            if let Some(first) = start.checked_add(1) {
+            if let Some(first) = start.checked_add(1).filter(|first| *first <= last) {
                 let (first, last) = (RecordKind::Content.at(first), RecordKind::Content.at(last));
                 self.vouched(inode, first, last, &stored).await?;
             }
@@ -242,17 +275,18 @@ where
     ) -> impl Future<Output = Result<ContentLoadPlan, ReadError<T::Failure, C::Failure>>> + Send
     {
         async move {
-            let (attributes, extents) = join(
-                self.getattr(inode),
-                self.overlapping_extents(inode, offset, offset.saturating_add(size)),
-            )
-            .await;
-            let attributes = attributes?.ok_or(ReadError::StaleFileHandle)?;
+            let end = offset.saturating_add(size);
+            let (attributes, stored) =
+                try_join(self.getattr(inode), self.stored_extents(inode, offset, end)).await?;
+            let attributes = attributes.ok_or(ReadError::StaleFileHandle)?;
             match attributes.kind {
                 FileType::File => {}
                 FileType::Directory => return Err(ReadError::IsADirectory),
                 FileType::SymbolicLink => return Err(ReadError::InvalidInput),
             }
+            let extents = self
+                .overlapping_extents(inode, offset, end, attributes.settable.size, stored)
+                .await;
             let size = size.min(attributes.settable.size.saturating_sub(offset));
             let read_end = offset + size;
             let pieces = extents?
@@ -320,16 +354,13 @@ where
     ) -> impl Future<Output = Result<Bytes, ReadSymbolicLinkError<T::Failure, C::Failure>>> + Send
     {
         async move {
-            let (attributes, target) = join(self.getattr(inode), async {
-                let Some(stored) = self
-                    .metadata
-                    .get(FsKey::new_symbolic_link_target(inode).into())
-                    .await
-                    .map_err(IoFailure::Metadata)?
-                else {
+            let (attributes, target) = try_join(self.getattr(inode), async {
+                let key = Bytes::from(FsKey::new_symbolic_link_target(inode));
+                let stored = self.metadata.get(key.clone()).map_err(IoFailure::Metadata);
+                let (stored, ()) = try_join(stored, self.prefetch_record(inode, &key)).await?;
+                let Some(stored) = stored else {
                     return Ok(None);
                 };
-                let key = Bytes::from(FsKey::new_symbolic_link_target(inode));
                 self.vouched_record(inode, &key, Some(&stored)).await?;
                 let value = SpillableValue::from_stored(stored).map_err(IoFailure::Corrupt)?;
                 let target = self
@@ -338,15 +369,15 @@ where
                     .map_err(IoFailure::ContentRead)?;
                 Ok::<_, IoFailure<T::Failure, C::Failure>>(Some(target))
             })
-            .await;
-            let attributes = attributes?.ok_or(ReadSymbolicLinkError::StaleFileHandle)?;
+            .await?;
+            let attributes = attributes.ok_or(ReadSymbolicLinkError::StaleFileHandle)?;
             match attributes.kind {
                 FileType::SymbolicLink => {}
                 FileType::File | FileType::Directory => {
                     return Err(ReadSymbolicLinkError::InvalidInput);
                 }
             }
-            Ok(target?.ok_or(IoFailure::Corrupt(CorruptValue::MissingSymbolicLinkTarget))?)
+            Ok(target.ok_or(IoFailure::Corrupt(CorruptValue::MissingSymbolicLinkTarget))?)
         }
     }
 }
@@ -369,17 +400,21 @@ where
     ) -> impl Future<Output = Result<(), SetattrError<T::Failure, T::Rejection, C::Failure>>> + Send
     {
         async move {
-            let removed = (
+            let range = (
                 Bound::Excluded(Bytes::from(FsKey::new_extent(inode, size))),
                 Bound::Included(Bytes::from(FsKey::new_extent(inode, old_size))),
             );
-            let removed: Vec<Record> = self
-                .metadata
-                .get_range(removed, usize::MAX)
-                .await
-                .map_err(IoFailure::Metadata)?
-                .map(Record::from)
-                .collect();
+            let removed = self.metadata.get_range(range, usize::MAX);
+            let (removed, ()) = try_join(
+                removed.map_err(IoFailure::Metadata),
+                self.prefetch(
+                    inode,
+                    RecordKind::Content.at(size),
+                    RecordKind::Content.at(old_size),
+                ),
+            )
+            .await?;
+            let removed: Vec<Record> = removed.map(Record::from).collect();
             if let Some(first) = size.checked_add(1).filter(|first| *first <= old_size) {
                 let (first, last) = (
                     RecordKind::Content.at(first),
@@ -425,12 +460,12 @@ where
             let write_end = offset
                 .checked_add(write_length as u64)
                 .ok_or(WriteError::FileTooLarge)?;
-            let (attributes, overlap) = join(
+            let (attributes, stored) = try_join(
                 self.getattr(inode),
-                self.overlapping_extents(inode, offset, write_end),
+                self.stored_extents(inode, offset, write_end),
             )
-            .await;
-            let mut attributes = attributes?.ok_or(WriteError::StaleFileHandle)?;
+            .await?;
+            let mut attributes = attributes.ok_or(WriteError::StaleFileHandle)?;
             match attributes.kind {
                 FileType::File => {}
                 FileType::Directory => return Err(WriteError::IsADirectory),
@@ -445,6 +480,9 @@ where
             if write_length == 0 {
                 return Ok(attributes);
             }
+            let overlap = self
+                .overlapping_extents(inode, offset, write_end, attributes.settable.size, stored)
+                .await;
             // clear out any overlaps before we write
             let mut changes = Vec::new();
             for (end, extent) in overlap? {

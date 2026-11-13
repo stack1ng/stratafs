@@ -56,10 +56,13 @@ shuttle = "0.9.7"
 smallvec = { version = "1.16", features = ["union"] }
 stateright = "0.31"
 stratafs-content-conformance = { path = "crates/stratafs-content-conformance" }
+stratafs-ed25519-signer = { path = "crates/stratafs-ed25519-signer" }
 stratafs-fs-engine = { path = "crates/stratafs-fs-engine" }
 stratafs-fskit = { path = "crates/stratafs-fskit" }
+stratafs-fuse = { path = "crates/stratafs-fuse" }
 stratafs-keyed-notify = { path = "crates/stratafs-keyed-notify" }
 stratafs-kv-conformance = { path = "crates/stratafs-kv-conformance" }
+stratafs-local = { path = "crates/stratafs-local" }
 stratafs-lock-synchronized = { path = "crates/stratafs-lock-synchronized" }
 stratafs-merkle-radix-tree = { path = "crates/stratafs-merkle-radix-tree" }
 stratafs-lossy-log = { path = "crates/stratafs-lossy-log" }
@@ -83,6 +86,7 @@ toml = "0.9"
 tracing = "0.1"
 tracing-oslog = "0.3"
 tracing-subscriber = "0.3"
+url = "2.5"
 uuid = "1"
 wasm-bindgen = "=0.2.129"
 weak-table = "0.4"

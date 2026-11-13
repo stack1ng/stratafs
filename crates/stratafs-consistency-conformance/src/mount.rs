@@ -1,12 +1,13 @@
 // A mount of a test volume: a real engine over the volume's shared store with a model of its kernel, whose operations
 // call the engine as that kernel's integration does. What every kernel's mount shares is here.
 
-use noncrypto_digests::Xxh3_128;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
-use stratafs_fs_engine::verification::Unsigned;
+use stratafs_fs_engine::verification::Signer;
 
 use bytes::{Buf, Bytes};
 use futures_util::FutureExt;
@@ -19,8 +20,8 @@ use stratafs_fs_engine::holds::{ConsistencyFailure, Failure as MountFailure};
 use stratafs_fs_engine::kernel_cache::KernelCache;
 use stratafs_fs_engine::writes::Pending;
 use stratafs_fs_engine::{
-    Cached, Eventual, FsConfig, FsEngine, Inode, Mount as EngineMount, MountId, PurgeWaits,
-    ResultHandling, StrongUntilDisconnectCached, Timestamp,
+    Cached, EngineSpecification, Eventual, FsConfig, FsEngine, Inode, Mount as EngineMount,
+    MountId, PurgeWaits, ResultHandling, StrongUntilDisconnectCached, Timestamp,
 };
 use stratafs_pubsub::PubSub;
 use stratafs_pubsub_conformance::{MemoryClient, MemoryVolume};
@@ -46,8 +47,36 @@ impl FsConfig for OneKibInline {
     const LARGEST_INLINE_ENTRY: usize = 1024;
     const CHECKED_CONTENT_BYTES: u64 = 1024 * 1024;
 
-    type HashFunction = Xxh3_128;
-    type Signer = Unsigned;
+    type HashFunction = Sha256;
+    type Signer = Signed;
+}
+
+// Signed signs a statement with the hash of a secret and the statement, and trusts only itself. Every mount of a
+// volume has it, so the suite's volumes are signed and every read of them is verified.
+pub(crate) struct Signed;
+
+impl Signed {
+    fn signature(statement: &[u8]) -> Bytes {
+        let signature = Sha256::new()
+            .chain_update(b"the conformance suite's secret")
+            .chain_update(statement)
+            .finalize();
+        Bytes::copy_from_slice(&signature)
+    }
+}
+
+impl Signer for Signed {
+    const VERIFIES: bool = true;
+
+    type Failure = Infallible;
+
+    async fn sign(&self, statement: &[u8]) -> Result<Bytes, Infallible> {
+        Ok(Self::signature(statement))
+    }
+
+    async fn verify(&self, statement: &[u8], signature: &[u8]) -> Result<bool, Infallible> {
+        Ok(Self::signature(statement) == signature)
+    }
 }
 
 type AllocateInode = Box<dyn Fn() -> u64 + Send + Sync>;
@@ -128,7 +157,7 @@ impl<const EVENTUAL: u8> stratafs_fs_engine::Consistency for Mixed<EVENTUAL> {}
 impl<St: Store, P: PubSub<Message = u64>, const EVENTUAL: u8> Cached<St, P> for Mixed<EVENTUAL> {
     type Ticket = u64;
 
-    fn reading(&self, mount: &EngineMount<St, P>) -> u64 {
+    fn reading(&self, mount: EngineMount<'_, St, P>) -> u64 {
         match self {
             Mixed::Strong(strong) => strong.reading(mount),
             Mixed::Eventual(eventual) => eventual.reading(mount),
@@ -137,7 +166,7 @@ impl<St: Store, P: PubSub<Message = u64>, const EVENTUAL: u8> Cached<St, P> for 
 
     async fn before_caching(
         &self,
-        mount: &EngineMount<St, P>,
+        mount: EngineMount<'_, St, P>,
         inodes: &[Inode],
         ticket: u64,
     ) -> Result<bool, MountFailure<P, St>> {
@@ -149,7 +178,7 @@ impl<St: Store, P: PubSub<Message = u64>, const EVENTUAL: u8> Cached<St, P> for 
 
     fn result_handling(
         &self,
-        mount: &EngineMount<St, P>,
+        mount: EngineMount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: u64,
@@ -181,7 +210,7 @@ impl<St: Store, P: PubSub<Message = u64>, const EVENTUAL: u8> Cached<St, P> for 
 
     fn result_handling_listed(
         &self,
-        mount: &EngineMount<St, P>,
+        mount: EngineMount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: u64,
@@ -196,7 +225,7 @@ impl<St: Store, P: PubSub<Message = u64>, const EVENTUAL: u8> Cached<St, P> for 
 
     async fn settled(
         &self,
-        mount: &EngineMount<St, P>,
+        mount: EngineMount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: u64,
@@ -216,14 +245,14 @@ impl<St: Store, P: PubSub<Message = u64>, const EVENTUAL: u8> Cached<St, P> for 
         }
     }
 
-    fn cached(&self, mount: &EngineMount<St, P>, inode: Inode, seen: &Attributes) {
+    fn cached(&self, mount: EngineMount<'_, St, P>, inode: Inode, seen: &Attributes) {
         match self {
             Mixed::Strong(strong) => strong.cached(mount, inode, seen),
             Mixed::Eventual(eventual) => eventual.cached(mount, inode, seen),
         }
     }
 
-    fn forget(&self, mount: &EngineMount<St, P>, inode: Inode) {
+    fn forget(&self, mount: EngineMount<'_, St, P>, inode: Inode) {
         match self {
             Mixed::Strong(strong) => strong.forget(mount, inode),
             Mixed::Eventual(eventual) => eventual.forget(mount, inode),
@@ -393,21 +422,23 @@ impl Volume {
             Box::new(move || next_inode.fetch_add(1, Ordering::SeqCst));
         let connecting = Arc::clone(&faults);
         let engine = FsEngine::new(
-            SharedStore::new(&self.store, &faults),
-            allocate_inode,
-            next_content_id,
-            epoch as fn() -> Timestamp,
-            MountId(index as u64 + 1),
-            None,
-            move || {
-                let faults = Arc::clone(&connecting);
-                async move { faults.connect().await }.boxed()
-            },
-            PUBLISH_TIMEOUT,
-            C::new(index),
-            Unsigned,
+            EngineSpecification::new(
+                SharedStore::new(&self.store, &faults),
+                allocate_inode,
+                next_content_id,
+                epoch as fn() -> Timestamp,
+                MountId(index as u64 + 1),
+                None,
+                move || {
+                    let faults = Arc::clone(&connecting);
+                    async move { faults.connect().await }.boxed()
+                },
+                PUBLISH_TIMEOUT,
+                C::new(index),
+                Signed,
+                Arc::clone(&self.runtime),
+            ),
             kernel.cache(),
-            Arc::clone(&self.runtime),
         )
         .await
         .unwrap_or_else(|_| panic!("mount {index} failed to mount"));

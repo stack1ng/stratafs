@@ -664,7 +664,6 @@ fn deactivated() -> *const NSError {
 
 fn activate_errno(error: &ActivateError) -> libc::c_int {
     match error {
-        ActivateError::UnreadableOptions(_) | ActivateError::InvalidOptions(_) => libc::EINVAL,
         ActivateError::OpenFailed { posix, .. } => errno(*posix),
     }
 }

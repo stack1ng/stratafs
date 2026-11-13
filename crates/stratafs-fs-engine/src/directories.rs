@@ -5,7 +5,8 @@
 #![allow(clippy::manual_async_fn, clippy::type_complexity)]
 
 use bytes::{Buf, Bytes};
-use futures_util::future::{join, join3, join4};
+use futures_util::TryFutureExt;
+use futures_util::future::{try_join, try_join4};
 use stratafs_store::content::ContentStore;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
@@ -154,6 +155,32 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
         self.vouched(dir, first, last, entries)
     }
 
+    // prefetch_names reads ahead the nodes of inode's hash tree for the names it has, which an operation that gives
+    // it a name or takes one away checks and changes.
+    fn prefetch_names(
+        &self,
+        inode: Inode,
+    ) -> impl Future<Output = Result<(), IoFailure<T::Failure, C::Failure>>> + Send {
+        self.prefetch(
+            inode,
+            RecordKind::Name.at(u64::MIN),
+            RecordKind::Name.at(u64::MAX),
+        )
+    }
+
+    // getattr_with_names is inode's attributes, read with the nodes of its hash tree for its names read ahead.
+    fn getattr_with_names(
+        &self,
+        inode: Inode,
+    ) -> impl Future<Output = Result<Option<Attributes>, IoFailure<T::Failure, C::Failure>>> + Send
+    {
+        async move {
+            let (attributes, ()) =
+                try_join(self.getattr(inode), self.prefetch_names(inode)).await?;
+            Ok(attributes)
+        }
+    }
+
     fn find_name(
         &self,
         dir: Inode,
@@ -161,13 +188,19 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     ) -> impl Future<Output = Result<NameSearch, IoFailure<T::Failure, C::Failure>>> + Send {
         async move {
             let (first, last) = positions_of(name);
-            let entries: Vec<Record> = self
+            let entries = self
                 .metadata
-                .get_range(directory_entries_between(dir, first, last), usize::MAX)
-                .await
-                .map_err(IoFailure::Metadata)?
-                .map(Record::from)
-                .collect();
+                .get_range(directory_entries_between(dir, first, last), usize::MAX);
+            let (entries, ()) = try_join(
+                entries.map_err(IoFailure::Metadata),
+                self.prefetch(
+                    dir,
+                    RecordKind::Content.at(first),
+                    RecordKind::Content.at(last),
+                ),
+            )
+            .await?;
+            let entries: Vec<Record> = entries.map(Record::from).collect();
             self.vouched_entries(dir, first, last, &entries).await?;
             let mut free = first.max(FIRST_POSITION);
             for Record { key, value } in entries {
@@ -245,13 +278,14 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
                 LookupError::InvalidInput,
                 LookupError::FileNameTooLong,
             )?;
-            let (directory, search) = join(self.getattr(dir), self.find_name(dir, name)).await;
+            let (directory, search) =
+                try_join(self.getattr(dir), self.find_name(dir, name)).await?;
             let directory = require_directory(
-                directory?,
+                directory,
                 LookupError::StaleFileHandle,
                 LookupError::NotADirectory,
             )?;
-            let NameSearch::Found(entry) = search? else {
+            let NameSearch::Found(entry) = search else {
                 return Ok(Lookup {
                     directory,
                     found: None,
@@ -276,21 +310,17 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     ) -> impl Future<Output = Result<Vec<DirectoryEntry>, ReaddirError<T::Failure, C::Failure>>> + Send
     {
         async move {
-            let (directory, entries) = join(
-                self.getattr(dir),
-                self.metadata
-                    .get_range(directory_entries_after(dir, after), limit),
-            )
-            .await;
+            let entries = self
+                .metadata
+                .get_range(directory_entries_after(dir, after), limit);
+            let (directory, entries) =
+                try_join(self.getattr(dir), entries.map_err(IoFailure::Metadata)).await?;
             require_directory(
-                directory?,
+                directory,
                 ReaddirError::StaleFileHandle,
                 ReaddirError::NotADirectory,
             )?;
-            let stored: Vec<Record> = entries
-                .map_err(IoFailure::Metadata)?
-                .map(Record::from)
-                .collect();
+            let stored: Vec<Record> = entries.map(Record::from).collect();
             let entries = stored
                 .iter()
                 .map(|entry| decode_entry(&entry.key, entry.value.clone()))
@@ -515,16 +545,17 @@ where
                 }
                 NewItem::SymbolicLink(target) => (FileType::SymbolicLink, target.len() as u64),
             };
-            let (directory, search) = join(self.getattr(dir), self.find_name(dir, name)).await;
+            let (directory, search) =
+                try_join(self.getattr(dir), self.find_name(dir, name)).await?;
             let mut directory = require_directory(
-                directory?,
+                directory,
                 CreateError::StaleFileHandle,
                 CreateError::NotADirectory,
             )?;
             if directory.hard_link_count == 0 {
                 return Err(CreateError::NotFound);
             }
-            let position = match search? {
+            let position = match search {
                 NameSearch::Found(_) => return Err(CreateError::AlreadyExists),
                 NameSearch::Full => return Err(CreateError::StorageFull),
                 NameSearch::Free(position) => position,
@@ -606,22 +637,23 @@ where
                 HardLinkError::InvalidInput,
                 HardLinkError::FileNameTooLong,
             )?;
-            let (item, directory, search) = join3(
+            let (item, directory, search, ()) = try_join4(
                 self.getattr(inode),
                 self.getattr(dir),
                 self.find_name(dir, name),
+                self.prefetch_names(inode),
             )
-            .await;
-            let mut item = item?.ok_or(HardLinkError::StaleFileHandle)?;
+            .await?;
+            let mut item = item.ok_or(HardLinkError::StaleFileHandle)?;
             let mut directory = require_directory(
-                directory?,
+                directory,
                 HardLinkError::StaleFileHandle,
                 HardLinkError::NotADirectory,
             )?;
             if item.hard_link_count == 0 || directory.hard_link_count == 0 {
                 return Err(HardLinkError::NotFound);
             }
-            let position = match search? {
+            let position = match search {
                 NameSearch::Found(_) => return Err(HardLinkError::AlreadyExists),
                 NameSearch::Full => None,
                 NameSearch::Free(position) => Some(position),
@@ -666,13 +698,14 @@ where
                 HardUnlinkError::InvalidInput,
                 HardUnlinkError::FileNameTooLong,
             )?;
-            let (directory, search) = join(self.getattr(dir), self.find_name(dir, name)).await;
+            let (directory, search) =
+                try_join(self.getattr(dir), self.find_name(dir, name)).await?;
             let mut directory = require_directory(
-                directory?,
+                directory,
                 HardUnlinkError::StaleFileHandle,
                 HardUnlinkError::NotADirectory,
             )?;
-            let NameSearch::Found(entry) = search? else {
+            let NameSearch::Found(entry) = search else {
                 return Err(HardUnlinkError::NotFound);
             };
             if expected.is_some_and(|expected| expected != entry.inode) {
@@ -683,7 +716,7 @@ where
                 FileType::File | FileType::SymbolicLink => {}
             }
             let mut item = self
-                .getattr(entry.inode)
+                .getattr_with_names(entry.inode)
                 .await?
                 .ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
             if !directory.settable.restrictions.is_empty() || !item.settable.restrictions.is_empty()
@@ -712,13 +745,14 @@ where
     {
         async move {
             check_name(name, RmdirError::InvalidInput, RmdirError::FileNameTooLong)?;
-            let (directory, search) = join(self.getattr(dir), self.find_name(dir, name)).await;
+            let (directory, search) =
+                try_join(self.getattr(dir), self.find_name(dir, name)).await?;
             let mut directory = require_directory(
-                directory?,
+                directory,
                 RmdirError::StaleFileHandle,
                 RmdirError::NotADirectory,
             )?;
-            let NameSearch::Found(entry) = search? else {
+            let NameSearch::Found(entry) = search else {
                 return Err(RmdirError::NotFound);
             };
             if expected.is_some_and(|expected| expected != entry.inode) {
@@ -728,17 +762,17 @@ where
                 FileType::Directory => {}
                 FileType::File | FileType::SymbolicLink => return Err(RmdirError::NotADirectory),
             }
-            let (item, empty) = join(
+            let (item, empty) = try_join(
                 self.getattr(entry.inode),
                 self.is_empty_directory(entry.inode),
             )
-            .await;
-            let mut item = item?.ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
+            .await?;
+            let mut item = item.ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
             if !directory.settable.restrictions.is_empty() || !item.settable.restrictions.is_empty()
             {
                 return Err(RmdirError::OperationNotPermitted);
             }
-            if !empty? {
+            if !empty {
                 return Err(RmdirError::DirectoryNotEmpty);
             }
             let now = self.now();
@@ -780,37 +814,34 @@ where
                 RenameError::InvalidInput,
                 RenameError::FileNameTooLong,
             )?;
-            let (from, to, source, target) = join4(
+            let (from, to, source, target) = try_join4(
                 self.getattr(dir),
                 self.getattr(new_dir),
                 self.find_name(dir, name),
                 self.find_name(new_dir, new_name),
             )
-            .await;
+            .await?;
             let mut from = require_directory(
-                from?,
+                from,
                 RenameError::StaleFileHandle,
                 RenameError::NotADirectory,
             )?;
-            let mut to = require_directory(
-                to?,
-                RenameError::StaleFileHandle,
-                RenameError::NotADirectory,
-            )?;
+            let mut to =
+                require_directory(to, RenameError::StaleFileHandle, RenameError::NotADirectory)?;
             if to.hard_link_count == 0 {
                 return Err(RenameError::NotFound);
             }
-            let NameSearch::Found(source) = source? else {
+            let NameSearch::Found(source) = source else {
                 return Err(RenameError::NotFound);
             };
             if expected.is_some_and(|expected| expected != source.inode) {
                 return Err(RenameError::StaleFileHandle);
             }
             let mut item = self
-                .getattr(source.inode)
+                .getattr_with_names(source.inode)
                 .await?
                 .ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
-            let target = match (mode, target?) {
+            let target = match (mode, target) {
                 (RenameMode::NoReplace, NameSearch::Found(_)) => {
                     return Err(RenameError::AlreadyExists);
                 }
@@ -883,7 +914,7 @@ where
                 }
                 RenameTarget::Exchanged(target) => {
                     let mut other = self
-                        .getattr(target.inode)
+                        .getattr_with_names(target.inode)
                         .await?
                         .ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
                     if !other.settable.restrictions.is_empty() {
@@ -908,7 +939,7 @@ where
                 }
                 RenameTarget::Replaced(target) => {
                     let mut replaced = self
-                        .getattr(target.inode)
+                        .getattr_with_names(target.inode)
                         .await?
                         .ok_or(IoFailure::Corrupt(CorruptValue::DanglingEntry))?;
                     match (item.kind, replaced.kind) {

@@ -13,6 +13,7 @@ event-listener.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 quick_cache.workspace = true
+rand.workspace = true
 smallvec.workspace = true
 storekey.workspace = true
 stratafs-merkle-radix-tree.workspace = true

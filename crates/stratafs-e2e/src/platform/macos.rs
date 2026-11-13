@@ -1,15 +1,11 @@
-// Mounts through the FSKit module installed on this Mac, which must be built with the sqlite or mdbx store when the
+// Mounts through the stratafs-local FSKit module installed on this Mac. The store must be mdbx or sqlite when the
 // volume gets more than one mount, as the module of each mount is a process of its own.
 
-use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use bytes::Bytes;
 use clap::Args;
 use stratafs_fskit::mount::{mount, unmount};
-use stratafs_fskit::mount_options;
 
 use crate::ConsistencyKind;
 
@@ -17,47 +13,44 @@ use crate::ConsistencyKind;
 pub struct Arguments {
     #[arg(
         long,
-        help = "The stratafs-bench binary of the installed FSKit module's build; the one beside this binary when left out"
+        help = "The stratafs-local binary of the installed FSKit module's build; the one beside this binary when left out"
     )]
-    bench: Option<PathBuf>,
+    local: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value = "sqlite",
+        help = "The store's database: mdbx, redb or sqlite"
+    )]
+    store: String,
 }
 
-// Store is a store directory with one volume in it.
+// Store is a store directory with one volume in it, and the options a mount of it takes.
 pub struct Store {
     directory: PathBuf,
-    volume: Bytes,
+    database: String,
+    volume: String,
+    coordinator: String,
+    // signing_key is the key a signed volume is signed with, as the mount options take it.
+    signing_key: Option<String>,
 }
 
 impl Store {
-    // create makes the store in directory with one volume, whose mounts reach the coordinator at its URL.
+    // create makes the store in directory with one volume, whose mounts reach the coordinator at its URL. The volume
+    // is signed with signing_key when there is one.
     pub fn create(
         arguments: &Arguments,
         directory: &Path,
         coordinator: &str,
+        signing_key: Option<&str>,
     ) -> Result<Store, String> {
-        let bench = match &arguments.bench {
-            Some(bench) => bench.clone(),
-            None => super::beside("stratafs-bench")?,
-        };
-        let created = Command::new(&bench)
-            .arg("create")
-            .arg(directory)
-            .output()
-            .map_err(|error| format!("starting {}: {error}", bench.display()))?;
-        if !created.status.success() {
-            return Err(format!(
-                "creating the volume failed: {}",
-                String::from_utf8_lossy(&created.stderr)
-            ));
-        }
-        let volume = hex::decode(String::from_utf8_lossy(&created.stdout).trim())
-            .map_err(|error| format!("reading the new volume's id: {error}"))?;
-        // The module reads the coordinator's URL from this file in the store directory.
-        fs::write(directory.join("coordinator"), coordinator)
-            .map_err(|error| format!("writing the coordinator's URL: {error}"))?;
+        let local = super::local(&arguments.local)?;
+        let volume = super::create(&local, directory, &arguments.store, signing_key)?;
         Ok(Store {
             directory: directory.to_owned(),
-            volume: Bytes::from(volume),
+            database: arguments.store.clone(),
+            volume,
+            coordinator: coordinator.to_owned(),
+            signing_key: signing_key.map(str::to_owned),
         })
     }
 
@@ -74,18 +67,15 @@ impl Store {
         let link = PathBuf::from(link);
         symlink(&self.directory, &link)
             .map_err(|error| format!("linking the store for mount {index}: {error}"))?;
-        let consistency = match consistency {
-            ConsistencyKind::Strong => mount_options::ConsistencyKind::Strong,
-            ConsistencyKind::Eventual => mount_options::ConsistencyKind::Eventual,
-        };
-        mount(
-            "stratafs",
-            self.volume.clone(),
-            consistency,
-            &link,
-            mount_point,
-        )
-        .map_err(|error| format!("mounting on {}: {error}", mount_point.display()))?;
+        let mut options = format!(
+            "store={},volume={},consistency={consistency},coordinator={}",
+            self.database, self.volume, self.coordinator
+        );
+        if let Some(signing_key) = &self.signing_key {
+            options.push_str(&format!(",signing-key={signing_key}"));
+        }
+        mount("stratafs", &options, &link, mount_point)
+            .map_err(|error| format!("mounting on {}: {error}", mount_point.display()))?;
         Ok(Mounted {
             mount_point: mount_point.to_owned(),
         })

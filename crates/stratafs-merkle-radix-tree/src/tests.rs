@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Buf;
@@ -103,29 +104,119 @@ fn tree<const N: usize>() -> Tree<N> {
     Tree::new(Bytes::from_static(PARTITION))
 }
 
-// verify verifies as the tree does, and checks it read the store at most once.
+// Stated is a record as the tests state it: its position and hash. Edit is a change the same way.
+type Stated<const N: usize> = ([u8; N], Hash);
+type Edit<const N: usize> = ([u8; N], Option<Hash>);
+
+// inclusive is the first and last position of a range, or None for a range of no positions.
+fn inclusive<const N: usize>(range: impl RangeBounds<[u8; N]>) -> Option<([u8; N], [u8; N])> {
+    let first = match range.start_bound() {
+        Bound::Included(first) => *first,
+        Bound::Excluded(before) => next(*before, 1)?,
+        Bound::Unbounded => [u8::MIN; N],
+    };
+    let last = match range.end_bound() {
+        Bound::Included(last) => *last,
+        Bound::Excluded(after) => next(*after, -1)?,
+        Bound::Unbounded => [u8::MAX; N],
+    };
+    (first <= last).then_some((first, last))
+}
+
+// next is the position one step after position, or None when there is none.
+fn next<const N: usize>(mut position: [u8; N], step: i8) -> Option<[u8; N]> {
+    for digit in position.iter_mut().rev() {
+        let (stepped, wrapped) = digit.overflowing_add_signed(step);
+        *digit = stepped;
+        if !wrapped {
+            return Some(position);
+        }
+    }
+    None
+}
+
+fn records<const N: usize>(stated: &[Stated<N>]) -> Vec<Record<Sha256, N>> {
+    let record = |(position, hash): &Stated<N>| Record {
+        position: *position,
+        hash: *hash,
+    };
+    stated.iter().map(record).collect()
+}
+
+fn changes<const N: usize>(edits: &[Edit<N>]) -> Vec<Change<Sha256, N>> {
+    let change = |(position, hash): &Edit<N>| Change {
+        position: *position,
+        hash: *hash,
+    };
+    edits.iter().map(change).collect()
+}
+
+// claim is the claim that records are every record in range. A range of no positions claims nothing.
+fn claim<const N: usize>(
+    range: impl RangeBounds<[u8; N]>,
+    records: &[Record<Sha256, N>],
+) -> Claim<'_, Sha256, N> {
+    let (first, last) = inclusive(range).unwrap_or(([u8::MAX; N], [u8::MIN; N]));
+    Claim {
+        first,
+        last,
+        records,
+    }
+}
+
+// verify verifies as the tree does with nothing read ahead, and checks it read the store at most once.
 fn verify<const N: usize>(
     store: &mut Store,
     root: &Hash,
     range: impl RangeBounds<[u8; N]>,
-    records: &[Record<Sha256, N>],
+    stated: &[Stated<N>],
+) -> Result<(), Error<Infallible>> {
+    verify_with(store, root, range, stated, &mut Prefetched::default())
+}
+
+// verify_with is verify with nodes read ahead.
+fn verify_with<const N: usize>(
+    store: &mut Store,
+    root: &Hash,
+    range: impl RangeBounds<[u8; N]>,
+    stated: &[Stated<N>],
+    prefetched: &mut Prefetched<N>,
 ) -> Result<(), Error<Infallible>> {
     store.watch();
-    let verified = block_on(tree::<N>().verify(store, root, range, records));
+    let records = records(stated);
+    let claims = [claim(range, &records)];
+    let verified = block_on(tree::<N>().verify(store, root, &claims, prefetched));
     assert!(!store.read_after_another.load(Ordering::Relaxed));
     verified
 }
 
-// update updates as the tree does, and checks it read the store at most once.
+// update updates as the tree does with nothing read ahead, and checks it read the store at most once.
 fn update<const N: usize>(
     store: &mut Store,
     root: &Hash,
-    changes: &[Change<Sha256, N>],
+    edits: &[Edit<N>],
+) -> Result<Hash, UpdateError<Store>> {
+    update_with(store, root, edits, &mut Prefetched::default())
+}
+
+// update_with is update with nodes read ahead.
+fn update_with<const N: usize>(
+    store: &mut Store,
+    root: &Hash,
+    edits: &[Edit<N>],
+    prefetched: &mut Prefetched<N>,
 ) -> Result<Hash, UpdateError<Store>> {
     store.watch();
-    let updated = block_on(tree::<N>().update(store, root, changes));
+    let changes = changes(edits);
+    let updated = block_on(tree::<N>().update(store, root, &[], &changes, prefetched));
     assert!(!store.read_after_another.load(Ordering::Relaxed));
     updated
+}
+
+// prefetch reads ahead the nodes of range.
+fn prefetch<const N: usize>(store: &Store, range: impl RangeBounds<[u8; N]>) -> Prefetched<N> {
+    let (first, last) = inclusive(range).expect("the range has positions");
+    block_on(tree::<N>().prefetch(store, first, last)).unwrap()
 }
 
 fn content(seed: u8) -> Hash {
@@ -190,7 +281,7 @@ fn built<const N: usize>(model: &Model<N>) -> (Store, Hash) {
     (store, root)
 }
 
-fn records_of<const N: usize>(model: &Model<N>) -> Vec<Record<Sha256, N>> {
+fn records_of<const N: usize>(model: &Model<N>) -> Vec<Stated<N>> {
     model
         .iter()
         .map(|(position, hash)| (*position, *hash))
@@ -247,7 +338,7 @@ fn agrees_with_the_model<const N: usize>(steps: Vec<Step<N>>) -> Result<(), Test
     let mut model = Model::<N>::new();
     let mut root = Tree::<N>::initial_root();
     for (changes, ranges) in steps {
-        let changes: Vec<Change<Sha256, N>> = changes
+        let changes: Vec<Edit<N>> = changes
             .into_iter()
             .map(|(position, seed)| (position, seed.map(content)))
             .collect();
@@ -354,8 +445,54 @@ proptest! {
     ) {
         let (mut store, root) = built(&model);
         prop_assume!(!store.entries.contains_key(&key(&digits)));
+        // The entry is a child of the root or of a node there is. Under any other, nothing reaches it.
+        let (_, parent) = digits.split_last().unwrap();
+        let reached = parent.is_empty() || store.entries.contains_key(&key(parent));
         store.entries.insert(key(&digits), Bytes::copy_from_slice(&content(hash)));
-        prop_assert!(unverified(verify(&mut store, &root, .., &records_of(&model))));
+        let verified = verify(&mut store, &root, .., &records_of(&model));
+        prop_assert_eq!(unverified(verified), reached);
+    }
+
+    #[test]
+    fn a_tree_with_nodes_read_ahead_agrees_with_the_model(
+        steps in steps::<3>(),
+        ahead in prop::collection::vec((position::<3>(), position::<3>()), 0..8),
+    ) {
+        let mut store = Store::default();
+        let mut model = Model::<3>::new();
+        let mut root = Tree::<3>::initial_root();
+        // The nodes read ahead stay through every step, as they do through a transaction.
+        let mut nodes = Prefetched::default();
+        let mut ahead = ahead.into_iter();
+        for (changes, ranges) in steps {
+            if let Some((one, other)) = ahead.next() {
+                nodes.extend(prefetch(&store, one.min(other)..=one.max(other)));
+            }
+            let changes: Vec<Edit<3>> = changes
+                .into_iter()
+                .map(|(position, seed)| (position, seed.map(content)))
+                .collect();
+            root = update_with(&mut store, &root, &changes, &mut nodes).unwrap();
+            for (position, hash) in changes {
+                match hash {
+                    Some(hash) => model.insert(position, hash),
+                    None => model.remove(&position),
+                };
+            }
+            prop_assert_eq!(&root, &root_of(&model));
+            prop_assert_eq!(&store.entries, &entries_of(&model));
+            for (range, _) in ranges {
+                let records: Vec<_> = records_of(&model)
+                    .into_iter()
+                    .filter(|(position, _)| range.contains(position))
+                    .collect();
+                prop_assert!(verify_with(&mut store, &root, range, &records, &mut nodes).is_ok());
+                if let Some((_, others)) = records.split_last() {
+                    let verified = verify_with(&mut store, &root, range, others, &mut nodes);
+                    prop_assert!(unverified(verified));
+                }
+            }
+        }
     }
 
     // An update reads the children of every node above the record it changes, so tampering with any of them stops it.
@@ -407,7 +544,7 @@ proptest! {
         let (store, root) = built(&model);
         let records = records_of(&model);
         let (early, late) = records.split_at(split.index(records.len() + 1));
-        let changes = |records: &[Record<Sha256, 3>]| -> Vec<Change<Sha256, 3>> {
+        let changes = |records: &[Stated<3>]| -> Vec<Edit<3>> {
             records.iter().map(|(position, hash)| (*position, Some(*hash))).collect()
         };
         let mut other = Store::default();
@@ -624,7 +761,7 @@ fn update_that_changes_nothing_writes_nothing() {
 #[test]
 fn removing_every_record_leaves_no_entries() {
     let (mut store, root, model) = sample();
-    let removals: Vec<Change<Sha256, 3>> = model.keys().map(|position| (*position, None)).collect();
+    let removals: Vec<Edit<3>> = model.keys().map(|position| (*position, None)).collect();
     let (some, rest) = removals.split_at(2);
     let root = update(&mut store, &root, some).unwrap();
     let root = update(&mut store, &root, rest).unwrap();
@@ -671,11 +808,13 @@ fn trees_with_different_partition_prefixes_share_a_store() {
     let (mut store, root, model) = sample();
     let other = MerkleRadixTree::<Sha256, 3>::new(Bytes::from_static(b"other/"));
     let empty = Tree::<3>::initial_root();
-    let changes = [([0, 5, 0], Some(content(9)))];
-    let other_root = block_on(other.update(&mut store, &empty, &changes)).unwrap();
+    let mut nodes = Prefetched::default();
+    let made = changes(&[([0, 5, 0], Some(content(9)))]);
+    let other_root = block_on(other.update(&mut store, &empty, &[], &made, &mut nodes)).unwrap();
     assert!(verify(&mut store, &root, .., &records_of(&model)).is_ok());
-    let records = [([0, 5, 0], content(9))];
-    assert!(block_on(other.verify(&store, &other_root, .., &records)).is_ok());
+    let records = records(&[([0, 5, 0], content(9))]);
+    let claims = [claim(.., &records)];
+    assert!(block_on(other.verify(&store, &other_root, &claims, &mut nodes)).is_ok());
     assert!(
         store
             .entries
@@ -704,6 +843,154 @@ fn verify_and_update_can_run_on_any_thread() {
     let mut store = Store::default();
     let root = Tree::<3>::initial_root();
     let tree = tree::<3>();
-    sendable(&tree.verify(&store, &root, .., &[]));
-    sendable(&tree.update(&mut store, &root, &[]));
+    let (mut nodes, mut others) = (Prefetched::default(), Prefetched::default());
+    sendable(&tree.prefetch(&store, [0; 3], [255; 3]));
+    sendable(&tree.verify(&store, &root, &[], &mut nodes));
+    sendable(&tree.update(&mut store, &root, &[], &[], &mut others));
+}
+
+#[test]
+fn nodes_read_ahead_save_the_read() {
+    let (mut store, root, model) = sample();
+    let mut nodes = prefetch(&store, [0, 5, 0]..=[0, 5, 9]);
+    let records = &records_of(&model)[1..3];
+    verify_with(
+        &mut store,
+        &root,
+        [0, 5, 0]..=[0, 5, 9],
+        records,
+        &mut nodes,
+    )
+    .unwrap();
+    assert_eq!(store.reads(), 0);
+    verify_with(
+        &mut store,
+        &root,
+        [0, 5, 1]..=[0, 5, 1],
+        &records[1..],
+        &mut nodes,
+    )
+    .unwrap();
+    assert_eq!(store.reads(), 0);
+    let changed = [([0, 5, 1], None), ([0, 5, 7], Some(content(9)))];
+    update_with(&mut store, &root, &changed, &mut nodes).unwrap();
+    assert_eq!(store.reads(), 0);
+}
+
+#[test]
+fn positions_no_nodes_were_read_ahead_for_are_read() {
+    let (mut store, root, model) = sample();
+    let mut nodes = prefetch(&store, [0, 5, 0]..=[0, 5, 9]);
+    verify_with(&mut store, &root, .., &records_of(&model), &mut nodes).unwrap();
+    assert_eq!(store.reads(), 3);
+    // What was read stays for the next.
+    verify_with(&mut store, &root, .., &records_of(&model), &mut nodes).unwrap();
+    assert_eq!(store.reads(), 0);
+}
+
+#[test]
+fn an_update_keeps_the_nodes_read_ahead_current() {
+    let (mut store, root, mut model) = sample();
+    let mut nodes = prefetch(&store, ..);
+    let next = update_with(
+        &mut store,
+        &root,
+        &[([0, 5, 2], Some(content(9)))],
+        &mut nodes,
+    )
+    .unwrap();
+    model.insert([0, 5, 2], content(9));
+    verify_with(&mut store, &next, .., &records_of(&model), &mut nodes).unwrap();
+    let removals: Vec<Edit<3>> = model.keys().map(|position| (*position, None)).collect();
+    let last = update_with(&mut store, &next, &removals, &mut nodes).unwrap();
+    verify_with(&mut store, &last, .., &[], &mut nodes).unwrap();
+    assert_eq!(store.reads(), 0);
+    assert_eq!(last, Tree::<3>::initial_root());
+    assert!(store.entries.is_empty());
+}
+
+#[test]
+fn nodes_read_ahead_of_an_earlier_tree_are_read_again() {
+    let (mut store, root, mut model) = sample();
+    let mut stale = prefetch(&store, ..);
+    let mut other = prefetch(&store, ..);
+    let next = update(&mut store, &root, &[([0, 5, 2], Some(content(9)))]).unwrap();
+    model.insert([0, 5, 2], content(9));
+
+    let records = records(&records_of(&model));
+    let claims = [claim(.., &records)];
+    block_on(tree::<3>().verify(&store, &next, &claims, &mut stale)).unwrap();
+    // The nodes read again are the tree's, so nothing more is read.
+    verify_with(&mut store, &next, .., &records_of(&model), &mut stale).unwrap();
+    assert_eq!(store.reads(), 0);
+
+    let removed = changes(&[([0, 5, 2], None)]);
+    let back = block_on(tree::<3>().update(&mut store, &next, &[], &removed, &mut other)).unwrap();
+    assert_eq!(back, root);
+}
+
+#[test]
+fn a_tree_with_no_records_needs_no_read() {
+    let mut store = Store::default();
+    let mut nodes = Prefetched::of_no_records();
+    let empty = Tree::<3>::initial_root();
+    verify_with(&mut store, &empty, .., &[], &mut nodes).unwrap();
+    let made = [([0, 5, 0], Some(content(1)))];
+    let root = update_with(&mut store, &empty, &made, &mut nodes).unwrap();
+    verify_with(
+        &mut store,
+        &root,
+        ..,
+        &[([0, 5, 0], content(1))],
+        &mut nodes,
+    )
+    .unwrap();
+    assert_eq!(store.reads(), 0);
+    let (other, same) = built(&Model::from([([0, 5, 0], content(1))]));
+    assert_eq!(root, same);
+    assert_eq!(store.entries, other.entries);
+}
+
+#[test]
+fn an_update_checks_its_claims_before_it_writes() {
+    let (mut store, root, model) = sample();
+    let stated = records(&records_of(&model));
+    let made = changes(&[([0, 5, 2], Some(content(9)))]);
+    let tree = tree::<3>();
+
+    let missing_one = [claim(.., &stated[1..])];
+    store.watch();
+    let mut nodes = Prefetched::default();
+    let refused = block_on(tree.update(&mut store, &root, &missing_one, &made, &mut nodes));
+    assert!(unverified(refused));
+    assert_eq!(store.writes, 0);
+
+    let all = [claim(.., &stated)];
+    let updated = block_on(tree.update(&mut store, &root, &all, &made, &mut nodes));
+    assert_ne!(updated.unwrap(), root);
+}
+
+#[test]
+fn a_claim_of_no_positions_has_no_records() {
+    let (mut store, root, model) = sample();
+    let stated = records(&records_of(&model));
+    let nothing = Claim {
+        first: [5, 0, 0],
+        last: [0, 0, 5],
+        records: &stated[..0],
+    };
+    let something = Claim {
+        records: &stated[..1],
+        ..nothing
+    };
+    let mut nodes = Prefetched::default();
+    store.watch();
+    assert!(block_on(tree::<3>().verify(&store, &root, &[nothing], &mut nodes)).is_ok());
+    assert!(unverified(block_on(tree::<3>().verify(
+        &store,
+        &root,
+        &[something],
+        &mut nodes
+    ))));
+    assert_eq!(store.reads(), 0);
 }

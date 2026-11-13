@@ -164,10 +164,17 @@ fn entries_in<T: ReadKeyValueTransaction>(
 }
 
 fn stored(engine: &InMemoryEngine, range: (Bound<Bytes>, Bound<Bytes>)) -> Vec<(Bytes, Bytes)> {
-    let read = block_on(engine.mount.store.metadata().read_transact(|metadata| {
-        let range = range.clone();
-        Box::pin(async move { entries_in(&*metadata, range).await.map_err(|_| ()) })
-    }));
+    let read = block_on(
+        engine
+            .specification
+            .mount
+            .store
+            .metadata()
+            .read_transact(|metadata| {
+                let range = range.clone();
+                Box::pin(async move { entries_in(&*metadata, range).await.map_err(|_| ()) })
+            }),
+    );
     done(read).unwrap()
 }
 
@@ -180,18 +187,20 @@ fn stored_at(engine: &InMemoryEngine, key: FsKey<'_>) -> Bytes {
 
 // replace sets each key to its value, or removes it for None.
 fn replace(engine: &InMemoryEngine, entries: Vec<(Bytes, Option<Bytes>)>) {
-    let replaced = block_on(engine.mount.store.metadata().transact(|mut metadata| {
-        let entries = entries.clone();
-        Box::pin(async move {
-            for (key, value) in entries {
-                match value {
-                    Some(value) => metadata.set(key, value).map_err(|_| ())?,
-                    None => metadata.clear(key).map_err(|_| ())?,
+    let replaced = block_on(engine.specification.mount.store.metadata().transact(
+        |mut metadata| {
+            let entries = entries.clone();
+            Box::pin(async move {
+                for (key, value) in entries {
+                    match value {
+                        Some(value) => metadata.set(key, value).map_err(|_| ())?,
+                        None => metadata.clear(key).map_err(|_| ())?,
+                    }
                 }
-            }
-            Ok::<_, ()>(((), metadata))
-        })
-    }));
+                Ok::<_, ()>(((), metadata))
+            })
+        },
+    ));
     done(replaced).unwrap();
 }
 

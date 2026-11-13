@@ -1,7 +1,7 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::iter::Peekable;
 use std::marker::PhantomData;
-use std::ops::{Bound, RangeBounds, RangeInclusive};
+use std::ops::{Bound, RangeInclusive};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use digest::{Digest, Output};
@@ -25,14 +25,97 @@ pub struct MerkleRadixTree<H: Digest, const N: usize> {
 }
 
 // Record is a record of a tree: its position and the hash of its content.
-type Record<H, const N: usize> = ([u8; N], Output<H>);
+pub struct Record<H: Digest, const N: usize> {
+    pub position: [u8; N],
+    pub hash: Output<H>,
+}
 
 // Change is a change to the record at a position: its new hash, or None to remove it.
-type Change<H, const N: usize> = ([u8; N], Option<Output<H>>);
+pub struct Change<H: Digest, const N: usize> {
+    pub position: [u8; N],
+    pub hash: Option<Output<H>>,
+}
 
-// Rebuilt is the hash a node's children gave it as they were read, and the hash they give it after an update's changes,
-// each None for no children.
-type Rebuilt<H> = (Option<Output<H>>, Option<Output<H>>);
+// Claim says that records are every record of a tree at the positions from first to last, in order of position. One
+// whose first is after its last says nothing, and has no records.
+pub struct Claim<'a, H: Digest, const N: usize> {
+    pub first: [u8; N],
+    pub last: [u8; N],
+    pub records: &'a [Record<H, N>],
+}
+
+// Prefetched is nodes of a tree read ahead of the verify or update that needs them. Each uses the nodes it finds
+// here, reads the ones it does not, and keeps them here for the next. An update keeps the nodes it changes current.
+pub struct Prefetched<const N: usize> {
+    // covered is the ranges of positions that every node on the way to is here for.
+    covered: Vec<([u8; N], [u8; N])>,
+    // nodes is the hash of each node read, by its digits, for each length a node's digits have: N of them.
+    nodes: Vec<BTreeMap<Bytes, Bytes>>,
+}
+
+impl<const N: usize> Default for Prefetched<N> {
+    // The default is no nodes, of no positions.
+    fn default() -> Self {
+        Prefetched {
+            covered: Vec::new(),
+            nodes: vec![BTreeMap::new(); N],
+        }
+    }
+}
+
+impl<const N: usize> Prefetched<N> {
+    // of_no_records is every node of a tree that holds no records: none.
+    pub fn of_no_records() -> Self {
+        Prefetched {
+            covered: vec![([u8::MIN; N], [u8::MAX; N])],
+            ..Prefetched::default()
+        }
+    }
+
+    // extend adds the nodes of other, which is of the same tree.
+    pub fn extend(&mut self, other: Prefetched<N>) {
+        self.covered.extend(other.covered);
+        for (nodes, others) in self.nodes.iter_mut().zip(other.nodes) {
+            nodes.extend(others);
+        }
+    }
+
+    // covers says whether every node a verify or update of the positions from first to last needs is here.
+    pub fn covers(&self, first: &[u8; N], last: &[u8; N]) -> bool {
+        let within = |(covered_first, covered_last): &([u8; N], [u8; N])| {
+            covered_first <= first && last <= covered_last
+        };
+        self.covered.iter().any(within)
+    }
+
+    // children is every child of parent, in order: its digits and its hash.
+    fn children(&self, parent: &[u8]) -> impl Iterator<Item = (&Bytes, &Bytes)> {
+        let (mut first, mut last) = ([u8::MIN; N], [u8::MAX; N]);
+        first[..parent.len()].copy_from_slice(parent);
+        last[..parent.len()].copy_from_slice(parent);
+        let length = parent.len() + 1;
+        let children = (
+            Bound::Included(&first[..length]),
+            Bound::Included(&last[..length]),
+        );
+        self.nodes[parent.len()].range::<[u8], _>(children)
+    }
+}
+
+// Planned is what an update does once the nodes it read are verified: the node it sets or removes at each of its
+// digits, and the tree's root afterwards.
+struct Planned<H: Digest> {
+    writes: Vec<(Vec<u8>, Option<Output<H>>)>,
+    root: Output<H>,
+}
+
+// Pending is a change to the node of digits that an update has worked out: its hash afterwards, or None for a node
+// left with no children, and for a node that is not a record the hash its children gave it before.
+struct Pending<H: Digest> {
+    digits: Vec<u8>,
+    after: Option<Output<H>>,
+    before: Option<Option<Output<H>>>,
+}
 
 // UpdateError is why an update in a transaction of T failed.
 pub type UpdateError<T> = Error<
@@ -54,78 +137,217 @@ impl<H: Digest, const N: usize> MerkleRadixTree<H, N> {
         H::new().finalize()
     }
 
-    // verify checks that the tree of root holds exactly records at the positions in range, and no others there. The
-    // records are in order of position. It reads the store at most once.
+    // prefetch reads the nodes a verify or update of the positions from first to last needs.
+    pub async fn prefetch<T: ReadKeyValueTransaction>(
+        &self,
+        transaction: &T,
+        first: [u8; N],
+        last: [u8; N],
+    ) -> Result<Prefetched<N>, Error<T::Failure>> {
+        match first <= last {
+            true => self.read(transaction, &[(first, last)]).await,
+            false => Ok(Prefetched::default()),
+        }
+    }
+
+    // verify checks every claim against the tree of root. It reads the store at most once, for the nodes prefetched
+    // lacks, and only what root vouches for counts: nodes prefetched from an earlier tree are read again.
     pub async fn verify<T: ReadKeyValueTransaction>(
         &self,
         transaction: &T,
         root: &Output<H>,
-        range: impl RangeBounds<[u8; N]>,
-        mut records: &[Record<H, N>],
+        claims: &[Claim<'_, H, N>],
+        prefetched: &mut Prefetched<N>,
     ) -> Result<(), Error<T::Failure>> {
-        let Some((first, last)) = inclusive(range) else {
-            return match records {
-                [] => Ok(()),
-                _ => Err(Error::Unverified),
-            };
+        let needed: Vec<_> = claims
+            .iter()
+            .filter(|claim| claim.first <= claim.last)
+            .map(|claim| (claim.first, claim.last))
+            .collect();
+        let read_ahead = !prefetched.covered.is_empty();
+        self.fill(transaction, &needed, prefetched).await?;
+        match Self::check(root, claims, prefetched) {
+            Err(Refused::Unverified) if read_ahead => {
+                *prefetched = self.read(transaction, &needed).await?;
+                Ok(Self::check(root, claims, prefetched)?)
+            }
+            checked => Ok(checked?),
+        }
+    }
+
+    // update checks every claim against the tree of root, then sets the record at each change's position, or removes
+    // it for None, and returns the root's hash of the tree after. The changes are in order of position, one for each.
+    // It reads the store at most once, for the nodes prefetched lacks, and checks every node it uses against root.
+    // A transaction whose update failed may hold some of its writes, and must not commit.
+    pub async fn update<T: KeyValueTransaction>(
+        &self,
+        transaction: &mut T,
+        root: &Output<H>,
+        claims: &[Claim<'_, H, N>],
+        changes: &[Change<H, N>],
+        prefetched: &mut Prefetched<N>,
+    ) -> Result<Output<H>, UpdateError<T>> {
+        assert!(
+            changes
+                .windows(2)
+                .all(|pair| pair[0].position < pair[1].position),
+            "the changes are in order of position, one for each"
+        );
+        let claimed = claims.iter().filter(|claim| claim.first <= claim.last);
+        let needed: Vec<_> = claimed
+            .map(|claim| (claim.first, claim.last))
+            .chain(
+                changes
+                    .iter()
+                    .map(|change| (change.position, change.position)),
+            )
+            .collect();
+        let read_ahead = !prefetched.covered.is_empty();
+        let read = |error| match error {
+            Error::Unverified => Error::Unverified,
+            Error::Corrupt => Error::Corrupt,
+            Error::Store(failure) => Error::Store(failure),
         };
-        let mut keys = Keys::new(&self.partition_prefix, 2 * N, N);
-        // Each level is every child of the nodes of one length between first and last, from the root's on down.
-        let mut levels = try_join_all((0..N).map(|length| {
-            let children = keys.children(&first[..length], &last[..length]);
-            transaction
-                .get_range(children, usize::MAX)
-                .map_ok(Iterator::peekable)
-        }))
-        .await
-        .map_err(Error::Store)?;
-        let vouched = self
-            .vouched(&mut levels, &[], &first, &last, &mut records)?
-            .unwrap_or_else(Self::initial_root);
-        let unread = levels.iter_mut().any(|level| level.peek().is_some());
-        if vouched != *root || !records.is_empty() || unread {
-            return Err(Error::Unverified);
+        self.fill(&*transaction, &needed, prefetched)
+            .await
+            .map_err(read)?;
+        let planned = match Self::plan(root, claims, changes, prefetched) {
+            Err(Refused::Unverified) if read_ahead => {
+                *prefetched = self.read(&*transaction, &needed).await.map_err(read)?;
+                Self::plan(root, claims, changes, prefetched)?
+            }
+            planned => planned?,
+        };
+        let mut keys = Keys::new(&self.partition_prefix, planned.writes.len(), N);
+        for (digits, hash) in planned.writes {
+            let key = keys.node(&digits);
+            let nodes = &mut prefetched.nodes[digits.len() - 1];
+            match hash {
+                Some(hash) => {
+                    transaction
+                        .set(key, hash.as_slice())
+                        .map_err(|error| match error {
+                            StoreError::Rejected(rejection) => Error::Rejected(rejection),
+                            StoreError::Failed(failure) => Error::Store(failure),
+                        })?;
+                    nodes.insert(Bytes::from(digits), Bytes::copy_from_slice(&hash));
+                }
+                None => {
+                    transaction.clear(key).map_err(Error::Store)?;
+                    nodes.remove(&digits[..]);
+                }
+            }
+        }
+        Ok(planned.root)
+    }
+
+    // fill reads the nodes of every needed range of positions that prefetched has not all of.
+    async fn fill<T: ReadKeyValueTransaction>(
+        &self,
+        transaction: &T,
+        needed: &[([u8; N], [u8; N])],
+        prefetched: &mut Prefetched<N>,
+    ) -> Result<(), Error<T::Failure>> {
+        let missing: Vec<_> = needed
+            .iter()
+            .filter(|(first, last)| !prefetched.covers(first, last))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            prefetched.extend(self.read(transaction, &missing).await?);
         }
         Ok(())
     }
 
-    // vouched takes parent's children off levels and returns the hash they give parent, or None when it has none. It
-    // checks each child between first and last: a record against the next of records, and a node against its own
-    // children.
-    fn vouched(
+    // read reads, for each range of positions, every child of each node on the way to one of them, all at once.
+    async fn read<T: ReadKeyValueTransaction>(
         &self,
-        levels: &mut [Peekable<impl Iterator<Item = (Bytes, Bytes)>>],
+        transaction: &T,
+        ranges: &[([u8; N], [u8; N])],
+    ) -> Result<Prefetched<N>, Error<T::Failure>> {
+        // Ranges that share the start of their positions share the nodes there, which are read once.
+        let mut parents: Vec<(usize, &[u8], &[u8])> = ranges
+            .iter()
+            .flat_map(|(first, last)| {
+                (0..N).map(move |length| (length, &first[..length], &last[..length]))
+            })
+            .collect();
+        parents.sort_unstable();
+        parents.dedup();
+        let mut keys = Keys::new(&self.partition_prefix, 2 * parents.len(), N);
+        let read = try_join_all(parents.into_iter().map(|(length, first, last)| {
+            let children = keys.children(first, last);
+            transaction
+                .get_range(children, usize::MAX)
+                .map_ok(move |children| (length, children))
+        }))
+        .await
+        .map_err(Error::Store)?;
+        let mut prefetched = Prefetched {
+            covered: ranges.to_vec(),
+            ..Prefetched::default()
+        };
+        for (length, children) in read {
+            for (key, hash) in children {
+                let digits = self.digits(&key, length + 1)?;
+                if hash.len() != <H as Digest>::output_size() {
+                    return Err(Error::Corrupt);
+                }
+                prefetched.nodes[length].insert(key.slice_ref(digits), hash);
+            }
+        }
+        Ok(prefetched)
+    }
+
+    // check checks every claim against the tree of root, whose nodes on the way to the claims' positions are all in
+    // nodes.
+    fn check(
+        root: &Output<H>,
+        claims: &[Claim<'_, H, N>],
+        nodes: &Prefetched<N>,
+    ) -> Result<(), Refused> {
+        for claim in claims {
+            let mut records = claim.records;
+            if claim.first <= claim.last {
+                let vouched = Self::vouched(nodes, &[], &claim.first, &claim.last, &mut records)?
+                    .unwrap_or_else(Self::initial_root);
+                if vouched != *root {
+                    return Err(Refused::Unverified);
+                }
+            }
+            if !records.is_empty() {
+                return Err(Refused::Unverified);
+            }
+        }
+        Ok(())
+    }
+
+    // vouched returns the hash parent's children give it, or None when it has none. It checks each child between
+    // first and last: a record against the next of records, and a node against its own children.
+    fn vouched(
+        nodes: &Prefetched<N>,
         parent: &[u8],
         first: &[u8; N],
         last: &[u8; N],
         records: &mut &[Record<H, N>],
     ) -> Result<Option<Output<H>>, Refused> {
-        let (level, deeper) = levels
-            .split_first_mut()
-            .expect("a parent is shorter than a position");
         let length = parent.len() + 1;
         let mut hasher = None;
-        while let Some((key, _)) = level.peek() {
-            if self.digits(key, length)?[..parent.len()] != *parent {
-                break;
-            }
-            let (key, hash) = level.next().expect("the entry was peeked");
-            let digits = self.digits(&key, length)?;
-            let hash = stored_hash::<H>(&hash)?;
-            add_child(&mut hasher, digits, hash);
-            if first[..length] > *digits || *digits > last[..length] {
+        for (digits, hash) in nodes.children(parent) {
+            add_child::<H>(&mut hasher, digits, hash);
+            if first[..length] > digits[..] || digits[..] > last[..length] {
                 continue;
             }
             if length < N {
-                match self.vouched(deeper, digits, first, last, records)? {
-                    Some(children) if children.as_slice() == hash => {}
+                match Self::vouched(nodes, digits, first, last, records)? {
+                    Some(children) if children.as_slice() == &hash[..] => {}
                     _ => return Err(Refused::Unverified),
                 }
                 continue;
             }
             match records.split_first() {
-                Some(((position, content), rest))
-                    if position[..] == *digits && content.as_slice() == hash =>
+                Some((record, rest))
+                    if record.position[..] == digits[..] && record.hash.as_slice() == &hash[..] =>
                 {
                     *records = rest;
                 }
@@ -135,138 +357,89 @@ impl<H: Digest, const N: usize> MerkleRadixTree<H, N> {
         Ok(hasher.map(H::finalize))
     }
 
-    // update sets the record at each position, or removes it for None, and returns the root's hash of the tree after.
-    // The changes are in order of position, one for each. It checks every node it reads against root, and reads the
-    // store at most once. A transaction whose update failed may hold some of its writes, and must not commit.
-    pub async fn update<T: KeyValueTransaction>(
-        &self,
-        transaction: &mut T,
+    // plan checks the claims and works out the changes against the tree of root, whose nodes on the way to the
+    // claims' and the changes' positions are all in nodes. It checks every node it changes against the hash its
+    // parent held for it, up to root.
+    fn plan(
         root: &Output<H>,
+        claims: &[Claim<'_, H, N>],
         changes: &[Change<H, N>],
-    ) -> Result<Output<H>, UpdateError<T>> {
+        nodes: &Prefetched<N>,
+    ) -> Result<Planned<H>, Refused> {
+        Self::check(root, claims, nodes)?;
+        let mut writes = Vec::new();
         if changes.is_empty() {
-            return Ok(root.clone());
+            let root = root.clone();
+            return Ok(Planned { writes, root });
         }
-        assert!(
-            changes.windows(2).all(|pair| pair[0].0 < pair[1].0),
-            "the changes are in order of position, one for each"
-        );
-        // The parents are every node above a changed record, in the order rebuilt comes to them: each change adds the
-        // ones the change before does not share.
-        let parents = || {
-            changes
-                .iter()
-                .enumerate()
-                .flat_map(|(index, (position, _))| {
-                    let unshared = match index.checked_sub(1) {
-                        Some(before) => shared(&changes[before].0, position) + 1,
-                        None => 0,
+        let mut pending: Vec<Pending<H>> = changes
+            .iter()
+            .map(|change| Pending {
+                digits: change.position.to_vec(),
+                after: change.hash.clone(),
+                before: None,
+            })
+            .collect();
+        // The changes move up the tree a length at a time: each node whose children changed is a change to its parent.
+        for length in (1..=N).rev() {
+            let mut parents = Vec::new();
+            for changed in pending
+                .chunk_by(|one, other| one.digits[..length - 1] == other.digits[..length - 1])
+            {
+                let parent = &changed[0].digits[..length - 1];
+                let (mut before, mut after) = (None, None);
+                let mut changed = changed.iter().peekable();
+                let mut children = nodes.children(parent).peekable();
+                loop {
+                    let next = changed.peek().map(|change| &change.digits[..]);
+                    let child = match (children.peek(), next) {
+                        (Some((digits, _)), Some(next)) if digits[..] < *next => children.next(),
+                        (Some(_), None) => children.next(),
+                        (_, Some(_)) => None,
+                        (None, None) => break,
                     };
-                    (unshared..N).map(move |length| &position[..length])
-                })
+                    // A child no change is for stays as it is.
+                    if let Some((digits, hash)) = child {
+                        add_child::<H>(&mut before, digits, hash);
+                        add_child::<H>(&mut after, digits, hash);
+                        continue;
+                    }
+                    let change = changed.next().expect("the change was peeked");
+                    let stored = children
+                        .next_if(|(digits, _)| digits[..] == change.digits[..])
+                        .map(|(_, hash)| &hash[..]);
+                    if let Some(read) = &change.before
+                        && read.as_ref().map(|read| read.as_slice()) != stored
+                    {
+                        return Err(Refused::Unverified);
+                    }
+                    if let Some(stored) = stored {
+                        add_child::<H>(&mut before, &change.digits, stored);
+                    }
+                    if let Some(hash) = &change.after {
+                        add_child::<H>(&mut after, &change.digits, hash);
+                    }
+                    if change.after.as_ref().map(|hash| hash.as_slice()) != stored {
+                        writes.push((change.digits.clone(), change.after.clone()));
+                    }
+                }
+                parents.push(Pending {
+                    digits: parent.to_vec(),
+                    after: after.map(H::finalize),
+                    before: Some(before.map(H::finalize)),
+                });
+            }
+            pending = parents;
+        }
+        let [top] = &pending[..] else {
+            unreachable!("every change is below the root");
         };
-        let written = changes.len() * N;
-        let mut keys = Keys::new(&self.partition_prefix, 2 * parents().count() + written, N);
-        let read = try_join_all(parents().map(|parent| {
-            let children = keys.children(parent, parent);
-            transaction.get_range(children, usize::MAX)
-        }))
-        .await
-        .map_err(Error::Store)?;
-        let (before, after) =
-            self.rebuilt(transaction, &mut keys, &mut read.into_iter(), &[], changes)?;
+        let before = top.before.clone().flatten();
         if before.unwrap_or_else(Self::initial_root) != *root {
-            return Err(Error::Unverified);
+            return Err(Refused::Unverified);
         }
-        Ok(after.unwrap_or_else(Self::initial_root))
-    }
-
-    // rebuilt applies changes, which all lie below parent, to parent's children, which are the next of read, and writes
-    // each child's new hash. It returns the hash the children it read give parent, and the hash its children give it
-    // after the changes, each None for no children. It checks every changed node below parent against what it read.
-    fn rebuilt<T: KeyValueTransaction, I: Iterator<Item = (Bytes, Bytes)>>(
-        &self,
-        transaction: &mut T,
-        keys: &mut Keys,
-        read: &mut impl Iterator<Item = I>,
-        parent: &[u8],
-        mut changes: &[Change<H, N>],
-    ) -> Result<Rebuilt<H>, UpdateError<T>> {
-        let length = parent.len() + 1;
-        let mut children = read
-            .next()
-            .expect("the children of every changed node were read")
-            .peekable();
-        let (mut before, mut after) = (None, None);
-        loop {
-            let next_stored = match children.peek() {
-                Some((key, _)) => {
-                    let digits = self.digits(key, length)?;
-                    if digits[..parent.len()] != *parent {
-                        return Err(Error::Corrupt);
-                    }
-                    Some(digits[parent.len()])
-                }
-                None => None,
-            };
-            let changed = changes.first().map(|(position, _)| position[parent.len()]);
-            let Some(digit) =
-                changed.filter(|digit| next_stored.is_none_or(|stored| *digit <= stored))
-            else {
-                // The next stored child lies before the next changed one, or nothing more changes: it stays.
-                let Some((key, hash)) = children.next() else {
-                    break;
-                };
-                let digits = self.digits(&key, length)?;
-                let hash = stored_hash::<H>(&hash)?;
-                add_child(&mut before, digits, hash);
-                add_child(&mut after, digits, hash);
-                continue;
-            };
-            let below = changes
-                .iter()
-                .take_while(|(position, _)| position[parent.len()] == digit)
-                .count();
-            let (below, rest) = changes.split_at(below);
-            changes = rest;
-            let child = &below[0].0[..length];
-            let stored = match next_stored == Some(digit) {
-                true => children.next().map(|(_, hash)| hash),
-                false => None,
-            };
-            let stored = stored.as_deref().map(stored_hash::<H>).transpose()?;
-            let new = match length < N {
-                true => {
-                    let (before, after) = self.rebuilt(transaction, keys, read, child, below)?;
-                    if before.as_ref().map(|before| before.as_slice()) != stored {
-                        return Err(Error::Unverified);
-                    }
-                    after
-                }
-                false => below[0].1.clone(),
-            };
-            if let Some(stored) = stored {
-                add_child(&mut before, child, stored);
-            }
-            match &new {
-                Some(new) => {
-                    add_child(&mut after, child, new);
-                    if stored != Some(new.as_slice()) {
-                        transaction
-                            .set(keys.node(child), new.as_slice())
-                            .map_err(|error| match error {
-                                StoreError::Rejected(rejection) => Error::Rejected(rejection),
-                                StoreError::Failed(failure) => Error::Store(failure),
-                            })?;
-                    }
-                }
-                None if stored.is_some() => {
-                    transaction.clear(keys.node(child)).map_err(Error::Store)?;
-                }
-                None => {}
-            }
-        }
-        Ok((before.map(H::finalize), after.map(H::finalize)))
+        let root = top.after.clone().unwrap_or_else(Self::initial_root);
+        Ok(Planned { writes, root })
     }
 
     // digits is the digits of the node a stored key names, which are length of them.
@@ -282,54 +455,11 @@ impl<H: Digest, const N: usize> MerkleRadixTree<H, N> {
     }
 }
 
-// stored_hash is a stored value as the hash it has to be.
-fn stored_hash<H: Digest>(stored: &[u8]) -> Result<&[u8], Refused> {
-    match stored.len() == <H as Digest>::output_size() {
-        true => Ok(stored),
-        false => Err(Refused::Corrupt),
-    }
-}
-
 // add_child adds a child, by its digits and its hash, to the hash of its parent.
 fn add_child<H: Digest>(parent: &mut Option<H>, digits: &[u8], hash: &[u8]) {
     let parent = parent.get_or_insert_with(H::new);
     parent.update(digits);
     parent.update(hash);
-}
-
-// shared is how many leading digits two positions share.
-fn shared<const N: usize>(one: &[u8; N], other: &[u8; N]) -> usize {
-    one.iter()
-        .zip(other)
-        .take_while(|(one, other)| one == other)
-        .count()
-}
-
-// inclusive is the first and last position of a range, or None for a range of no positions.
-fn inclusive<const N: usize>(range: impl RangeBounds<[u8; N]>) -> Option<([u8; N], [u8; N])> {
-    let first = match range.start_bound() {
-        Bound::Included(first) => *first,
-        Bound::Excluded(before) => next(*before, 1)?,
-        Bound::Unbounded => [u8::MIN; N],
-    };
-    let last = match range.end_bound() {
-        Bound::Included(last) => *last,
-        Bound::Excluded(after) => next(*after, -1)?,
-        Bound::Unbounded => [u8::MAX; N],
-    };
-    (first <= last).then_some((first, last))
-}
-
-// next is the position one step after position, or None when there is none.
-fn next<const N: usize>(mut position: [u8; N], step: i8) -> Option<[u8; N]> {
-    for digit in position.iter_mut().rev() {
-        let (stepped, wrapped) = digit.overflowing_add_signed(step);
-        *digit = stepped;
-        if !wrapped {
-            return Some(position);
-        }
-    }
-    None
 }
 
 // Keys makes the store's keys of a tree's nodes, in one allocation for all of them.

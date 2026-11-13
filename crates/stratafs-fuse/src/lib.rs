@@ -1,5 +1,5 @@
 // stratafs-fuse serves a stratafs volume to the Linux kernel through FUSE. mount answers the kernel's requests with
-// the engine until the volume is unmounted; stores opens an engine on the store and consistency a mount names.
+// the engine until the volume is unmounted.
 #![cfg(target_os = "linux")]
 
 mod changes;
@@ -8,7 +8,6 @@ mod item;
 mod items;
 mod operations;
 mod purges;
-pub mod stores;
 mod volume;
 
 use std::error::Error;
@@ -22,9 +21,8 @@ use futures_lite::future::block_on;
 use nix::mount::{MntFlags, umount2};
 use nix::sys::signal::{SigSet, Signal};
 use stratafs_fs_engine::error::PosixError;
-use stratafs_fs_engine::{Cached, FsConfig, FsEngine, Timestamp};
+use stratafs_fs_engine::{Cached, EngineSpecification, FsConfig, FsEngine, Timestamp};
 use stratafs_pubsub::PubSub;
-use stratafs_runtime::Runtime;
 use stratafs_store::store::Store;
 
 use file_system::StrataFileSystem;
@@ -36,9 +34,9 @@ pub use volume::FuseCache;
 const FILE_SYSTEM_TYPE: &str = "stratafs";
 
 #[derive(Debug, thiserror::Error)]
-pub enum MountError<F> {
+pub enum MountError {
     #[error("the volume could not be opened")]
-    Open(#[source] F),
+    Open(#[source] Box<dyn Error + Send + Sync>),
     #[error("the volume could not be mounted")]
     Mount(#[source] io::Error),
     #[error("serving the volume failed")]
@@ -47,17 +45,16 @@ pub enum MountError<F> {
     Durable(#[source] Box<dyn Error + Send + Sync>),
 }
 
-// mount opens a volume with open_volume and serves it on mount_point until it is unmounted and its last operation
-// ends, making commits durable each durability_cadence, on fsync and on unmount, to every user when allow_other says
-// so and otherwise to the one mounting it. A request that waits finishes on runtime, which needs threads of its own.
-// SIGINT and SIGTERM unmount, so the caller blocks them in every thread it starts, as the daemon's main does first.
-pub fn mount<St, P, A, N, S, C, F>(
-    runtime: Arc<dyn Runtime>,
+// mount serves the volume specification describes on mount_point until it is unmounted and its last operation ends,
+// making commits durable each durability_cadence, on fsync and on unmount, to every user when allow_other says so and
+// otherwise to the one mounting it. A request that waits finishes on the specification's runtime, which needs threads
+// of its own. SIGINT and SIGTERM unmount, so the caller blocks them in every thread it starts.
+pub fn mount<St, P, A, N, S, C>(
+    specification: EngineSpecification<St, P, A, N, S, C>,
     mount_point: &Path,
     durability_cadence: Duration,
     allow_other: bool,
-    open_volume: impl AsyncFnOnce(FuseCache, Arc<dyn Runtime>) -> Result<FsEngine<St, P, A, N, S, C>, F>,
-) -> Result<(), MountError<F>>
+) -> Result<(), MountError>
 where
     St: Store,
     P: PubSub<Message = u64>,
@@ -65,12 +62,12 @@ where
     N: Fn() -> Timestamp + Send + Sync + 'static,
     S: FsConfig,
     C: Cached<St, P>,
-    F: Error,
 {
     let items = Arc::new(Items::new());
     let kernel = FuseCache::new(Arc::clone(&items));
-    let engine =
-        block_on(open_volume(kernel.clone(), Arc::clone(&runtime))).map_err(MountError::Open)?;
+    let engine = block_on(FsEngine::new(specification, kernel.clone()))
+        .map_err(|error| MountError::Open(Box::new(error)))?;
+    let runtime = Arc::clone(engine.runtime());
     let (stops_durability_cadence, durability_cadence_stopped) = mpsc::channel();
     let (closes, closed) = mpsc::channel();
     let volume = Arc::new(Volume {

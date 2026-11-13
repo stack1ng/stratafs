@@ -153,22 +153,28 @@ fn new_file_another_mount_writes<C: Cached<InMemoryStore, P>, P: PubSub<Message 
     engine: &TestEngine<C, P>,
 ) -> Inode {
     let inode = new_file(engine);
-    let announced: Result<(), Settled> =
-        block_on(engine.mount.store.metadata().transact(|mut metadata| {
-            Box::pin(async move {
-                let attributes = read_attributes(&*metadata, inode)
-                    .await
-                    .map_err(StoreWork::Read)?
-                    .expect("the file exists");
-                metadata
-                    .set(
-                        FsKey::new_pending_change_version(inode).into(),
-                        Bytes::from(&attributes.change_version.after(OTHER_MOUNT)),
-                    )
-                    .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
-                Ok(((), metadata))
-            })
-        }));
+    let announced: Result<(), Settled> = block_on(
+        engine
+            .specification
+            .mount
+            .store
+            .metadata()
+            .transact(|mut metadata| {
+                Box::pin(async move {
+                    let attributes = read_attributes(&*metadata, inode)
+                        .await
+                        .map_err(StoreWork::Read)?
+                        .expect("the file exists");
+                    metadata
+                        .set(
+                            FsKey::new_pending_change_version(inode).into(),
+                            Bytes::from(&attributes.change_version.after(OTHER_MOUNT)),
+                        )
+                        .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
+                    Ok(((), metadata))
+                })
+            }),
+    );
     announced.unwrap();
     inode
 }
@@ -178,33 +184,44 @@ fn end_other_mounts_write<C: Cached<InMemoryStore, P>, P: PubSub<Message = u64>>
     engine: &TestEngine<C, P>,
     inode: Inode,
 ) {
-    let committed: Result<(), Settled> =
-        block_on(engine.mount.store.metadata().transact(|mut metadata| {
-            Box::pin(async move {
-                // The other mount signs what it commits, as every mount of a signed volume does.
-                let verifier = engine.mount.verifier.as_ref().expect("signed");
-                let (mut attributes, root) = verifier
-                    .read(&*metadata, inode)
-                    .await
-                    .map_err(StoreWork::Read)?
-                    .expect("the file exists");
-                attributes.change_version = attributes.change_version.after(OTHER_MOUNT);
-                metadata
-                    .set(
-                        FsKey::new_attributes(inode).into(),
-                        Bytes::from(&attributes),
-                    )
-                    .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
-                let signed = verifier.signed(inode, &attributes, &root).await;
-                metadata
-                    .set(FsKey::new_signature(inode).into(), signed.unwrap())
-                    .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
-                metadata
-                    .clear(FsKey::new_pending_change_version(inode).into())
-                    .map_err(|failure| StoreWork::Write(StoreError::Failed(failure)))?;
-                Ok(((), metadata))
-            })
-        }));
+    let committed: Result<(), Settled> = block_on(
+        engine
+            .specification
+            .mount
+            .store
+            .metadata()
+            .transact(|mut metadata| {
+                Box::pin(async move {
+                    // The other mount signs what it commits, as every mount of a signed volume does.
+                    let verifier = engine
+                        .specification
+                        .mount
+                        .verifier
+                        .as_ref()
+                        .expect("signed");
+                    let (mut attributes, root) = verifier
+                        .read(&*metadata, inode)
+                        .await
+                        .map_err(StoreWork::Read)?
+                        .expect("the file exists");
+                    attributes.change_version = attributes.change_version.after(OTHER_MOUNT);
+                    metadata
+                        .set(
+                            FsKey::new_attributes(inode).into(),
+                            Bytes::from(&attributes),
+                        )
+                        .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
+                    let signed = verifier.signed(inode, &attributes, &root).await;
+                    metadata
+                        .set(FsKey::new_signature(inode).into(), signed.unwrap())
+                        .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
+                    metadata
+                        .clear(FsKey::new_pending_change_version(inode).into())
+                        .map_err(|failure| StoreWork::Write(StoreError::Failed(failure)))?;
+                    Ok(((), metadata))
+                })
+            }),
+    );
     committed.unwrap();
 }
 
@@ -230,7 +247,7 @@ async fn getattr(engine: &StrongEngine, inode: Inode) -> Result<Attributes, Fail
 
 // start_delivery has the mount handle a delivery of inode, which it holds, that never ends.
 fn start_delivery(engine: &StrongEngine, inode: Inode) {
-    let state = &engine.mount.state;
+    let state = &engine.state;
     state
         .lock()
         .held(inode)
@@ -286,19 +303,19 @@ fn with_no_room_a_write_any_purge_waits_for_waits_on_another_mounts_write_while_
     let engine = strong_engine();
     let inode = new_file_another_mount_writes(&engine);
     let strong = engine.consistency();
-    let (stored, pending) = block_on(engine.mount.stored(&[inode])).unwrap();
+    let (stored, pending) = block_on(engine.mount().stored(&[inode])).unwrap();
     let in_flight = [(inode, stored[0].clone().expect("the file exists"))];
-    let ticket = Cached::<InMemoryStore, Alone>::reading(strong, &engine.mount);
+    let ticket = Cached::<InMemoryStore, Alone>::reading(strong, engine.mount());
     let mut settled = pin!(Cached::<InMemoryStore, Alone>::settled(
         strong,
-        &engine.mount,
+        engine.mount(),
         &in_flight,
         &pending,
         ticket,
         PurgeWaits::OfAnyInode,
     ));
     assert!(block_on(poll_once(settled.as_mut())).is_none());
-    engine.mount.state.wake();
+    engine.state.wake();
     block_on(settled).expect("the write waits");
 }
 
@@ -328,7 +345,7 @@ fn with_no_room_a_read_any_purge_waits_for_fails_rather_than_wait_to_retry() {
 fn with_no_room_a_write_any_purge_waits_for_waits_to_publish_while_another_publishes() {
     let engine = strong_engine();
     let inode = new_file(&engine);
-    let mount = &engine.mount;
+    let mount = engine.mount();
     let publishing = block_on(mount.publishing(PurgeWaits::OfAnyInode, &NoRoom(2)));
     let publishing = publishing
         .unwrap()
@@ -348,7 +365,8 @@ fn with_no_room_a_write_any_purge_waits_for_waits_to_publish_while_another_publi
 fn with_no_room_a_write_any_purge_waits_for_waiting_to_publish_fails_once_a_delivery_is_handled() {
     let engine = strong_engine();
     let inode = new_file(&engine);
-    let publishing = block_on(engine.mount.publishing(PurgeWaits::OfAnyInode, &NoRoom(2)));
+    let mount = engine.mount();
+    let publishing = block_on(mount.publishing(PurgeWaits::OfAnyInode, &NoRoom(2)));
     let _publishing = publishing
         .unwrap()
         .expect("one fewer than the limit may publish");
@@ -362,7 +380,8 @@ fn with_no_room_a_write_any_purge_waits_for_waiting_to_publish_fails_once_a_deli
 #[test]
 fn with_a_limit_of_one_a_write_any_purge_waits_for_fails_rather_than_wait_to_publish() {
     let engine = strong_engine();
-    let publishing = pin!(engine.mount.publishing(PurgeWaits::OfAnyInode, &NoRoom(1)));
+    let mount = engine.mount();
+    let publishing = pin!(mount.publishing(PurgeWaits::OfAnyInode, &NoRoom(1)));
     let publishing = block_on(poll_once(publishing));
     assert!(matches!(
         publishing,
@@ -381,7 +400,7 @@ fn a_write_any_purge_waits_for_whose_publish_fails_stops_counting_as_publishing(
         written,
         Err(ConsistencyFailure::Publish(PubSubError::TimedOut))
     ));
-    assert_eq!(engine.mount.state.lock().publishing, 0);
+    assert_eq!(engine.state.lock().publishing, 0);
 }
 
 #[test]
@@ -389,7 +408,7 @@ fn with_no_room_a_write_any_purge_waits_for_fails_rather_than_wait_on_a_claim() 
     let engine = strong_engine();
     let inode = new_file(&engine);
     // Another write of this mount, which never ends, claims the file.
-    assert!(engine.mount.claim(u64::MAX, &[inode]));
+    assert!(engine.mount().claim(u64::MAX, &[inode]));
     start_delivery(&engine, Inode::ROOT);
     let written = write(&engine, inode, PurgeWaits::OfAnyInode);
     assert!(matches!(written, Err(ConsistencyFailure::Contended)));
@@ -399,7 +418,7 @@ fn with_no_room_a_write_any_purge_waits_for_fails_rather_than_wait_on_a_claim() 
 fn with_no_room_a_write_any_purge_waits_for_waits_on_a_claim_while_no_delivery_is_handled() {
     let engine = strong_engine();
     let inodes = [new_file(&engine)];
-    let mount = &engine.mount;
+    let mount = engine.mount();
     assert!(mount.claim(u64::MAX, &inodes));
     let mut unclaimed = pin!(mount.unclaimed(0, &inodes, PurgeWaits::OfAnyInode, &NoRoom(2)));
     assert!(block_on(poll_once(unclaimed.as_mut())).is_none());
@@ -411,7 +430,7 @@ fn with_no_room_a_write_any_purge_waits_for_waits_on_a_claim_while_no_delivery_i
 fn with_no_room_a_write_any_purge_waits_for_waiting_on_a_claim_fails_once_a_delivery_is_handled() {
     let engine = strong_engine();
     let inodes = [new_file(&engine)];
-    let mount = &engine.mount;
+    let mount = engine.mount();
     assert!(mount.claim(u64::MAX, &inodes));
     let mut unclaimed = pin!(mount.unclaimed(0, &inodes, PurgeWaits::OfAnyInode, &NoRoom(2)));
     assert!(block_on(poll_once(unclaimed.as_mut())).is_none());
@@ -427,27 +446,27 @@ fn with_no_room_a_write_any_purge_waits_for_waiting_on_a_claim_fails_once_a_deli
 fn a_read_waiting_on_another_mounts_write_wakes_at_its_commit() {
     let engine = strong_engine();
     let inode = new_file_another_mount_writes(&engine);
-    let began = engine.mount.runtime.now();
+    let began = engine.specification.mount.runtime.now();
     let mut read = pin!(getattr(&engine, inode));
     assert!(block_on(poll_once(read.as_mut())).is_none());
     // It waits having met the write in flight.
-    assert!(!engine.mount.state.lock().seen.is_empty());
+    assert!(!engine.state.lock().seen.is_empty());
     end_other_mounts_write(&engine, inode);
     let read = block_on(read).expect("the read waits and goes on");
     assert_eq!(read.change_version.mount, OTHER_MOUNT);
     // Well before the other mount's writer would be taken for gone.
-    assert!(engine.mount.runtime.now() - began < TIMEOUT + SETTLE_MARGIN);
+    assert!(engine.specification.mount.runtime.now() - began < TIMEOUT + SETTLE_MARGIN);
 }
 
 #[test]
 fn a_read_waiting_on_a_write_whose_writer_is_gone_settles_it_at_its_deadline() {
     let engine = strong_engine();
     let inode = new_file_another_mount_writes(&engine);
-    let began = engine.mount.runtime.now();
+    let began = engine.specification.mount.runtime.now();
     let read = block_on(getattr(&engine, inode)).expect("the read settles the write and goes on");
-    assert!(engine.mount.runtime.now() - began >= TIMEOUT + SETTLE_MARGIN);
+    assert!(engine.specification.mount.runtime.now() - began >= TIMEOUT + SETTLE_MARGIN);
     assert_eq!(read.change_version.mount, OTHER_MOUNT);
-    let (_, pending) = block_on(engine.mount.stored(&[inode])).unwrap();
+    let (_, pending) = block_on(engine.mount().stored(&[inode])).unwrap();
     assert!(pending.is_empty());
 }
 
@@ -458,20 +477,20 @@ fn a_late_read_settling_after_its_wait_is_over_goes_on() {
     block_on(getattr(&engine, inode)).expect("the read holds the inode");
     let strong = engine.consistency();
     // A delivery whose round asked the kernel longer ago than a late read waits for it, and has not ended.
-    let asked_at = engine.mount.runtime.now() - LATE_READS_WAIT;
+    let asked_at = engine.specification.mount.runtime.now() - LATE_READS_WAIT;
     {
-        let mut inner = engine.mount.state.lock();
+        let mut inner = engine.state.lock();
         let hold = inner.held(inode).expect("the mount holds the inode");
         hold.pending += 1;
         hold.asked += 1;
         hold.asked_at = Some(asked_at);
     }
-    let (stored, pending) = block_on(engine.mount.stored(&[inode])).unwrap();
+    let (stored, pending) = block_on(engine.mount().stored(&[inode])).unwrap();
     let reads = [(inode, stored[0].clone().expect("the file exists"))];
-    let ticket = Cached::<InMemoryStore, Alone>::reading(strong, &engine.mount);
+    let ticket = Cached::<InMemoryStore, Alone>::reading(strong, engine.mount());
     let settled = Cached::<InMemoryStore, Alone>::settled(
         strong,
-        &engine.mount,
+        engine.mount(),
         &reads,
         &pending,
         ticket,
@@ -479,6 +498,7 @@ fn a_late_read_settling_after_its_wait_is_over_goes_on() {
     );
     let settled = block_on(
         engine
+            .specification
             .mount
             .runtime
             .timeout(TIMEOUT + SETTLE_MARGIN, settled),
@@ -592,7 +612,7 @@ fn an_eventual_mounts_write_returns_once_a_strong_mount_holding_the_file_dropped
     let (attributes, _) = served(&strong, inode);
     assert_eq!(attributes.settable.size, 6);
     // The eventual mount holds nothing, so no write waits on it.
-    assert!(eventual.mount.state.lock().holds.is_empty());
+    assert!(eventual.state.lock().holds.is_empty());
 }
 
 #[test]
@@ -621,7 +641,7 @@ fn an_eventual_mounts_write_that_cannot_reach_the_pub_sub_fails_and_commits_noth
         engine.read_transact(|txn| Box::pin(async move { txn.lookup(Inode::ROOT, b"file").await })),
     );
     assert!(found.unwrap().found.is_none());
-    let (_, pending) = block_on(engine.mount.stored(&[Inode::ROOT])).unwrap();
+    let (_, pending) = block_on(engine.mount().stored(&[Inode::ROOT])).unwrap();
     assert!(pending.is_empty());
 }
 
@@ -693,7 +713,7 @@ fn an_eventual_mounts_write_a_hung_strong_holder_never_answers_fails_and_commits
             ConsistencyFailure::Publish(_)
         )))
     ));
-    let (stored, pending) = block_on(eventual.mount.stored(&[inode])).unwrap();
+    let (stored, pending) = block_on(eventual.mount().stored(&[inode])).unwrap();
     assert_eq!(
         stored[0].as_ref().expect("the file exists").settable.size,
         0
@@ -760,10 +780,10 @@ fn an_eventual_mounts_write_settles_a_write_whose_writer_is_gone_at_its_deadline
         NoKernel,
     );
     let inode = new_file_another_mount_writes(&eventual);
-    let began = eventual.mount.runtime.now();
+    let began = eventual.specification.mount.runtime.now();
     write_data(&eventual, inode, b"after");
-    assert!(eventual.mount.runtime.now() - began >= TIMEOUT + SETTLE_MARGIN);
-    let (stored, pending) = block_on(eventual.mount.stored(&[inode])).unwrap();
+    assert!(eventual.specification.mount.runtime.now() - began >= TIMEOUT + SETTLE_MARGIN);
+    let (stored, pending) = block_on(eventual.mount().stored(&[inode])).unwrap();
     let stored = stored[0].clone().expect("the file exists");
     // The settle moved the version to the other mount's announcement, and the write moved it once more.
     assert_eq!(stored.change_version.number, 2);
@@ -802,7 +822,7 @@ fn attributes<C: Cached<InMemoryStore, P>, P: PubSub<Message = u64>>(
     engine: &TestEngine<C, P>,
     inode: Inode,
 ) -> Attributes {
-    let (stored, _) = block_on(engine.mount.stored(&[inode])).unwrap();
+    let (stored, _) = block_on(engine.mount().stored(&[inode])).unwrap();
     stored[0].clone().expect("the inode exists")
 }
 
@@ -1079,7 +1099,7 @@ fn unlinks_and_deletes<C: Cached<InMemoryStore, MemoryClient<u64>>>(engine: &Tes
             result.map(|_| ((), txn))
         })
     });
-    let (stored, pending) = block_on(engine.mount.stored(&[inode])).unwrap();
+    let (stored, pending) = block_on(engine.mount().stored(&[inode])).unwrap();
     assert!(stored[0].is_none());
     assert!(pending.is_empty());
     assert_eq!(named(engine, Inode::ROOT, b"file"), None);
@@ -1102,7 +1122,7 @@ fn creates_and_deletes<C: Cached<InMemoryStore, MemoryClient<u64>>>(engine: &Tes
             result.map(|_| (created.inode, txn))
         })
     });
-    let (stored, _) = block_on(engine.mount.stored(&[inode])).unwrap();
+    let (stored, _) = block_on(engine.mount().stored(&[inode])).unwrap();
     assert!(stored[0].is_none());
     assert_eq!(named(engine, Inode::ROOT, b"file"), None);
 }
@@ -1131,7 +1151,7 @@ fn a_strong_mount_lets_go_of_a_file_its_committing_attempt_made_and_deleted() {
         })
     });
     assert!(attempts.into_inner() > 1, "the first attempt made the file");
-    assert!(!engine.mount.state.lock().holds.contains_key(&inode));
+    assert!(!engine.state.lock().holds.contains_key(&inode));
 }
 
 #[test]

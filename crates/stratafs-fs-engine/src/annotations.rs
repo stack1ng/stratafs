@@ -7,7 +7,8 @@
 use std::ops::RangeBounds;
 
 use bytes::{Buf, Bytes};
-use futures_util::future::join;
+use futures_util::TryFutureExt;
+use futures_util::future::{try_join, try_join3};
 use stratafs_store::content::ContentStore;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
 
@@ -53,6 +54,21 @@ impl<'a> AnnotationKey<'a> {
 impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
     FsTransaction<'_, '_, T, C, A, N, S>
 {
+    // stored_annotation reads inode's stored annotation of key, with the nodes of the inode's hash tree for it read
+    // ahead.
+    fn stored_annotation<'a>(
+        &'a self,
+        inode: Inode,
+        key: &'a Bytes,
+    ) -> impl Future<Output = Result<Option<Bytes>, IoFailure<T::Failure, C::Failure>>> + Send + 'a
+    {
+        async move {
+            let stored = self.metadata.get(key.clone()).map_err(IoFailure::Metadata);
+            let (stored, ()) = try_join(stored, self.prefetch_record(inode, key)).await?;
+            Ok(stored)
+        }
+    }
+
     pub fn get_annotation(
         &self,
         inode: Inode,
@@ -66,13 +82,9 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
             if key.name().len() > LARGEST_NAME_LENGTH {
                 return Err(GetAnnotationError::FileNameTooLong);
             }
-            let (attributes, content) = join(self.getattr(inode), async {
+            let (attributes, content) = try_join(self.getattr(inode), async {
                 let key = Bytes::from(FsKey::new_annotation(inode, key));
-                let stored = self
-                    .metadata
-                    .get(key.clone())
-                    .await
-                    .map_err(IoFailure::Metadata)?;
+                let stored = self.stored_annotation(inode, &key).await?;
                 self.vouched_record(inode, &key, stored.as_ref()).await?;
                 let Some(stored) = stored else {
                     return Ok(None);
@@ -84,11 +96,11 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
                     .map_err(IoFailure::ContentRead)?;
                 Ok::<_, IoFailure<T::Failure, C::Failure>>(Some(content))
             })
-            .await;
-            if attributes?.is_none() {
+            .await?;
+            if attributes.is_none() {
                 return Err(GetAnnotationError::StaleFileHandle);
             }
-            Ok(content?)
+            Ok(content)
         }
     }
 
@@ -105,22 +117,21 @@ impl<T: ReadKeyValueTransaction, C: ContentStore, A: Sync, N: Sync, S: FsConfig>
                 Some(_) => annotations_of(inode),
                 None => annotations_in(inode, scope),
             };
-            let (attributes, stored) = join(
-                self.getattr(inode),
-                self.metadata.get_range(read, usize::MAX),
-            )
-            .await;
-            if attributes?.is_none() {
-                return Err(ListAnnotationsError::StaleFileHandle);
-            }
-            let stored: Vec<Record> = stored
-                .map_err(IoFailure::Metadata)?
-                .map(Record::from)
-                .collect();
             let (first, last) = (
                 RecordKind::Annotation.at(u64::MIN),
                 RecordKind::Annotation.at(u64::MAX),
             );
+            let stored = self.metadata.get_range(read, usize::MAX);
+            let (attributes, stored, ()) = try_join3(
+                self.getattr(inode),
+                stored.map_err(IoFailure::Metadata),
+                self.prefetch(inode, first, last),
+            )
+            .await?;
+            if attributes.is_none() {
+                return Err(ListAnnotationsError::StaleFileHandle);
+            }
+            let stored: Vec<Record> = stored.map(Record::from).collect();
             self.vouched(inode, first, last, &stored).await?;
             let in_scope = annotations_in(inode, scope);
             let names = stored
@@ -156,12 +167,11 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             }
             let key = Bytes::from(FsKey::new_annotation(inode, key));
             let (attributes, existing) =
-                join(self.getattr(inode), self.metadata.get(key.clone())).await;
-            let mut attributes = attributes?.ok_or(SetAnnotationError::StaleFileHandle)?;
+                try_join(self.getattr(inode), self.stored_annotation(inode, &key)).await?;
+            let mut attributes = attributes.ok_or(SetAnnotationError::StaleFileHandle)?;
             if !attributes.settable.restrictions.is_empty() {
                 return Err(SetAnnotationError::OperationNotPermitted);
             }
-            let existing = existing.map_err(IoFailure::Metadata)?;
             self.vouched_record(inode, &key, existing.as_ref()).await?;
             let exists = existing.is_some();
             match (mode, exists) {
@@ -205,12 +215,11 @@ impl<T: KeyValueTransaction, C: ContentStore, A: Sync, N: Fn() -> Timestamp + Sy
             }
             let key = Bytes::from(FsKey::new_annotation(inode, key));
             let (attributes, existing) =
-                join(self.getattr(inode), self.metadata.get(key.clone())).await;
-            let mut attributes = attributes?.ok_or(RemoveAnnotationError::StaleFileHandle)?;
+                try_join(self.getattr(inode), self.stored_annotation(inode, &key)).await?;
+            let mut attributes = attributes.ok_or(RemoveAnnotationError::StaleFileHandle)?;
             if !attributes.settable.restrictions.is_empty() {
                 return Err(RemoveAnnotationError::OperationNotPermitted);
             }
-            let existing = existing.map_err(IoFailure::Metadata)?;
             self.vouched_record(inode, &key, existing.as_ref()).await?;
             if existing.is_none() {
                 return Err(RemoveAnnotationError::AttributeNotFound);

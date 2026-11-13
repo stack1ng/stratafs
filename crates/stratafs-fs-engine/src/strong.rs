@@ -23,7 +23,7 @@ impl StrongUntilDisconnectCached {
     #[allow(clippy::too_many_arguments)]
     fn handling<St, P: PubSub>(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: u64,
@@ -72,9 +72,9 @@ impl StrongUntilDisconnectCached {
                         if hold.asked == 0 || began < hold.round => {}
                     _ if no_cache_honoured => behind = true,
                     PurgeWaits::OfOwnInode | PurgeWaits::OfAnyInode
-                        if hold
-                            .asked_at
-                            .is_some_and(|asked| mount.runtime.now() - asked < LATE_READS_WAIT) =>
+                        if hold.asked_at.is_some_and(|asked| {
+                            mount.specification.runtime.now() - asked < LATE_READS_WAIT
+                        }) =>
                     {
                         return ResultHandling::Retry;
                     }
@@ -110,14 +110,14 @@ impl StrongUntilDisconnectCached {
 impl<St: Store, P: PubSub<Message = u64>> Cached<St, P> for StrongUntilDisconnectCached {
     type Ticket = u64;
 
-    fn reading(&self, mount: &Mount<St, P>) -> u64 {
+    fn reading(&self, mount: Mount<'_, St, P>) -> u64 {
         mount.state.clock.fetch_add(1, Ordering::SeqCst)
     }
 
     // before_caching holds every inode of inodes, and says whether each was held already when ticket was taken.
     async fn before_caching(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         inodes: &[Inode],
         ticket: u64,
     ) -> Result<bool, Failure<P, St>> {
@@ -130,7 +130,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St, P> for StrongUntilDisconnec
     // NoCache when no_cache_honoured.
     fn result_handling(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: u64,
@@ -154,7 +154,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St, P> for StrongUntilDisconnec
     // go, but for lost ones, which settled holds again.
     fn result_handling_listed(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: u64,
@@ -173,7 +173,7 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St, P> for StrongUntilDisconnec
 
     async fn settled(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: u64,
@@ -182,9 +182,9 @@ impl<St: Store, P: PubSub<Message = u64>> Cached<St, P> for StrongUntilDisconnec
         mount.settled(reads, pending, ticket, purge_waits).await
     }
 
-    fn cached(&self, _: &Mount<St, P>, _: Inode, _: &Attributes) {}
+    fn cached(&self, _: Mount<'_, St, P>, _: Inode, _: &Attributes) {}
 
-    fn forget(&self, mount: &Mount<St, P>, inode: Inode) {
+    fn forget(&self, mount: Mount<'_, St, P>, inode: Inode) {
         mount.release(&[inode]);
     }
 

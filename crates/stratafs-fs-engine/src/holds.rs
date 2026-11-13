@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use event_listener::Event;
-use futures_core::future::BoxFuture;
 use futures_util::future::{AbortHandle, Abortable, join_all};
 use stratafs_pubsub::{Key, PubSub, PubSubError};
 use stratafs_runtime::Runtime;
@@ -19,9 +18,8 @@ use stratafs_store::store::Store;
 
 use crate::error::{IoFailure, PosixError};
 use crate::kernel_cache::{Answered, Asked, KernelCache, Uninvalidated};
-use crate::verification::Verifier;
 use crate::writes::StoreWork;
-use crate::{Inode, MetadataFailure, MetadataRejection, Mount, MountId, PurgeWaits};
+use crate::{FsEngine, Inode, MetadataFailure, MetadataRejection, Mount, MountId, PurgeWaits};
 
 // CONNECT_TIMEOUT is how long connecting to the volume's pub/sub may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -94,6 +92,35 @@ impl<F, R, M> From<&ConsistencyFailure<F, R, M>> for PosixError {
 // ahead.
 pub type Failure<P, St> =
     ConsistencyFailure<<P as PubSub>::Failure, MetadataRejection<St>, MetadataFailure<St>>;
+
+// NoCoordinator is the pub/sub client of an engine that reaches no coordinator, such as one that only makes a
+// volume. There is none, so its connect always fails.
+pub enum NoCoordinator {}
+
+impl PubSub for NoCoordinator {
+    type Message = u64;
+    type Subscription = ();
+    type Failure = Infallible;
+
+    async fn subscribe<Handled>(
+        &self,
+        _: Key,
+        _: impl Fn(u64) -> Handled + Send + Sync + 'static,
+    ) -> Result<(), PubSubError<Infallible>>
+    where
+        Handled: Future<Output = ()> + Send + 'static,
+    {
+        match *self {}
+    }
+
+    async fn publish(&self, _: Key, _: &u64, _: Duration) -> Result<(), PubSubError<Infallible>> {
+        match *self {}
+    }
+
+    async fn failed(&self) -> Infallible {
+        match *self {}
+    }
+}
 
 pub(crate) struct State<P: PubSub> {
     inner: Mutex<Inner<P>>,
@@ -241,51 +268,33 @@ pub(crate) fn no_room(purge_waits: PurgeWaits, kernel: &dyn KernelCache) -> bool
     purge_waits == PurgeWaits::OfAnyInode && !kernel.in_flight_room()
 }
 
-impl<St, P: PubSub> Mount<St, P> {
-    // new is the mount id of store, whose inodes kernel caches and whose tasks run on runtime, of a volume whose
-    // pub/sub connect reaches and whose publishes wait timeout for holders.
-    pub(crate) fn new(
-        store: Arc<St>,
-        kernel: Arc<dyn KernelCache>,
-        runtime: Arc<dyn Runtime>,
-        id: MountId,
-        verifier: Option<Arc<Verifier>>,
-        connect: impl Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync + 'static,
-        timeout: Duration,
-    ) -> Self {
-        Mount {
-            store,
-            kernel,
-            runtime,
-            id,
-            verifier,
-            connect: Box::new(connect),
-            timeout,
-            state: Arc::new(State {
-                inner: Mutex::new(Inner {
-                    connection: Connection::Down {
-                        connecting: false,
-                        purging: false,
-                    },
-                    holds: HashMap::new(),
-                    seen: HashMap::new(),
-                    claims: HashMap::new(),
-                    delivering: HashMap::new(),
-                    publishing: 0,
-                    generations: 0,
-                    connects: 0,
-                    unconnected: None,
-                }),
-                watching: Mutex::new(None),
-                changed: Event::new(),
-                clock: AtomicU64::new(1),
-                woken: AtomicU64::new(0),
+impl<P: PubSub> State<P> {
+    // new is the state of a mount that holds nothing and has no connection yet.
+    pub(crate) fn new() -> Self {
+        State {
+            inner: Mutex::new(Inner {
+                connection: Connection::Down {
+                    connecting: false,
+                    purging: false,
+                },
+                holds: HashMap::new(),
+                seen: HashMap::new(),
+                claims: HashMap::new(),
+                delivering: HashMap::new(),
+                publishing: 0,
+                generations: 0,
+                connects: 0,
+                unconnected: None,
             }),
+            watching: Mutex::new(None),
+            changed: Event::new(),
+            clock: AtomicU64::new(1),
+            woken: AtomicU64::new(0),
         }
     }
 }
 
-impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
+impl<St: Store, P: PubSub<Message = u64>> Mount<'_, St, P> {
     // client is the connected client, connecting one first when there is none.
     // waited is the first connect that may have run while this operation waited, on a hold another operation was
     // making or here: one that failed fails this operation too, rather than it trying again in turn.
@@ -331,7 +340,10 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
             };
             listener.await;
         };
-        let connecting = self.runtime.timeout(CONNECT_TIMEOUT, (self.connect)());
+        let connecting = self
+            .specification
+            .runtime
+            .timeout(CONNECT_TIMEOUT, (self.specification.connect)());
         let connected = match connecting.await {
             Some(connected) => connected.map_err(|failure| Unconnected::Failed(failure.into())),
             None => Err(Unconnected::TimedOut),
@@ -343,13 +355,13 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
         let watched = connected.map(|client| {
             let client = Arc::new(client);
             let (state, kernel, runtime, watched) = (
-                Arc::downgrade(&self.state),
-                Arc::clone(&self.kernel),
-                Arc::clone(&self.runtime),
+                Arc::downgrade(self.state),
+                Arc::clone(self.kernel),
+                Arc::clone(&self.specification.runtime),
                 Arc::clone(&client),
             );
             let (stop, stopped) = AbortHandle::new_pair();
-            self.runtime.spawn(Box::pin(async move {
+            self.specification.runtime.spawn(Box::pin(async move {
                 let _ = Abortable::new(
                     async move {
                         let failure = watched.failed().await;
@@ -409,9 +421,9 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
             let (client, generation) = self.client(waited).await?;
             // The handler holds the state weakly, so the client the state holds does not keep it alive.
             let (state, kernel, runtime, id) = (
-                Arc::downgrade(&self.state),
-                Arc::clone(&self.kernel),
-                Arc::clone(&self.runtime),
+                Arc::downgrade(self.state),
+                Arc::clone(self.kernel),
+                Arc::clone(&self.specification.runtime),
                 Arc::clone(&id),
             );
             let subscription = client
@@ -832,8 +844,8 @@ async fn purge(runtime: &dyn Runtime, kernel: &dyn KernelCache, inode: Inode) {
     }
 }
 
-// Dropping the mount stops watching its client, which it no longer holds, so the connection closes.
-impl<St, P: PubSub> Drop for Mount<St, P> {
+// Dropping the engine stops watching its client, which it no longer holds, so the connection closes.
+impl<St: Store, P: PubSub, A, N, S, C> Drop for FsEngine<St, P, A, N, S, C> {
     fn drop(&mut self) {
         if let Some(watching) = self
             .state

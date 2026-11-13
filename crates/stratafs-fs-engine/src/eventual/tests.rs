@@ -11,11 +11,15 @@ use super::*;
 use crate::annotations::{AnnotationKey, SetAnnotationMode};
 use crate::checked_content::CheckedBlobs;
 use crate::directories::NewItem;
+use crate::holds::State;
 use crate::kernel_cache::{Answered, Asked, KernelCache, NoKernel, Uninvalidated};
 use crate::test_support::{
     InMemoryEngine, InMemoryStore, OneKibInline, PUBLISH_TIMEOUT, TestVolumes, new_test_engine,
 };
-use crate::{FsConfig, FsEngine, MountId, PurgeWaits, ResultHandling};
+use crate::{
+    EngineSpecification, FsConfig, FsEngine, MountId, MountSpecification, PurgeWaits,
+    ResultHandling,
+};
 
 // ChannelKernel is a kernel cache that sends each inode it is asked to invalidate.
 struct ChannelKernel(mpsc::Sender<Inode>);
@@ -68,22 +72,25 @@ fn auto_invalidating_engine() -> (TestVolumes, InMemoryEngine, mpsc::Receiver<In
 // client's. It reaches the pub/sub of volumes, engine's.
 fn another_client(volumes: &TestVolumes, engine: &InMemoryEngine) -> InMemoryEngine {
     FsEngine {
-        allocate_inode: engine.allocate_inode,
-        allocate_content_id: engine.allocate_content_id,
-        now: engine.now,
-        mount: Mount::new(
-            Arc::clone(&engine.mount.store),
-            Arc::new(NoKernel),
-            Arc::clone(&engine.mount.runtime),
-            MountId(2),
-            engine.mount.verifier.clone(),
-            volumes.connect(),
-            PUBLISH_TIMEOUT,
-        ),
-        durability_limit: None,
-        consistency: Eventual::default(),
+        specification: EngineSpecification {
+            allocate_inode: engine.specification.allocate_inode,
+            allocate_content_id: engine.specification.allocate_content_id,
+            now: engine.specification.now,
+            durability_limit: None,
+            consistency: Eventual::default(),
+            mount: MountSpecification {
+                store: Arc::clone(&engine.specification.mount.store),
+                runtime: Arc::clone(&engine.specification.mount.runtime),
+                id: MountId(2),
+                verifier: engine.specification.mount.verifier.clone(),
+                connect: Box::new(volumes.connect()),
+                timeout: PUBLISH_TIMEOUT,
+            },
+            config: PhantomData,
+        },
+        kernel: Arc::new(NoKernel),
+        state: Arc::new(State::new()),
         checked: CheckedBlobs::new(OneKibInline::CHECKED_CONTENT_BYTES),
-        config: PhantomData,
     }
 }
 
@@ -116,7 +123,11 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_a_write_to_it_commits() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"cached");
     let (other, _) = new_file(&engine, b"other");
-    let mut invalidated = pin!(invalidated(&*engine.mount.store, inode, &seen));
+    let mut invalidated = pin!(invalidated(
+        &*engine.specification.mount.store,
+        inode,
+        &seen
+    ));
     assert!(block_on(poll_once(invalidated.as_mut())).is_none());
     write(&engine, other, b"elsewhere");
     assert!(block_on(poll_once(invalidated.as_mut())).is_none());
@@ -130,9 +141,13 @@ fn an_eventual_engine_invalidates_at_once_when_seen_is_already_stale() {
     let (inode, seen) = new_file(&engine, b"cached");
     write(&engine, inode, b"before the watch");
     assert!(
-        block_on(poll_once(invalidated(&*engine.mount.store, inode, &seen)))
-            .unwrap()
-            .is_ok()
+        block_on(poll_once(invalidated(
+            &*engine.specification.mount.store,
+            inode,
+            &seen
+        )))
+        .unwrap()
+        .is_ok()
     );
 }
 
@@ -140,7 +155,7 @@ fn an_eventual_engine_invalidates_at_once_when_seen_is_already_stale() {
 fn an_eventual_engine_invalidates_a_cached_inode_once_its_annotations_change() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"cached");
-    let invalidated = invalidated(&*engine.mount.store, inode, &seen);
+    let invalidated = invalidated(&*engine.specification.mount.store, inode, &seen);
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
             let result = txn
@@ -170,7 +185,11 @@ fn an_eventual_engine_invalidates_a_cached_inode_once_it_is_deleted() {
     }))
     .unwrap();
     let (inode, seen) = (unlinked.inode, unlinked.item);
-    let mut invalidated = pin!(invalidated(&*engine.mount.store, inode, &seen));
+    let mut invalidated = pin!(invalidated(
+        &*engine.specification.mount.store,
+        inode,
+        &seen
+    ));
     assert!(block_on(poll_once(invalidated.as_mut())).is_none());
     block_on(engine.transact(PurgeWaits::No, |mut txn| {
         Box::pin(async move {
@@ -214,12 +233,13 @@ fn an_auto_invalidating_engine_leaves_a_forgotten_inode_alone() {
 fn an_eventual_engine_retries_a_read_begun_before_the_kernel_last_let_go_of_an_inode() {
     let engine = new_test_engine();
     let (inode, seen) = new_file(&engine, b"cached");
-    let reading =
-        || Cached::<InMemoryStore, MemoryClient<u64>>::reading(&engine.consistency, &engine.mount);
+    let reading = || {
+        Cached::<InMemoryStore, MemoryClient<u64>>::reading(engine.consistency(), engine.mount())
+    };
     let reads = [(inode, seen)];
     let handling = |ticket| {
-        engine.consistency.result_handling(
-            &engine.mount,
+        engine.consistency().result_handling(
+            engine.mount(),
             &reads,
             &Pending::new(),
             ticket,

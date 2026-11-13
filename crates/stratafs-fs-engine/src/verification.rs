@@ -12,9 +12,9 @@ use std::sync::{Arc, PoisonError};
 use bytes::{Buf, Bytes};
 use digest::{Digest, Output};
 use futures_core::future::BoxFuture;
-use futures_util::future::{join, try_join_all};
+use futures_util::future::{try_join, try_join_all};
 use quick_cache::sync::Cache;
-use stratafs_merkle_radix_tree::MerkleRadixTree;
+use stratafs_merkle_radix_tree::{Claim, MerkleRadixTree, Prefetched};
 use stratafs_store::content::ContentStore;
 use stratafs_store::error::StoreError;
 use stratafs_store::kv::{KeyValueTransaction, ReadKeyValueTransaction};
@@ -122,17 +122,18 @@ impl Verifier {
     ) -> impl Future<Output = Result<Option<(Attributes, Bytes)>, IoFailure<T::Failure, C>>> + Send + 'a
     {
         async move {
-            let (attributes, signed) = join(
+            let (stored, signed) = try_join(
                 metadata.get(FsKey::new_attributes(inode).into()),
                 metadata.get(FsKey::new_signature(inode).into()),
             )
-            .await;
-            let Some(stored) = attributes.map_err(IoFailure::Metadata)? else {
+            .await
+            .map_err(IoFailure::Metadata)?;
+            let Some(stored) = stored else {
                 return Ok(None);
             };
             let attributes =
                 Attributes::view(&stored).map_err(|corrupt| IoFailure::Corrupt(corrupt.into()))?;
-            let Some(signed) = signed.map_err(IoFailure::Metadata)? else {
+            let Some(signed) = signed else {
                 return Err(unverified(inode, "its attributes are not signed"));
             };
             let root_length = usize::from(
@@ -305,8 +306,10 @@ where
     ) -> impl Future<Output = Result<Option<Attributes>, IoFailure<T::Failure, C::Failure>>> + Send + 'a
     {
         async move {
-            if self.changes.contains_key(&inode) {
-                return crate::attributes::read_attributes(&*self.metadata, inode).await;
+            match self.changes.get(&inode) {
+                Some(Change::Written(written)) => return Ok(Some(written.clone())),
+                Some(Change::Deleted(_)) => return Ok(None),
+                None => {}
             }
             let Some((attributes, root)) = verifier.read(&*self.metadata, inode).await? else {
                 return Ok(None);
@@ -374,22 +377,28 @@ where
                 return Ok(());
             };
             let hashed = |record: &Record| {
-                let position = position::<S::HashFunction>(&record.key)?;
-                Ok((
-                    position,
-                    hash::<S::HashFunction>(&record.key, &record.value),
-                ))
+                Ok(stratafs_merkle_radix_tree::Record {
+                    position: position::<S::HashFunction>(&record.key)?,
+                    hash: hash::<S::HashFunction>(&record.key, &record.value),
+                })
             };
             let mut hashed = records
                 .iter()
                 .map(hashed)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(IoFailure::Corrupt)?;
-            hashed.sort_unstable_by_key(|(position, _)| *position);
+            hashed.sort_unstable_by_key(|record| record.position);
+            let claim = Claim {
+                first,
+                last,
+                records: &hashed,
+            };
             let root = self.root(verifier, inode).await?;
+            let mut nodes = self.take_nodes(inode);
             let vouched = tree::<S::HashFunction>(inode)
-                .verify(&*self.metadata, &root, first..=last, &hashed)
+                .verify(&*self.metadata, &root, &[claim], &mut nodes)
                 .await;
+            self.keep_nodes(inode, nodes);
             vouched.map_err(|error| match error {
                 stratafs_merkle_radix_tree::Error::Unverified => {
                     unverified(inode, "its hash tree does not hold what was read")
@@ -400,6 +409,61 @@ where
                 stratafs_merkle_radix_tree::Error::Store(failure) => IoFailure::Metadata(failure),
             })
         }
+    }
+
+    // prefetch reads ahead the nodes of inode's hash tree that checking or changing its records at the positions from
+    // first to last needs. An operation sends it with the read of those records, so the two take one round trip.
+    pub(crate) fn prefetch(
+        &self,
+        inode: Inode,
+        first: Position,
+        last: Position,
+    ) -> impl Future<Output = Result<(), IoFailure<T::Failure, C::Failure>>> + Send {
+        async move {
+            if self.verifier().is_none() {
+                return Ok(());
+            }
+            let read = tree::<S::HashFunction>(inode)
+                .prefetch(&*self.metadata, first, last)
+                .await;
+            let nodes = read.map_err(|error| match error {
+                stratafs_merkle_radix_tree::Error::Store(failure) => IoFailure::Metadata(failure),
+                stratafs_merkle_radix_tree::Error::Unverified
+                | stratafs_merkle_radix_tree::Error::Corrupt => {
+                    IoFailure::Corrupt(CorruptValue::InvalidVerificationNode)
+                }
+            })?;
+            self.keep_nodes(inode, nodes);
+            Ok(())
+        }
+    }
+
+    // prefetch_record is prefetch for inode's record of key.
+    pub(crate) fn prefetch_record<'a>(
+        &'a self,
+        inode: Inode,
+        key: &'a Bytes,
+    ) -> impl Future<Output = Result<(), IoFailure<T::Failure, C::Failure>>> + Send + 'a {
+        async move {
+            if self.verifier().is_none() {
+                return Ok(());
+            }
+            let at = position::<S::HashFunction>(key).map_err(IoFailure::Corrupt)?;
+            self.prefetch(inode, at, at).await
+        }
+    }
+
+    // take_nodes takes the nodes of inode's hash tree the transaction has read, for a check or change to use and add
+    // to.
+    fn take_nodes(&self, inode: Inode) -> Prefetched<POSITION_LENGTH> {
+        let mut nodes = self.nodes.lock().unwrap_or_else(PoisonError::into_inner);
+        nodes.remove(&inode).unwrap_or_default()
+    }
+
+    // keep_nodes keeps nodes of inode's hash tree with those the transaction has read.
+    fn keep_nodes(&self, inode: Inode, read: Prefetched<POSITION_LENGTH>) {
+        let mut nodes = self.nodes.lock().unwrap_or_else(PoisonError::into_inner);
+        nodes.entry(inode).or_default().extend(read);
     }
 
     // vouched_record checks that inode's record of key has value, or that it has no such record for None.
@@ -439,12 +503,21 @@ where
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(inode, root);
+            // Its tree has no nodes, so none need reading.
+            self.nodes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(inode, Prefetched::of_no_records());
         }
     }
 
-    // unmade forgets the root of an inode the transaction deleted.
+    // unmade forgets the hash tree of an inode the transaction deleted.
     pub(crate) fn unmade(&self, inode: Inode) {
         self.roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&inode);
+        self.nodes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&inode);
@@ -468,7 +541,7 @@ where
                     let hash = value
                         .as_ref()
                         .map(|value| hash::<S::HashFunction>(&key, value));
-                    records.push((at, hash));
+                    records.push(stratafs_merkle_radix_tree::Change { position: at, hash });
                     match value {
                         Some(value) => self.metadata.set(key, value),
                         None => self.metadata.clear(key).map_err(StoreError::Failed),
@@ -490,12 +563,14 @@ where
             };
             // The last change to a position is the one that stands.
             records.reverse();
-            records.sort_by_key(|(position, _)| *position);
-            records.dedup_by_key(|(position, _)| *position);
+            records.sort_by_key(|change| change.position);
+            records.dedup_by_key(|change| change.position);
             let root = self.root(verifier, inode).await?;
+            let mut nodes = self.take_nodes(inode);
             let updated = tree::<S::HashFunction>(inode)
-                .update(&mut *self.metadata, &root, &records)
+                .update(&mut *self.metadata, &root, &[], &records, &mut nodes)
                 .await;
+            self.keep_nodes(inode, nodes);
             let root = updated.map_err(|error| match error {
                 stratafs_merkle_radix_tree::Error::Unverified => ChangeFailure::Failed(unverified(
                     inode,
@@ -589,6 +664,10 @@ where
 // Roots is the root of the hash tree of each inode a transaction read or changed, as the transaction left it. D is
 // the hash function that makes the roots.
 pub(crate) type Roots<D> = std::sync::Mutex<HashMap<Inode, Output<D>>>;
+
+// Nodes is the nodes of the hash tree of each inode that a transaction has read, which its checks and changes use
+// before they read any more. A change keeps them current.
+pub(crate) type Nodes = std::sync::Mutex<HashMap<Inode, Prefetched<POSITION_LENGTH>>>;
 
 #[cfg(test)]
 mod tests;

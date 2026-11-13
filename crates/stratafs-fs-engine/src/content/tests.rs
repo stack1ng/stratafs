@@ -324,7 +324,15 @@ fn a_view_outside_the_stored_bytes_is_an_invalid_extent() {
 
 fn overlapping(engine: &InMemoryEngine, inode: Inode, start: u64, end: u64) -> Vec<(u64, u64)> {
     block_on(engine.read_transact(|txn| {
-        Box::pin(async move { txn.overlapping_extents(inode, start, end).await })
+        Box::pin(async move {
+            let size = txn
+                .getattr(inode)
+                .await?
+                .map_or(0, |file| file.settable.size);
+            let stored = txn.stored_extents(inode, start, end).await?;
+            txn.overlapping_extents(inode, start, end, size, stored)
+                .await
+        })
     }))
     .map_err(aborted)
     .unwrap()
@@ -461,7 +469,11 @@ fn getattr(engine: &InMemoryEngine, inode: Inode) -> Option<Attributes> {
 
 fn stored_extents(engine: &InMemoryEngine, inode: Inode) -> Vec<(u64, ExtentValue)> {
     block_on(engine.read_transact(|txn| {
-        Box::pin(async move { txn.overlapping_extents(inode, 0, u64::MAX).await })
+        Box::pin(async move {
+            let stored = txn.stored_extents(inode, 0, u64::MAX).await?;
+            txn.overlapping_extents(inode, 0, u64::MAX, u64::MAX, stored)
+                .await
+        })
     }))
     .map_err(aborted)
     .unwrap()

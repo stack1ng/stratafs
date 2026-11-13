@@ -17,6 +17,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use stratafs_ed25519_signer::Ed25519Signer;
 
 use coordinator::Coordinator;
 use platform::{Mounted, Store};
@@ -57,6 +58,11 @@ struct Arguments {
         help = "The seed the operations come from; a random one when left out"
     )]
     seed: Option<u64>,
+    #[arg(
+        long,
+        help = "Sign the volume with a new key, so every mount signs what it writes and verifies what it reads"
+    )]
+    signed: bool,
     #[arg(
         long,
         value_parser = seconds,
@@ -217,10 +223,13 @@ fn run(arguments: &Arguments, seed: u64, progress: &Progress) -> Result<(), Stri
     progress.now(0, "making the volume".to_owned());
     let coordinator =
         Coordinator::start().map_err(|error| format!("starting the coordinator: {error}"))?;
+    // A signed volume gets a key of its own, which lasts as long as the run.
+    let key = arguments.signed.then(|| Ed25519Signer::generate().key());
     let store = Store::create(
         &arguments.platform,
         &directory.join("store"),
         &coordinator.url,
+        key.as_deref(),
     )?;
 
     let kinds = std::iter::repeat_n(ConsistencyKind::Strong, arguments.strong).chain(

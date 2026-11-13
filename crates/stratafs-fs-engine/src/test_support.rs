@@ -35,7 +35,10 @@ use crate::holds::ConnectFailure;
 use crate::kernel_cache::{KernelCache, NoKernel};
 use crate::spillable::{ContentHash, referenced_content};
 use crate::verification::Signer;
-use crate::{Cached, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
+use crate::{
+    Cached, EngineSpecification, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits,
+    Timestamp,
+};
 
 // TEST_MOUNT is the mount test engines are.
 pub(crate) const TEST_MOUNT: MountId = MountId(1);
@@ -360,18 +363,20 @@ impl TestVolumes {
         block_on(async {
             let volume = self.tree.open(volume).await.unwrap();
             FsEngine::new(
-                volume,
-                allocate_inode,
-                next_content_id,
-                now,
-                mount,
-                Some(DurableAgainst::PowerFailure),
-                connect,
-                timeout,
-                consistency,
-                TestSigner,
+                EngineSpecification::new(
+                    volume,
+                    allocate_inode,
+                    next_content_id,
+                    now,
+                    mount,
+                    Some(DurableAgainst::PowerFailure),
+                    connect,
+                    timeout,
+                    consistency,
+                    TestSigner,
+                    Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
+                ),
                 kernel,
-                Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap())),
             )
             .await
             .unwrap()

@@ -6,7 +6,7 @@ use std::future::ready;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use digest::Digest;
 use futures_core::future::BoxFuture;
@@ -33,7 +33,7 @@ use crate::holds::{ConnectFailure, ConsistencyFailure, Failure, State};
 use crate::kernel_cache::KernelCache;
 use crate::spillable::ContentHash;
 pub use crate::strong::StrongUntilDisconnectCached;
-use crate::verification::{Roots, Signer, Verifier};
+use crate::verification::{Nodes, Roots, Signer, Verifier};
 use crate::writes::{Pending, Prepared, read_pending};
 
 pub mod annotations;
@@ -51,6 +51,7 @@ pub mod strong;
 #[cfg(test)]
 mod test_support;
 pub mod verification;
+pub mod volume_creation;
 pub mod writes;
 
 pub trait FsConfig: Send + Sync + 'static {
@@ -114,37 +115,61 @@ type ReadTransaction<'txn, 'engine, St, A, N, S> = FsTransaction<
 type Failed<St, P, E> =
     TransactError<MetadataRejection<St>, EngineFailure<MetadataFailure<St>, Failure<P, St>>, E>;
 
-pub struct FsEngine<St: Store, P: PubSub, A, N, S, C> {
+// EngineSpecification is everything about an engine that is known before the kernel mounts it. A consumer builds one
+// and hands it to its integration, which adds the kernel's cache.
+pub struct EngineSpecification<St, P: PubSub, A, N, S, C> {
     allocate_inode: A,
     allocate_content_id: fn() -> ContentId,
     now: N,
-    // mount is the mount the engine is, whose id stamps every change it makes.
-    mount: Mount<St, P>,
     // durability_limit is the most ensure_durable makes commits durable against, or None when it makes nothing
     // durable.
     durability_limit: Option<DurableAgainst>,
     // consistency keeps the kernel's cache in line with what its reads promise. Dropping it stops its work.
     consistency: C,
-    // checked is the blobs the engine checked last.
-    checked: CheckedBlobs,
+    mount: MountSpecification<St, P>,
     config: PhantomData<S>,
 }
 
-// Mount is one mount of a volume: its store and kernel, and its connection to the volume's pub/sub with the inodes it
-// holds through it.
-pub struct Mount<St, P: PubSub> {
+// MountSpecification is the part of a specification the mount's consistency works with, which only the store and the
+// pub/sub give a type.
+pub struct MountSpecification<St, P: PubSub> {
     pub(crate) store: Arc<St>,
-    pub(crate) kernel: Arc<dyn KernelCache>,
     pub(crate) runtime: Arc<dyn Runtime>,
+    // id stamps every change the mount makes.
     pub(crate) id: MountId,
     // verifier is the volume's verifier, or None when it is not signed.
     pub(crate) verifier: Option<Arc<Verifier>>,
     // connect connects a client of the volume's pub/sub, first and again after the last one failed.
-    connect: Box<dyn Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync>,
+    pub(crate) connect:
+        Box<dyn Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync>,
     // timeout is how long a publish waits for every other holder to handle it.
-    timeout: Duration,
-    state: Arc<State<P>>,
+    pub(crate) timeout: Duration,
 }
+
+// FsEngine is a specification the kernel mounted: with the kernel's cache, and what it keeps while it runs.
+pub struct FsEngine<St: Store, P: PubSub, A, N, S, C> {
+    specification: EngineSpecification<St, P, A, N, S, C>,
+    kernel: Arc<dyn KernelCache>,
+    state: Arc<State<P>>,
+    // checked is the blobs the engine checked last.
+    checked: CheckedBlobs,
+}
+
+// Mount is one mount of a volume, as its consistency works with it: its store and kernel, and its connection to the
+// volume's pub/sub with the inodes it holds through it.
+pub struct Mount<'engine, St, P: PubSub> {
+    pub(crate) specification: &'engine MountSpecification<St, P>,
+    pub(crate) kernel: &'engine Arc<dyn KernelCache>,
+    pub(crate) state: &'engine Arc<State<P>>,
+}
+
+impl<St, P: PubSub> Clone for Mount<'_, St, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<St, P: PubSub> Copy for Mount<'_, St, P> {}
 
 // Consistency is what a client's reads promise about other clients' writes. Each promise is a type of its own.
 pub trait Consistency: Send + Sync + 'static {}
@@ -155,13 +180,13 @@ pub trait Cached<St: Store, P: PubSub>: Consistency {
     type Ticket: Copy + Send + Sync;
 
     // reading marks the start of a read the engine may hand to the kernel.
-    fn reading(&self, mount: &Mount<St, P>) -> Self::Ticket;
+    fn reading(&self, mount: Mount<'_, St, P>) -> Self::Ticket;
 
     // before_caching readies inodes for the kernel to cache, and says whether a read taken at ticket may be cached.
     // When it may not, the engine takes the read again.
     fn before_caching(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         inodes: &[Inode],
         ticket: Self::Ticket,
     ) -> impl Future<Output = Result<bool, Failure<P, St>>> + Send;
@@ -172,7 +197,7 @@ pub trait Cached<St: Store, P: PubSub>: Consistency {
     #[allow(clippy::too_many_arguments)]
     fn result_handling(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: Self::Ticket,
@@ -185,7 +210,7 @@ pub trait Cached<St: Store, P: PubSub>: Consistency {
     // Only inodes held already count, since the kernel keeps nothing of a listing but the attributes of items it holds.
     fn result_handling_listed(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: Self::Ticket,
@@ -195,7 +220,7 @@ pub trait Cached<St: Store, P: PubSub>: Consistency {
     // taking again.
     fn settled(
         &self,
-        mount: &Mount<St, P>,
+        mount: Mount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         pending: &Pending,
         ticket: Self::Ticket,
@@ -203,11 +228,11 @@ pub trait Cached<St: Store, P: PubSub>: Consistency {
     ) -> impl Future<Output = Result<(), Failure<P, St>>> + Send;
 
     // cached tells the consistency the kernel now caches inode as seen.
-    fn cached(&self, mount: &Mount<St, P>, inode: Inode, seen: &Attributes);
+    fn cached(&self, mount: Mount<'_, St, P>, inode: Inode, seen: &Attributes);
 
     // forget tells the consistency the kernel no longer caches inode. It is called while nothing can be handed to
     // the kernel for inode, so it must not wait.
-    fn forget(&self, mount: &Mount<St, P>, inode: Inode);
+    fn forget(&self, mount: Mount<'_, St, P>, inode: Inode);
 
     // write_back says whether the kernel may keep writes before handing them to the engine.
     fn write_back(&self) -> bool;
@@ -285,6 +310,8 @@ pub struct FsTransaction<'txn, 'engine, T, C, A, N, S: FsConfig> {
     // tree of each inode the transaction read or changed.
     verifier: Option<&'engine Verifier>,
     roots: Roots<S::HashFunction>,
+    // nodes is the nodes of the hash tree of each inode the transaction has read.
+    nodes: Nodes,
     allocate_inode: &'engine A,
     allocate_content_id: fn() -> ContentId,
     now: &'engine N,
@@ -305,23 +332,8 @@ impl<T, C, A, N: Fn() -> Timestamp, S: FsConfig> FsTransaction<'_, '_, T, C, A, 
     }
 }
 
-impl<St, P, A, N, S, C> FsEngine<St, P, A, N, S, C>
-where
-    St: Store,
-    P: PubSub<Message = u64>,
-    A: Send + Sync,
-    N: Fn() -> Timestamp + Send + Sync,
-    S: FsConfig,
-    C: Cached<St, P>,
-{
-    // new makes an engine whose consistency keeps kernel's cache of each inode in line with the store, running its
-    // tasks on runtime, of a volume whose pub/sub connect reaches and whose publishes wait timeout for holders. An
-    // engine whose inodes no kernel caches takes NoKernel.
-    //
-    // new returns `impl Future + Send` instead of being `async fn`, so Send is proven here once, for every store.
-    // As `async fn`, rustc checks Send at each call site and wrongly rejects stores whose types contain 'static lifetimes,
-    // such as redb's (https://github.com/rust-lang/rust/issues/110338). The long return type comes from that form.
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+impl<St, P: PubSub, A, N, S: FsConfig, C> EngineSpecification<St, P, A, N, S, C> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: St,
         allocate_inode: A,
@@ -333,8 +345,89 @@ where
         timeout: Duration,
         consistency: C,
         signer: S::Signer,
-        kernel: impl KernelCache,
         runtime: Arc<dyn Runtime>,
+    ) -> Self {
+        EngineSpecification {
+            allocate_inode,
+            allocate_content_id,
+            now,
+            durability_limit,
+            consistency,
+            mount: MountSpecification {
+                store: Arc::new(store),
+                runtime,
+                id: mount,
+                verifier: Verifier::of(signer),
+                connect: Box::new(connect),
+                timeout,
+            },
+            config: PhantomData,
+        }
+    }
+}
+
+// PUBLISH_TIMEOUT is how long a mount's write waits for every other mount holding what it changes. It is longer than
+// the coordinator takes to drop a mount that went silent, so only a coordinator that stopped answering fails a write.
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl<St, P: PubSub, S: FsConfig, C>
+    EngineSpecification<St, P, fn() -> u64, fn() -> Timestamp, S, C>
+{
+    // with_defaults is the specification of an engine on store, whose mounts reach each other through connect and
+    // sign with signer. It allocates at random, reads the system's clock, and takes a mount id at random.
+    pub fn with_defaults(
+        store: St,
+        connect: impl Fn() -> BoxFuture<'static, Result<P, ConnectFailure>> + Send + Sync + 'static,
+        consistency: C,
+        signer: S::Signer,
+        durability_limit: Option<DurableAgainst>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Self {
+        Self::new(
+            store,
+            rand::random,
+            || ContentId(rand::random()),
+            now,
+            MountId(rand::random()),
+            durability_limit,
+            connect,
+            PUBLISH_TIMEOUT,
+            consistency,
+            signer,
+            runtime,
+        )
+    }
+}
+
+// now is the time in nanoseconds since the Unix epoch. It is the clock with_defaults gives an engine, the one place the
+// system's clock is read.
+#[allow(clippy::disallowed_methods)]
+fn now() -> Timestamp {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after 1970");
+    Timestamp(i64::try_from(since_epoch.as_nanos()).expect("the clock is before 2262"))
+}
+
+impl<St, P, A, N, S, C> FsEngine<St, P, A, N, S, C>
+where
+    St: Store,
+    P: PubSub<Message = u64>,
+    A: Send + Sync,
+    N: Fn() -> Timestamp + Send + Sync,
+    S: FsConfig,
+    C: Cached<St, P>,
+{
+    // new is specification as an engine whose consistency keeps kernel's cache of each inode in line with the store.
+    // An engine whose inodes no kernel caches takes NoKernel. Only an integration calls it.
+    //
+    // new returns `impl Future + Send` instead of being `async fn`, so Send is proven here once, for every store.
+    // As `async fn`, rustc checks Send at each call site and wrongly rejects stores whose types contain 'static lifetimes,
+    // such as redb's (https://github.com/rust-lang/rust/issues/110338). The long return type comes from that form.
+    #[allow(clippy::type_complexity)]
+    pub fn new(
+        specification: EngineSpecification<St, P, A, N, S, C>,
+        kernel: impl KernelCache,
     ) -> impl Future<
         Output = Result<
             Self,
@@ -353,22 +446,10 @@ where
         };
         async move {
             let engine = Self {
-                allocate_inode,
-                allocate_content_id,
-                now,
-                mount: Mount::new(
-                    Arc::new(store),
-                    Arc::new(kernel),
-                    runtime,
-                    mount,
-                    Verifier::of(signer),
-                    connect,
-                    timeout,
-                ),
-                durability_limit,
-                consistency,
+                specification,
+                kernel: Arc::new(kernel),
+                state: Arc::new(State::new()),
                 checked: CheckedBlobs::new(S::CHECKED_CONTENT_BYTES),
-                config: PhantomData,
             };
             engine
                 .transact(PurgeWaits::No, |mut transaction| {
@@ -383,6 +464,17 @@ where
     }
 }
 
+impl<St: Store, P: PubSub, A, N, S, C> FsEngine<St, P, A, N, S, C> {
+    // mount is the engine's mount, as its consistency works with it.
+    pub(crate) fn mount(&self) -> Mount<'_, St, P> {
+        Mount {
+            specification: &self.specification.mount,
+            kernel: &self.kernel,
+            state: &self.state,
+        }
+    }
+}
+
 impl<St: Store, P: PubSub, A: Sync, N: Sync, S: Sync, C: Send + Sync> FsEngine<St, P, A, N, S, C> {
     // ensure_durable makes every transaction committed before it is called durable against a failure, or against
     // the durability limit when that is less, and resolves once they are. Without a limit it resolves at once.
@@ -393,8 +485,14 @@ impl<St: Store, P: PubSub, A: Sync, N: Sync, S: Sync, C: Send + Sync> FsEngine<S
         against: DurableAgainst,
     ) -> impl Future<Output = Result<(), St::Failure>> + Send {
         async move {
-            match self.durability_limit {
-                Some(limit) => self.mount.store.ensure_durable(against.min(limit)).await,
+            match self.specification.durability_limit {
+                Some(limit) => {
+                    self.specification
+                        .mount
+                        .store
+                        .ensure_durable(against.min(limit))
+                        .await
+                }
                 None => Ok(()),
             }
         }
@@ -405,15 +503,20 @@ impl<St: Store, P: PubSub, A, N, S, C> FsEngine<St, P, A, N, S, C> {
     // content is the content store, which loads a read's ContentLoadPlan once the read's transaction ends.
     pub fn content(&self) -> CheckedContent<'_, St::Content, S> {
         CheckedContent {
-            store: self.mount.store.content(),
+            store: self.specification.mount.store.content(),
             checked: &self.checked,
             _config: PhantomData,
         }
     }
 
+    // runtime is the runtime the engine's tasks run on, which its integration runs its own waiting work on too.
+    pub fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.specification.mount.runtime
+    }
+
     // consistency is what the engine's reads promise about other clients' writes.
     pub fn consistency(&self) -> &C {
-        &self.consistency
+        &self.specification.consistency
     }
 }
 
@@ -438,7 +541,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                 .committed(purge_waits, &mut work, |_| Vec::new())
                 .await?;
             if let Some(prepared) = prepared {
-                self.mount.finish(prepared, Some(&changes)).await;
+                self.mount().finish(prepared, Some(&changes)).await;
             }
             Ok(result)
         }
@@ -476,22 +579,22 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                 match self.held(ticket, &read).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        ticket = self.consistency.reading(&self.mount);
+                        ticket = self.specification.consistency.reading(self.mount());
                         at_once = false;
                         continue;
                     }
                     Err(failure) => break Err(failure),
                 }
-                if !at_once && self.consistency.holds() {
-                    match self.mount.reread(&committed).await {
+                if !at_once && self.specification.consistency.holds() {
+                    match self.mount().reread(&committed).await {
                         Ok(reread) => (read, pending) = reread,
                         Err(failure) => break Err(failure),
                     }
                 }
                 let cached = AtomicBool::new(false);
                 let result_handling = || {
-                    let handling = self.consistency.result_handling(
-                        &self.mount,
+                    let handling = self.specification.consistency.result_handling(
+                        self.mount(),
                         &read,
                         &pending,
                         ticket,
@@ -511,7 +614,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                         {
                             break Err(failure);
                         }
-                        ticket = self.consistency.reading(&self.mount);
+                        ticket = self.specification.consistency.reading(self.mount());
                     }
                 }
             };
@@ -519,7 +622,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                 hand(&result, &committed, &|| ResultHandling::NoCache).ok_or(failure)
             });
             if let Some(prepared) = prepared {
-                self.mount.finish(prepared, Some(&changes)).await;
+                self.mount().finish(prepared, Some(&changes)).await;
             }
             served.map_err(consistency_failed)
         }
@@ -559,8 +662,9 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
         let mut may_have_committed = false;
         let outcome = loop {
             let attempts_before = attempts;
-            let ticket = self.consistency.reading(&self.mount);
+            let ticket = self.specification.consistency.reading(self.mount());
             let attempt = self
+                .specification
                 .mount
                 .store
                 .metadata()
@@ -576,9 +680,9 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                     Box::pin(async move {
                         let (result, mut transaction) = working.await.map_err(Attempt::Work)?;
                         let may_commit = self
-                            .mount
+                            .mount()
                             .may_commit(
-                                self.consistency.holds(),
+                                self.specification.consistency.holds(),
                                 prepared.as_ref(),
                                 &transaction.changes,
                                 &mut *transaction.metadata,
@@ -616,8 +720,13 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                 Err(TransactError::Aborted(Attempt::Refused(changes, allocated))) => {
                     reuse = allocated;
                     match self
-                        .mount
-                        .prepare(&self.consistency, prepared.take(), changes, purge_waits)
+                        .mount()
+                        .prepare(
+                            &self.specification.consistency,
+                            prepared.take(),
+                            changes,
+                            purge_waits,
+                        )
                         .await
                     {
                         Ok(readied) => {
@@ -639,7 +748,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                 }
             };
             if let Some(prepared) = prepared {
-                self.mount.finish(prepared, None).await;
+                self.mount().finish(prepared, None).await;
             }
             break Err(failed);
         };
@@ -648,7 +757,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
             .iter()
             .filter(|blob| !(may_have_committed && blob.taken_by == attempts));
         join_all(unreferenced.map(|blob| async move {
-            if let Err(error) = self.mount.store.content().delete(&blob.id).await {
+            if let Err(error) = self.specification.mount.store.content().delete(&blob.id).await {
                 tracing::warn!(id = blob.id.0, %error, "deleting a blob no commit references failed, so it stays");
             }
         }))
@@ -714,7 +823,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
             // began marks when the operation began, its first read's ticket.
             let mut began = None;
             loop {
-                let ticket = self.consistency.reading(&self.mount);
+                let ticket = self.specification.consistency.reading(self.mount());
                 let began = *began.get_or_insert(ticket);
                 let (result, read, pending) = self.read_with_state(&mut read, &reads).await?;
                 let result = load(result).await.map_err(TransactError::Aborted)?;
@@ -723,8 +832,8 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
                 }
                 let cached = AtomicBool::new(false);
                 let result_handling = || {
-                    let handling = self.consistency.result_handling(
-                        &self.mount,
+                    let handling = self.specification.consistency.result_handling(
+                        self.mount(),
                         &read,
                         &pending,
                         ticket,
@@ -767,11 +876,15 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
     ) -> impl Future<Output = Result<R, Failed<St, P, E>>> + Send {
         async move {
             loop {
-                let ticket = self.consistency.reading(&self.mount);
+                let ticket = self.specification.consistency.reading(self.mount());
                 let (result, read, pending) = self.read_with_state(&mut read, &reads).await?;
                 let result_handling = || {
-                    self.consistency
-                        .result_handling_listed(&self.mount, &read, &pending, ticket)
+                    self.specification.consistency.result_handling_listed(
+                        self.mount(),
+                        &read,
+                        &pending,
+                        ticket,
+                    )
                 };
                 match hand(&result, &read, &result_handling) {
                     Some(replied) => return Ok(replied),
@@ -802,6 +915,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
         // A read commits nothing, so a failure to read pending change versions is carried out of the transaction as its
         // result.
         let (result, read, pending) = self
+            .specification
             .mount
             .store
             .metadata()
@@ -828,7 +942,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
         metadata: &T,
         reads: &[(Inode, Attributes)],
     ) -> Result<Pending, IoFailure<T::Failure, Infallible>> {
-        if !self.consistency.holds() {
+        if !self.specification.consistency.holds() {
             return Ok(Pending::new());
         }
         let inodes: Vec<Inode> = reads.iter().map(|(inode, _)| *inode).collect();
@@ -839,6 +953,7 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
     // kernel.
     pub async fn pending(&self, inodes: &[Inode]) -> Result<Pending, Failed<St, P, Infallible>> {
         let pending = self
+            .specification
             .mount
             .store
             .metadata()
@@ -858,8 +973,9 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
     ) -> impl Future<Output = Result<bool, Failure<P, St>>> + Send {
         let inodes: Vec<Inode> = reads.iter().map(|(inode, _)| *inode).collect();
         async move {
-            self.consistency
-                .before_caching(&self.mount, &inodes, ticket)
+            self.specification
+                .consistency
+                .before_caching(self.mount(), &inodes, ticket)
                 .await
         }
     }
@@ -869,7 +985,9 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
     fn handed<R>(&self, reads: &[(Inode, Attributes)], cached: bool, replied: R) -> R {
         if cached {
             for (inode, read) in reads {
-                self.consistency.cached(&self.mount, *inode, read);
+                self.specification
+                    .consistency
+                    .cached(self.mount(), *inode, read);
             }
         }
         replied
@@ -884,24 +1002,27 @@ impl<St: Store, P: PubSub<Message = u64>, A: Sync, N: Sync, S: FsConfig, C: Cach
         ticket: C::Ticket,
         purge_waits: PurgeWaits,
     ) -> impl Future<Output = Result<(), Failure<P, St>>> + Send + 'a {
-        self.consistency
-            .settled(&self.mount, reads, pending, ticket, purge_waits)
+        self.specification
+            .consistency
+            .settled(self.mount(), reads, pending, ticket, purge_waits)
     }
 
     // cached tells the consistency the kernel caches inode as seen, for a reply serve did not hand over.
     pub fn cached(&self, inode: Inode, seen: &Attributes) {
-        self.consistency.cached(&self.mount, inode, seen);
+        self.specification
+            .consistency
+            .cached(self.mount(), inode, seen);
     }
 
     // forget tells the consistency the kernel no longer caches inode. Nothing may be handed to the kernel for inode
     // meanwhile.
     pub fn forget(&self, inode: Inode) {
-        self.consistency.forget(&self.mount, inode);
+        self.specification.consistency.forget(self.mount(), inode);
     }
 
     // write_back says whether the kernel may keep writes before handing them to the engine.
     pub fn write_back(&self) -> bool {
-        self.consistency.write_back()
+        self.specification.consistency.write_back()
     }
 }
 
@@ -941,7 +1062,8 @@ impl<St: Store, P: PubSub, A: Sync, N: Sync, S: FsConfig, C: Send + Sync>
     ) -> impl Future<
         Output = Result<T, TransactError<MetadataRejection<St>, MetadataFailure<St>, E>>,
     > + Send {
-        self.mount
+        self.specification
+            .mount
             .store
             .metadata()
             .read_transact(move |metadata| work(self.transaction(metadata)))
@@ -960,13 +1082,14 @@ impl<St: Store, P: PubSub, A: Sync, N: Sync, S: FsConfig, C: Send + Sync>
             reuse: Vec::new(),
             written: None,
             attempt: 0,
-            mount: self.mount.id,
+            mount: self.specification.mount.id,
             content: self.content(),
-            verifier: self.mount.verifier.as_deref(),
+            verifier: self.specification.mount.verifier.as_deref(),
             roots: Mutex::default(),
-            allocate_inode: &self.allocate_inode,
-            allocate_content_id: self.allocate_content_id,
-            now: &self.now,
+            nodes: Mutex::default(),
+            allocate_inode: &self.specification.allocate_inode,
+            allocate_content_id: self.specification.allocate_content_id,
+            now: &self.specification.now,
             config: PhantomData,
         }
     }

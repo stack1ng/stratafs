@@ -5,7 +5,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>stratafs benchmark</string>
 	<key>CFBundleExecutable</key>
-	<string>stratafs-bench-host</string>
+	<string>stratafs-local-host</string>
 	<key>CFBundleIdentifier</key>
 	<string>dev.stratafs.bench</string>
 	<key>CFBundleName</key>

@@ -1,4 +1,4 @@
-// Mounts through FUSE, each served by a stratafs-fuse daemon of its own. The store must be mdbx or sqlite when the
+// Mounts through FUSE, each served by a stratafs-local daemon of its own. The store must be mdbx or sqlite when the
 // volume gets more than one mount.
 
 use std::fs::{self, File};
@@ -19,9 +19,9 @@ const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Arguments {
     #[arg(
         long,
-        help = "The stratafs-fuse binary; the one beside this binary when left out"
+        help = "The stratafs-local binary; the one beside this binary when left out"
     )]
-    daemon: Option<PathBuf>,
+    local: Option<PathBuf>,
     #[arg(
         long,
         default_value = "sqlite",
@@ -37,37 +37,28 @@ pub struct Store {
     directory: PathBuf,
     volume: String,
     coordinator: String,
+    // signing_key is the key a signed volume is signed with, as the command line takes it.
+    signing_key: Option<String>,
 }
 
 impl Store {
-    // create makes the store in directory with one volume, whose mounts reach the coordinator at its URL.
+    // create makes the store in directory with one volume, whose mounts reach the coordinator at its URL. The volume
+    // is signed with signing_key when there is one.
     pub fn create(
         arguments: &Arguments,
         directory: &Path,
         coordinator: &str,
+        signing_key: Option<&str>,
     ) -> Result<Store, String> {
-        let daemon = match &arguments.daemon {
-            Some(daemon) => daemon.clone(),
-            None => super::beside("stratafs-fuse")?,
-        };
-        let created = Command::new(&daemon)
-            .arg("create")
-            .arg(directory)
-            .args(["--store", &arguments.store])
-            .output()
-            .map_err(|error| format!("starting {}: {error}", daemon.display()))?;
-        if !created.status.success() {
-            return Err(format!(
-                "creating the volume failed: {}",
-                String::from_utf8_lossy(&created.stderr)
-            ));
-        }
+        let daemon = super::local(&arguments.local)?;
+        let volume = super::create(&daemon, directory, &arguments.store, signing_key)?;
         Ok(Store {
             daemon,
             database: arguments.store.clone(),
             directory: directory.to_owned(),
-            volume: String::from_utf8_lossy(&created.stdout).trim().to_owned(),
+            volume,
             coordinator: coordinator.to_owned(),
+            signing_key: signing_key.map(str::to_owned),
         })
     }
 
@@ -86,6 +77,8 @@ impl Store {
             .args(["--store", &self.database])
             .args(["--consistency", &consistency.to_string()])
             .args(["--coordinator", &self.coordinator])
+            .args(self.signing_key.as_ref().map(|_| "--signing-key"))
+            .args(&self.signing_key)
             .stdin(Stdio::null())
             // The daemon writes nothing to its output, so the pipe's one event is closing when the daemon exits.
             .stdout(Stdio::piped())

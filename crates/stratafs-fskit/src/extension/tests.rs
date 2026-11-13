@@ -1,6 +1,6 @@
 use noncrypto_digests::Xxh3_128;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex, Once};
@@ -31,12 +31,14 @@ use stratafs_fs_engine::attributes::{
 use stratafs_fs_engine::content::error::WriteError;
 use stratafs_fs_engine::directories::NewItem;
 use stratafs_fs_engine::kernel_cache::{KernelCache, NoKernel};
-use stratafs_fs_engine::{Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp};
+use stratafs_fs_engine::{
+    EngineSpecification, Eventual, FsConfig, FsEngine, Inode, MountId, PurgeWaits, Timestamp,
+};
 use stratafs_lock_synchronized::LockSynchronizedStore;
 use stratafs_object_store::ObjectStoreContentStore;
 use stratafs_pubsub_conformance::{MemoryClient, MemoryVolume};
 use stratafs_redb::RedbStore;
-use stratafs_runtime::ThreadPoolRuntime;
+use stratafs_runtime::{Runtime, ThreadPoolRuntime};
 use stratafs_store::content::ContentId;
 use stratafs_store::durability::DurableAgainst;
 use stratafs_store::kv::TransactError;
@@ -76,10 +78,16 @@ impl SpawnBlocking for SimulatedThreadPool {
     }
 }
 
-async fn new_engine(
-    kernel: impl KernelCache,
-    runtime: Arc<dyn Runtime>,
-) -> Result<TestEngine, io::Error> {
+type TestSpecification = EngineSpecification<
+    TestStore,
+    MemoryClient<u64>,
+    fn() -> u64,
+    fn() -> Timestamp,
+    TestConfig,
+    Eventual,
+>;
+
+fn new_specification(runtime: Arc<dyn Runtime>) -> Result<TestSpecification, io::Error> {
     let database = redb::Database::builder()
         .create_with_backend(InMemoryBackend::new())
         .map_err(io::Error::other)?;
@@ -90,7 +98,7 @@ async fn new_engine(
         || ContentId(NEXT_CONTENT_ID.fetch_add(1, Ordering::Relaxed).into());
     let now: fn() -> Timestamp = || Timestamp(1_500_000_000);
     let pubsub = MemoryVolume::new(Arc::clone(&runtime));
-    FsEngine::new(
+    Ok(EngineSpecification::new(
         LockSynchronizedStore::new(
             RedbStore::new(database, SimulatedThreadPool).map_err(io::Error::other)?,
             ObjectStoreContentStore::new(InMemory::new()),
@@ -107,11 +115,17 @@ async fn new_engine(
         Duration::from_secs(1),
         Eventual::default(),
         Unsigned,
-        kernel,
         runtime,
-    )
-    .await
-    .map_err(io::Error::other)
+    ))
+}
+
+async fn new_engine(
+    kernel: impl KernelCache,
+    runtime: Arc<dyn Runtime>,
+) -> Result<TestEngine, io::Error> {
+    FsEngine::new(new_specification(runtime)?, kernel)
+        .await
+        .map_err(io::Error::other)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +136,8 @@ enum TestOpenError {
     Busy,
     #[error("the store is not the test store: {0}")]
     WrongStore(PathBuf),
+    #[error("the volume was not named in hex")]
+    NotHex,
     #[error(transparent)]
     Engine(io::Error),
 }
@@ -130,6 +146,7 @@ impl From<&TestOpenError> for PosixError {
     fn from(error: &TestOpenError) -> Self {
         match error {
             TestOpenError::Busy => PosixError::EBUSY,
+            TestOpenError::NotHex => PosixError::EINVAL,
             TestOpenError::Down | TestOpenError::WrongStore(_) | TestOpenError::Engine(_) => {
                 PosixError::EIO
             }
@@ -142,35 +159,34 @@ fn store() -> PathBuf {
     std::env::temp_dir()
 }
 
-// install sets up what run would, once per test process. A volume id of ff fails to open, and bb is
-// open in another mount.
+// install sets up what run would, once per test process. The request's last argument names the volume in hex: ff
+// fails to open, and bb is open in another mount.
 fn install() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
-        assert!(
-            OPEN_VOLUME
-                .set(opener(
-                    ThreadPoolRuntime(ThreadPool::new().unwrap()),
-                    async |mounted: &Path,
-                           volume: Bytes,
-                           _: ConsistencyKind,
-                           kernel: FsKitCache,
-                           runtime: Arc<dyn Runtime>| {
-                        if mounted != store() {
-                            return Err(TestOpenError::WrongStore(mounted.to_owned()));
-                        }
-                        match &volume[..] {
-                            [0xff] => Err(TestOpenError::Down),
-                            [0xbb] => Err(TestOpenError::Busy),
-                            _ => new_engine(kernel, runtime)
-                                .await
-                                .map(OpenedEngine::from)
-                                .map_err(TestOpenError::Engine),
-                        }
-                    }
-                ))
-                .is_ok()
-        );
+        let runtime: Arc<dyn Runtime> = Arc::new(ThreadPoolRuntime(ThreadPool::new().unwrap()));
+        let open: OpenVolume = Box::new(move |mounted, arguments, kernel| {
+            let opened = (|| {
+                if mounted != store() {
+                    return Err(TestOpenError::WrongStore(mounted.to_owned()));
+                }
+                let named = arguments.last().and_then(|name| hex::decode(name).ok());
+                let name = named.ok_or(TestOpenError::NotHex)?;
+                match &name[..] {
+                    [0xff] => Err(TestOpenError::Down),
+                    [0xbb] => Err(TestOpenError::Busy),
+                    _ => new_specification(Arc::clone(&runtime))
+                        .map(|specification| Opened::new(Bytes::from(name), specification))
+                        .map_err(TestOpenError::Engine),
+                }
+            })()
+            .map_err(|error| ActivateError::OpenFailed {
+                posix: PosixError::from(&error),
+                source: Box::new(error),
+            })?;
+            (opened.0)(kernel)
+        });
+        assert!(OPEN_VOLUME.set(open).is_ok());
     });
 }
 
@@ -282,9 +298,8 @@ fn activate(volume: &FSVolume, arguments: &[&str]) -> Replied {
 
 // mounted is the volume volume loaded from the test store and activated.
 fn mounted(volume: &str) -> Retained<FSVolume> {
-    let volume_option = format!("volume={volume},consistency=eventual");
     let loaded = load(&new_file_system(), &store_resource()).expect("the store loads");
-    assert_eq!(activate(&loaded, &["-o", &volume_option]), Ok(()));
+    assert_eq!(activate(&loaded, &[volume]), Ok(()));
     loaded
 }
 
@@ -380,34 +395,9 @@ fn activate_opens_the_volume_its_options_name_or_replies_why_not() {
     let volume = mounted("ab01");
     assert_eq!(name_of(&volume).as_deref(), Some("ab01"));
     for (arguments, errno, message) in [
-        (&[][..], libc::EINVAL, "no volume was given"),
-        (&["-o", "volume=zz"], libc::EINVAL, "not hex"),
-        (
-            &["-o", "volume=ab01,consistency=eventual,rdonly"],
-            libc::EINVAL,
-            "rdonly is not a mount option",
-        ),
-        (&["-x"], libc::EINVAL, "could not be read"),
-        (
-            &["-o", "volume=ab01"],
-            libc::EINVAL,
-            "no consistency was given",
-        ),
-        (
-            &["-o", "volume=ab01,consistency=weak"],
-            libc::EINVAL,
-            "weak is not a consistency",
-        ),
-        (
-            &["-o", "volume=ff,consistency=eventual"],
-            libc::EIO,
-            "the store is down",
-        ),
-        (
-            &["-o", "volume=bb,consistency=eventual"],
-            libc::EBUSY,
-            "open in another mount",
-        ),
+        (&[][..], libc::EINVAL, "not named in hex"),
+        (&["ff"], libc::EIO, "the store is down"),
+        (&["bb"], libc::EBUSY, "open in another mount"),
     ] {
         let loaded = load(&new_file_system(), &store_resource()).expect("the store loads");
         assert!(

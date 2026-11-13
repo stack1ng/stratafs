@@ -16,9 +16,10 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
+use stratafs_ed25519_signer::Ed25519Signer;
 use tempfile::TempDir;
 
-const DAEMON: &str = env!("CARGO_BIN_EXE_stratafs-fuse");
+const DAEMON: &str = env!("CARGO_BIN_EXE_stratafs-local");
 
 // NOBODY is the user and group of the tests' other user, who did not mount the volume.
 const NOBODY: u32 = 65534;
@@ -40,13 +41,24 @@ struct Store {
 }
 
 impl Store {
-    // new makes a store of database with one volume.
+    // new makes a store of database with one volume, which is not signed.
     fn new(database: &str) -> Store {
+        Store::with(database, &[])
+    }
+
+    // signed makes a store of database with one volume, signed with a new key.
+    fn signed(database: &str) -> Store {
+        Store::with(database, &["--signing-key".to_owned(), new_key()])
+    }
+
+    // with makes a store of database with one volume, which create and every mount take signing for.
+    fn with(database: &str, signing: &[String]) -> Store {
         let directory = tempfile::tempdir().unwrap();
         let created = Command::new(DAEMON)
             .arg("create")
             .arg(directory.path())
             .args(["--store", database])
+            .args(signing)
             .output()
             .unwrap();
         assert!(
@@ -56,12 +68,13 @@ impl Store {
         );
         let volume = String::from_utf8(created.stdout).unwrap().trim().to_owned();
         let coordinator = Coordinator::start();
-        let flags = vec![
+        let mut flags = vec![
             "--store".to_owned(),
             database.to_owned(),
             "--coordinator".to_owned(),
             coordinator.url.clone(),
         ];
+        flags.extend_from_slice(signing);
         Store {
             directory,
             volume,
@@ -92,13 +105,16 @@ impl Store {
             _unmounted: unmounted,
         };
         mounted.wait_until_mounted(true);
-        // The kernel numbers a FUSE connection by its mount's device minor.
-        let connection = libc::minor(fs::metadata(mounted.mount_point.path()).unwrap().dev());
-        std::thread::spawn(move || {
-            if let Err(RecvTimeoutError::Timeout) = watched.recv_timeout(DEADLOCK_TIMEOUT) {
-                abort(connection);
-            }
-        });
+        // The kernel numbers a FUSE connection by its mount's device minor. A mount that cannot read its own root, as
+        // one with the wrong key cannot, has no number to find, and is left unwatched.
+        if let Ok(root) = fs::metadata(mounted.mount_point.path()) {
+            let connection = libc::minor(root.dev());
+            std::thread::spawn(move || {
+                if let Err(RecvTimeoutError::Timeout) = watched.recv_timeout(DEADLOCK_TIMEOUT) {
+                    abort(connection);
+                }
+            });
+        }
         mounted
     }
 }
@@ -480,6 +496,52 @@ fn a_strong_mount_sees_an_eventual_mounts_changes_as_soon_as_they_return() {
     assert!(!strong.path("gone").exists());
     strong.unmount();
     eventual.unmount();
+}
+
+// new_key is a new signing key as the command line takes it.
+fn new_key() -> String {
+    Ed25519Signer::generate().key()
+}
+
+// Every mount of a signed volume signs what it writes and verifies what it reads, so a mount with the volume's key
+// reads what another wrote, and one with another key reads nothing.
+#[test]
+fn a_signed_volume_is_read_with_its_key_only() {
+    let mut store = Store::signed("mdbx");
+    let (strong, eventual) = (store.mount("strong"), store.mount("eventual"));
+    fs::create_dir(eventual.path("dir")).unwrap();
+    fs::write(eventual.path("dir/file"), vec![7; 100_000]).unwrap();
+    assert_eq!(fs::read(strong.path("dir/file")).unwrap(), vec![7; 100_000]);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(strong.path("dir/file"))
+        .unwrap();
+    file.seek(SeekFrom::Start(50_000)).unwrap();
+    file.write_all(b"middle").unwrap();
+    drop(file);
+    fs::rename(strong.path("dir/file"), strong.path("moved")).unwrap();
+    symlink("moved", strong.path("link")).unwrap();
+    assert_eq!(names(strong.mount_point.path()), ["dir", "link", "moved"]);
+    assert_eq!(
+        fs::read(strong.path("link")).unwrap()[49_999..50_007],
+        *b"\x07middle\x07"
+    );
+    strong.unmount();
+    eventual.unmount();
+
+    let again = store.mount("strong");
+    assert_eq!(fs::read(again.path("moved")).unwrap().len(), 100_000);
+    again.unmount();
+
+    // Another key signs nothing this volume holds.
+    *store.flags.last_mut().unwrap() = new_key();
+    let untrusted = store.mount("eventual");
+    // It cannot read even the volume's root directory.
+    let refused = fs::metadata(untrusted.mount_point.path()).unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(libc::EIO));
+    let refused = fs::read(untrusted.path("moved")).unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(libc::EIO));
+    untrusted.unmount();
 }
 
 // A mount serves only the user who mounted it, unless it allows other users.

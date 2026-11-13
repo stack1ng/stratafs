@@ -1,0 +1,60 @@
+[package]
+name = "stratafs-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+clap.workspace = true
+futures-executor.workspace = true
+futures-lite.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+mdbx-sys = "=14.4.0"
+noncrypto-digests.workspace = true
+rand.workspace = true
+redb = "4.4.0"
+sha2 = "0.11"
+stratafs-ed25519-signer.workspace = true
+stratafs-fs-engine.workspace = true
+stratafs-lock-synchronized.workspace = true
+stratafs-mdbx.workspace = true
+stratafs-object-store.workspace = true
+stratafs-redb.workspace = true
+stratafs-runtime.workspace = true
+stratafs-sqlite.workspace = true
+stratafs-store.workspace = true
+stratafs-tree.workspace = true
+stratafs-websocket-pubsub = { workspace = true, features = ["client"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+# The daemon mounts with FUSE, which is Linux's.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["signal"] }
+stratafs-fuse.workspace = true
+
+# The module is FSKit's, which is macOS's.
+[target.'cfg(target_os = "macos")'.dependencies]
+mimalloc.workspace = true
+stratafs-fskit = { workspace = true, features = ["extension"] }
+tracing-oslog.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { workspace = true, features = ["poll"] }
+stratafs-websocket-pubsub-native = { path = "../stratafs-websocket-pubsub-native" }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+xattr = "1.7"
+
+[lints]
+workspace = true

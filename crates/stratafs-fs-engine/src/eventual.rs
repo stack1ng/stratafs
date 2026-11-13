@@ -117,13 +117,13 @@ impl Eventual {
 impl<St: Store, P: PubSub> Cached<St, P> for Eventual {
     type Ticket = u64;
 
-    fn reading(&self, _: &Mount<St, P>) -> u64 {
+    fn reading(&self, _: Mount<'_, St, P>) -> u64 {
         self.clock.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     async fn before_caching(
         &self,
-        _: &Mount<St, P>,
+        _: Mount<'_, St, P>,
         inodes: &[Inode],
         ticket: u64,
     ) -> Result<bool, Failure<P, St>> {
@@ -134,7 +134,7 @@ impl<St: Store, P: PubSub> Cached<St, P> for Eventual {
     // land after a newer one this mount handed over, which the auto invalidator then takes for the kernel's own.
     fn result_handling(
         &self,
-        _: &Mount<St, P>,
+        _: Mount<'_, St, P>,
         reads: &[(Inode, Attributes)],
         _: &Pending,
         ticket: u64,
@@ -150,7 +150,7 @@ impl<St: Store, P: PubSub> Cached<St, P> for Eventual {
 
     fn result_handling_listed(
         &self,
-        _: &Mount<St, P>,
+        _: Mount<'_, St, P>,
         _: &[(Inode, Attributes)],
         _: &Pending,
         _: u64,
@@ -160,7 +160,7 @@ impl<St: Store, P: PubSub> Cached<St, P> for Eventual {
 
     async fn settled(
         &self,
-        _: &Mount<St, P>,
+        _: Mount<'_, St, P>,
         _: &[(Inode, Attributes)],
         _: &Pending,
         _: u64,
@@ -171,7 +171,7 @@ impl<St: Store, P: PubSub> Cached<St, P> for Eventual {
 
     // cached tells Eventual the kernel now caches the given inode as seen.
     // This is then used to coordinate an auto invalidator for this inode.
-    fn cached(&self, mount: &Mount<St, P>, inode: Inode, seen: &Attributes) {
+    fn cached(&self, mount: Mount<'_, St, P>, inode: Inode, seen: &Attributes) {
         let (stop, stopped) = AbortHandle::new_pair();
         let id = self
             .auto_invalidators
@@ -200,10 +200,10 @@ impl<St: Store, P: PubSub> Cached<St, P> for Eventual {
             }
         }
         let (store, kernel, auto_invalidators, mount_id, mut seen) = (
-            Arc::clone(&mount.store),
-            Arc::clone(&mount.kernel),
+            Arc::clone(&mount.specification.store),
+            Arc::clone(mount.kernel),
             Arc::clone(&self.auto_invalidators),
-            mount.id,
+            mount.specification.id,
             seen.clone(),
         );
         let auto_invalidator = Abortable::new(
@@ -247,13 +247,13 @@ impl<St: Store, P: PubSub> Cached<St, P> for Eventual {
             },
             stopped,
         );
-        mount.runtime.spawn(Box::pin(async move {
+        mount.specification.runtime.spawn(Box::pin(async move {
             let _ = auto_invalidator.await;
         }));
     }
 
     // forget tells Eventual the kernel no longer caches inode.
-    fn forget(&self, _: &Mount<St, P>, inode: Inode) {
+    fn forget(&self, _: Mount<'_, St, P>, inode: Inode) {
         let at = self.clock.fetch_add(1, Ordering::SeqCst) + 1;
         self.forgotten(inode).fetch_max(at, Ordering::SeqCst);
         if let Some(running) = self

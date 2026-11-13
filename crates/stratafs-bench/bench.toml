@@ -1,4 +1,4 @@
-# The benchmark run `stratafs-bench run crates/stratafs-bench/bench.toml` performs.
+# The benchmark run `stratafs-bench crates/stratafs-bench/bench.toml` performs.
 # Relative paths are relative to this file. Run inside the repository's nix shell, which has hyperfine and fio.
 
 results = "../../target/bench/results"
@@ -22,6 +22,15 @@ name = "stratafs"
 store = "/Volumes/StrataBench/stratafs-store"
 mount_point = "/Volumes/StrataBench/stratafs-mount"
 consistency = "eventual"
+
+# The same, on a volume that is signed with an Ed25519 key and hashed with SHA-256, so every read is verified.
+[[targets]]
+kind = "stratafs"
+name = "stratafs-signed"
+store = "/Volumes/StrataBench/stratafs-signed-store"
+mount_point = "/Volumes/StrataBench/stratafs-signed-mount"
+consistency = "eventual"
+signed = true
 
 # JuiceFS through macFUSE's FSKit backend, which needs no kernel extension: install macFUSE 5.4 and enable its
 # File System Extensions. `cargo xtask juicefs` builds the juicefs this uses; the 1.4.2 release crashes on M5 Macs.

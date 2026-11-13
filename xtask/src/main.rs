@@ -18,7 +18,7 @@ struct Xtask {
 #[derive(Subcommand)]
 enum Task {
     #[command(
-        about = "Build the benchmark FSKit module and its create command with one configuration, then install the module for FSKit"
+        about = "Build stratafs-local and its FSKit module with one configuration, then install the module for FSKit"
     )]
     Bundle(Configuration),
     #[command(
@@ -26,14 +26,14 @@ enum Task {
     )]
     Juicefs,
     #[command(
-        about = "Build and test stratafs-fuse on Linux, in a Docker container that can mount FUSE volumes; extra arguments go to cargo test"
+        about = "Build and test stratafs-fuse and stratafs-local on Linux, in a Docker container that can mount FUSE volumes; extra arguments go to cargo test"
     )]
     FuseTest {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
     #[command(
-        about = "Build stratafs-fuse and stratafs-e2e on Linux, in the Docker container stratafs-fuse's tests use, and run stratafs-e2e there with the arguments"
+        about = "Build stratafs-local and stratafs-e2e on Linux, in the Docker container stratafs-fuse's tests use, and run stratafs-e2e there with the arguments"
     )]
     E2e {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -41,7 +41,7 @@ enum Task {
     },
 }
 
-// Configuration is the build's tuning constants. Each one left out keeps stratafs-bench's default.
+// Configuration is the build's tuning constants. Each one left out keeps stratafs-local's default.
 #[derive(Args)]
 struct Configuration {
     #[arg(long, help = "The tree's node capacity in bytes, at most 65535")]
@@ -50,8 +50,6 @@ struct Configuration {
     merge_below_percent: Option<u8>,
     #[arg(long, help = "The largest entry the engine keeps inline, in bytes")]
     largest_inline_entry: Option<u32>,
-    #[arg(long, help = "The store: redb, sqlite or mdbx")]
-    store: Option<String>,
     #[arg(long, help = "How the mdbx store syncs: safe or utterly")]
     mdbx_mode: Option<String>,
     #[arg(
@@ -125,7 +123,7 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask sits in the workspace root");
-    let sources = workspace.join("crates/stratafs-bench/bundle");
+    let sources = workspace.join("crates/stratafs-local/bundle");
     // FSKit lets the module invalidate what the kernel caches only when a provisioning profile grants it FSKit's
     // module entitlement, so the profile is found before anything is built.
     let info: Dictionary = plist::from_file(sources.join("extension/Info.plist"))
@@ -140,34 +138,33 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
         "build",
         "--release",
         "--package",
-        "stratafs-bench",
+        "stratafs-local",
         "--bins",
     ]);
     for (variable, value) in [
         (
-            "STRATAFS_BENCH_NODE_CAPACITY",
+            "STRATAFS_LOCAL_NODE_CAPACITY",
             configuration.node_capacity.map(|value| value.to_string()),
         ),
         (
-            "STRATAFS_BENCH_MERGE_BELOW_PERCENT",
+            "STRATAFS_LOCAL_MERGE_BELOW_PERCENT",
             configuration
                 .merge_below_percent
                 .map(|value| value.to_string()),
         ),
         (
-            "STRATAFS_BENCH_LARGEST_INLINE_ENTRY",
+            "STRATAFS_LOCAL_LARGEST_INLINE_ENTRY",
             configuration
                 .largest_inline_entry
                 .map(|value| value.to_string()),
         ),
-        ("STRATAFS_BENCH_STORE", configuration.store.clone()),
         (
-            "STRATAFS_BENCH_DURABILITY",
+            "STRATAFS_LOCAL_DURABILITY",
             configuration.durability.clone(),
         ),
-        ("STRATAFS_BENCH_MDBX_MODE", configuration.mdbx_mode.clone()),
+        ("STRATAFS_LOCAL_MDBX_MODE", configuration.mdbx_mode.clone()),
         (
-            "STRATAFS_BENCH_MDBX_SYNC_BYTES",
+            "STRATAFS_LOCAL_MDBX_SYNC_BYTES",
             configuration.mdbx_sync_bytes.map(|value| value.to_string()),
         ),
     ] {
@@ -189,27 +186,27 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
         return Err("a stratafs volume is mounted; unmount it before bundling".to_owned());
     }
     if Command::new("/usr/bin/pgrep")
-        .args(["-f", "stratafs-bench-extension"])
+        .args(["-f", "stratafs-local-module"])
         .output()
         .is_ok_and(|found| found.status.success())
     {
         return Err(
-            "a stratafs-bench-extension process is still running; wait for it to exit, or stop it, before bundling"
+            "a stratafs-local-module process is still running; wait for it to exit, or stop it, before bundling"
                 .to_owned(),
         );
     }
     for (from, to) in [
         (
-            built.join("stratafs-bench-extension"),
-            appex.join("Contents/MacOS/stratafs-bench-extension"),
+            built.join("stratafs-local-module"),
+            appex.join("Contents/MacOS/stratafs-local-module"),
         ),
         (
             sources.join("extension/Info.plist"),
             appex.join("Contents/Info.plist"),
         ),
         (
-            built.join("stratafs-bench-host"),
-            app.join("Contents/MacOS/stratafs-bench-host"),
+            built.join("stratafs-local-host"),
+            app.join("Contents/MacOS/stratafs-local-host"),
         ),
         (
             sources.join("host/Info.plist"),
@@ -253,7 +250,7 @@ fn bundle(configuration: &Configuration) -> Result<(), String> {
     println!(
         "installed {}\nThe first time, enable \"stratafs benchmark\" in System Settings > General > Login Items & Extensions > File System Extensions.\nCreate volumes with {}",
         app.display(),
-        built.join("stratafs-bench").display(),
+        built.join("stratafs-local").display(),
     );
     Ok(())
 }
@@ -295,14 +292,22 @@ const FUSE_LEFT_OUT: [&str; 4] = ["./target", "./.git", "./.direnv", "node_modul
 
 // fuse_test runs stratafs-fuse's tests in the Linux container.
 fn fuse_test(arguments: &[String]) -> Result<(), String> {
-    let mut command = vec!["cargo", "test", "--locked", "--package", "stratafs-fuse"];
+    let mut command = vec![
+        "cargo",
+        "test",
+        "--locked",
+        "--package",
+        "stratafs-fuse",
+        "--package",
+        "stratafs-local",
+    ];
     command.extend(arguments.iter().map(String::as_str));
     in_linux_container(&command)
 }
 
 // e2e builds stratafs-fuse and stratafs-e2e in the Linux container, and runs stratafs-e2e there with arguments.
 fn e2e(arguments: &[String]) -> Result<(), String> {
-    let build = "cargo build --release --locked --package stratafs-fuse --package stratafs-e2e";
+    let build = "cargo build --release --locked --package stratafs-local --package stratafs-e2e";
     let run = format!("{build} && exec /target/release/stratafs-e2e \"$@\"");
     let mut command = vec!["sh", "-c", &run, "stratafs-e2e"];
     command.extend(arguments.iter().map(String::as_str));

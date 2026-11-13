@@ -33,13 +33,13 @@ type Memory = MemoryClient<u64>;
 impl Cached<InMemoryStore, Memory> for Scripted {
     type Ticket = u64;
 
-    fn reading(&self, _: &Mount<InMemoryStore, Memory>) -> u64 {
+    fn reading(&self, _: Mount<'_, InMemoryStore, Memory>) -> u64 {
         0
     }
 
     async fn before_caching(
         &self,
-        _: &Mount<InMemoryStore, Memory>,
+        _: Mount<'_, InMemoryStore, Memory>,
         _: &[Inode],
         _: u64,
     ) -> Result<bool, Failure<Memory, InMemoryStore>> {
@@ -56,7 +56,7 @@ impl Cached<InMemoryStore, Memory> for Scripted {
 
     fn result_handling(
         &self,
-        _: &Mount<InMemoryStore, Memory>,
+        _: Mount<'_, InMemoryStore, Memory>,
         _: &[(Inode, Attributes)],
         _: &Pending,
         _: u64,
@@ -69,7 +69,7 @@ impl Cached<InMemoryStore, Memory> for Scripted {
 
     fn result_handling_listed(
         &self,
-        _: &Mount<InMemoryStore, Memory>,
+        _: Mount<'_, InMemoryStore, Memory>,
         _: &[(Inode, Attributes)],
         _: &Pending,
         _: u64,
@@ -79,7 +79,7 @@ impl Cached<InMemoryStore, Memory> for Scripted {
 
     async fn settled(
         &self,
-        _: &Mount<InMemoryStore, Memory>,
+        _: Mount<'_, InMemoryStore, Memory>,
         _: &[(Inode, Attributes)],
         _: &Pending,
         _: u64,
@@ -88,14 +88,14 @@ impl Cached<InMemoryStore, Memory> for Scripted {
         Ok(())
     }
 
-    fn cached(&self, _: &Mount<InMemoryStore, Memory>, inode: Inode, _: &Attributes) {
+    fn cached(&self, _: Mount<'_, InMemoryStore, Memory>, inode: Inode, _: &Attributes) {
         self.cached
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(inode);
     }
 
-    fn forget(&self, _: &Mount<InMemoryStore, Memory>, _: Inode) {}
+    fn forget(&self, _: Mount<'_, InMemoryStore, Memory>, _: Inode) {}
 
     fn write_back(&self) -> bool {
         false

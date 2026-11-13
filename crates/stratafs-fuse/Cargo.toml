@@ -4,45 +4,21 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
 
-# FUSE is Linux's, so elsewhere the library is empty and the daemon only says it runs on Linux.
+# FUSE is Linux's, so elsewhere the library is empty.
 [target.'cfg(target_os = "linux")'.dependencies]
 bytes.workspace = true
-clap.workspace = true
-futures-executor.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
 fuser.workspace = true
-hex.workspace = true
-noncrypto-digests.workspace = true
 libc.workspace = true
-mdbx-sys = "=14.4.0"
 nix = { workspace = true, features = ["mount", "signal"] }
-rand.workspace = true
-redb = "4.4.0"
 stratafs-fs-engine.workspace = true
-stratafs-lock-synchronized.workspace = true
-stratafs-mdbx.workspace = true
-stratafs-object-store.workspace = true
 stratafs-pubsub.workspace = true
-stratafs-redb.workspace = true
 stratafs-runtime.workspace = true
-stratafs-sqlite.workspace = true
 stratafs-store.workspace = true
-stratafs-tree.workspace = true
-stratafs-websocket-pubsub = { workspace = true, features = ["client"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-nix = { workspace = true, features = ["poll"] }
-stratafs-websocket-pubsub-native = { path = "../stratafs-websocket-pubsub-native" }
-tempfile = "3"
-tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
-xattr = "1.7"
 
 [lints]
 workspace = true

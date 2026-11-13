@@ -133,7 +133,7 @@ pub(crate) async fn read_pending<T: ReadKeyValueTransaction>(
     Ok(pending)
 }
 
-impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
+impl<St: Store, P: PubSub<Message = u64>> Mount<'_, St, P> {
     // attributes is inode's stored attributes as metadata reads them, once their signature is verified on a signed
     // volume, or None when the inode does not exist.
     async fn attributes<T: ReadKeyValueTransaction>(
@@ -141,7 +141,7 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
         metadata: &T,
         inode: Inode,
     ) -> Result<Option<Attributes>, IoFailure<T::Failure, Infallible>> {
-        match &self.verifier {
+        match &self.specification.verifier {
             Some(verifier) => {
                 let read = verifier.read(metadata, inode).await?;
                 Ok(read.map(|(attributes, _)| attributes))
@@ -177,11 +177,12 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
         Result<Vec<(Inode, ChangeVersion)>, (Vec<(Inode, Attributes)>, Pending)>,
         Failure<P, St>,
     > {
-        self.store
+        self.specification
+            .store
             .metadata()
             .transact(|mut metadata| {
                 let inodes = inodes.to_vec();
-                let id = self.id;
+                let id = self.specification.id;
                 Box::pin(async move {
                     let mut read = Vec::new();
                     for inode in inodes {
@@ -241,7 +242,7 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
     ) -> Result<(), Failure<P, St>> {
         loop {
             let inodes: Vec<Inode> = in_flight.iter().map(|(inode, _)| *inode).collect();
-            if contended(&mut self.state.lock(), &inodes, purge_waits, &*self.kernel) {
+            if contended(&mut self.state.lock(), &inodes, purge_waits, &**self.kernel) {
                 return Err(ConsistencyFailure::Contended);
             }
             let ticket = self.state.clock.fetch_add(1, Ordering::SeqCst);
@@ -271,7 +272,8 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
         &self,
         inodes: &[Inode],
     ) -> Result<(Vec<Option<Attributes>>, Pending), Failure<P, St>> {
-        self.store
+        self.specification
+            .store
             .metadata()
             .read_transact(|metadata| {
                 Box::pin(async move {
@@ -372,7 +374,7 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                 let mut inner = self.state.lock();
                 if inner.publishing + 1 < limit {
                     inner.publishing += 1;
-                    return Ok(Some(Publishing(&self.state)));
+                    return Ok(Some(Publishing(self.state)));
                 }
                 if let Connection::Down { purging: true, .. } = inner.connection {
                     return Err(ConsistencyFailure::Purging);
@@ -425,13 +427,14 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
         if announced.is_empty() {
             return Ok(());
         }
-        self.store
+        self.specification
+            .store
             .metadata()
             .transact(|mut metadata| {
                 let announced = announced.clone();
                 Box::pin(async move {
                     for (inode, version) in announced {
-                        let read = match &self.verifier {
+                        let read = match &self.specification.verifier {
                             Some(verifier) => verifier.read(&*metadata, inode).await.map(|read| {
                                 read.map(|(attributes, root)| (attributes, Some(root)))
                             }),
@@ -455,7 +458,9 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                                 )
                                 .map_err(|error| StoreWork::Write(refused_or_failed(error)))?;
                             // The attributes moved, so a signed volume signs them again with the root they had.
-                            if let (Some(verifier), Some(root)) = (&self.verifier, root) {
+                            if let (Some(verifier), Some(root)) =
+                                (&self.specification.verifier, root)
+                            {
                                 let signed =
                                     verifier.signed(inode, &attributes, &root).await.map_err(
                                         |failure| StoreWork::Read(IoFailure::Verification(failure)),
@@ -582,14 +587,14 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                 }
                 if holds {
                     consistency
-                        .before_caching(self, &changed, consistency.reading(self))
+                        .before_caching(*self, &changed, consistency.reading(*self))
                         .await?;
                 }
                 let (client, _) = self.client(None).await?;
                 // It waits to publish before it announces, so other mounts never wait on its announcement for longer
                 // than a publish. A mount that holds nothing gets no delivery, so it keeps no room for a purge.
                 let publishing = match holds && !existing.is_empty() {
-                    true => self.publishing(purge_waits, &*self.kernel).await?,
+                    true => self.publishing(purge_waits, &**self.kernel).await?,
                     false => None,
                 };
                 let fresh = match self.announce(&existing, &announced).await? {
@@ -629,11 +634,11 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                     self.state.lock().delivering.insert(write, false);
                     self.state.wake();
                     let (state, kernel, runtime) = (
-                        Arc::clone(&self.state),
-                        Arc::clone(&self.kernel),
-                        Arc::clone(&self.runtime),
+                        Arc::clone(self.state),
+                        Arc::clone(self.kernel),
+                        Arc::clone(&self.specification.runtime),
                     );
-                    self.runtime.spawn(Box::pin(async move {
+                    self.specification.runtime.spawn(Box::pin(async move {
                         join_all(own.into_iter().map(|(inode, id, version)| {
                             handled(&state, &*kernel, &runtime, inode, id, version)
                         }))
@@ -645,7 +650,11 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                 let published = join_all(fresh.iter().map(|(inode, version)| {
                     let client = Arc::clone(&client);
                     let (inode, number) = (*inode, version.number);
-                    async move { client.publish(Key(inode.0), &number, self.timeout).await }
+                    async move {
+                        client
+                            .publish(Key(inode.0), &number, self.specification.timeout)
+                            .await
+                    }
                 }))
                 .await;
                 drop(publishing);
@@ -678,7 +687,7 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
                 settled?;
                 match waiting {
                     Waiting::Claimed => {
-                        self.unclaimed(write, &changed, purge_waits, &*self.kernel)
+                        self.unclaimed(write, &changed, purge_waits, &**self.kernel)
                             .await?
                     }
                     Waiting::InFlight(in_flight, pending) => {
@@ -782,7 +791,7 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
         purge_waits: PurgeWaits,
     ) -> Result<(), Failure<P, St>> {
         let listener = self.state.changed.listen();
-        if no_room(purge_waits, &*self.kernel) && handling_delivery(&self.state.lock()) {
+        if no_room(purge_waits, &**self.kernel) && handling_delivery(&self.state.lock()) {
             return Err(ConsistencyFailure::Contended);
         }
         if self.state.woken.load(Ordering::SeqCst) > ticket {
@@ -794,8 +803,8 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
         {
             let mut inner = self.state.lock();
             // A write in flight not met again for twice the wait is long over, settled by some read or by its writer.
-            let waits = self.timeout + SETTLE_MARGIN;
-            let now = self.runtime.now();
+            let waits = self.specification.timeout + SETTLE_MARGIN;
+            let now = self.specification.runtime.now();
             inner.seen.retain(|_, first| now - *first < waits * 2);
             for (inode, read) in reads {
                 let version = pending
@@ -842,11 +851,13 @@ impl<St: Store, P: PubSub<Message = u64>> Mount<St, P> {
         }
         // A write ends by committing or being settled, which moves the inode's attributes and clears its pending
         // change version.
-        let metadata = self.store.metadata();
+        let metadata = self.specification.store.metadata();
         let mut ends: Vec<BoxFuture<'_, Result<(), MetadataFailure<St>>>> =
             vec![Box::pin(listener.map(Ok))];
         if let Some(deadline) = deadline {
-            ends.push(Box::pin(self.runtime.sleep_until(deadline).map(Ok)));
+            ends.push(Box::pin(
+                self.specification.runtime.sleep_until(deadline).map(Ok),
+            ));
         }
         for (inode, read) in watched {
             let key = FsKey::new_attributes(inode).into();
